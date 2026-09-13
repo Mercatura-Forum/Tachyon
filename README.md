@@ -1,64 +1,95 @@
-# Tachyon
+# Tachyon: Delivery-versus-Payment Settlement on Thebes
 
-Delivery-versus-payment settlement on Thebes: an asset leg and a cash leg move together, or
-neither moves.
+A settlement layer that runs as a smart contract: an asset leg and a cash leg
+move together, or neither moves. Every trade is a two-phase escrow whose only
+exits are settlement to the counterparty or refund to the owner; every order,
+funding, settlement and abort is a leaf of a Merkle mountain range whose root
+the network certifies; a batch matching engine clears orders at a single
+uniform price per window and settles each fill through the same core.
 
-Tachyon is three Motoko contracts on the Thebes substrate:
+Tachyon is written in Motoko for the Thebes substrate. It implements BIS DvP
+Model 1 (gross, simultaneous, both-or-neither) over any ICRC-1/ICRC-2 ledger
+for cash and fungible assets and any ICRC-7 ledger for unique assets, so the
+same core settles token against token, shares against cash, and a registered
+unique asset against cash. Its matching engine follows the frequent batch
+auction of Budish, Cramton and Shim.
 
-| Contract | Role |
+**Type-safe, memory-safe, no silent errors.** Motoko is a strongly and
+statically typed language of the ML family. It has option types in place of
+nulls, arbitrary-precision and overflow-checked arithmetic that traps rather
+than wraps, garbage-collected memory with no pointers to corrupt, and atomic
+message execution: a trap rolls the whole message back. Tachyon is written to
+that discipline throughout. Every refusal is a typed `Result` value with its
+reason (a leg not yet escrowed, a deadline not reached, a caller who is not
+the maker), never a default silently applied; every invariant is checked in
+the contract on every transition and a violation traps the message; a ledger
+reply is never trusted beyond what the ledger's own records confirm.
+
+**Status.** The settlement core is verified on pocket-thebes, a four-validator
+chain running the production node binary under the production environment
+(25 of 25 rows), and on a throwaway chain; the matching engine and the listing
+registry are verified in the interpreter and on the throwaway chain. Not
+deployed to the production chain. Not independently audited. See
+`docs/VERIFICATION.md`.
+
+## Why it runs on Thebes
+
+A settlement system holds other people's assets for the duration of a trade.
+Running it as a smart contract on the Thebes substrate changes what that
+custody is:
+
+- **Redundant by construction.** The core does not run on a server; it runs on
+  every validator of the network, and an escrow exists only as the state a
+  Byzantine fault-tolerant quorum of them agrees on. There is no primary to
+  fail over from and no replica to fall behind.
+
+- **Tamper-proof execution.** A settlement or a refund happens only if the
+  validators executed the same command on the same state and reached the same
+  result. No administrator, no operator of a single machine and no validator
+  on its own can release an escrow, redirect a payout or remove a receipt: the
+  receipt log is append-only and hash-chained, and the state every validator
+  holds is hashed and compared at every height.
+
+- **Verification and proofs.** Every receipt is a leaf of a Merkle mountain
+  range whose root is certified by the network. A counterparty, a custodian or
+  a regulator holding a receipt and its inclusion proof verifies it against the
+  certified root without trusting the venue or any one validator.
+
+- **A venue the participants can operate.** The validators of a Thebes network
+  can be run by the participants themselves, the settlement members, the
+  custodian, the regulator and an auditor, so that settlement runs on
+  infrastructure they jointly operate and jointly verify.
+
+## What is here
+
+| Contract | What it does |
 |---|---|
-| `core/` | the settlement core: two-phase escrow, both-or-neither settlement, reclaim after the deadline, idempotent retry, a Merkle mountain range receipt for every event |
-| `matching/` | a sealed batch matching engine over the core: orders staged into windows, cleared as a batch, each fill settled through the core as a matched obligation |
-| `listing/` | the issuer-gated registry of what is tradeable: fungible shares and unique asset collections, funded-check at listing time |
-
-Any ICRC-1/ICRC-2 ledger serves as the cash leg or a fungible asset leg; an ICRC-7 ledger serves as
-a unique-asset leg. The same core therefore settles token against token, shares against cash, and a
-registered unique asset against cash.
-
-**Status: the settlement core verified on pocket-thebes (the production node binary and environment,
-four validators, 25 of 25 rows) and on a throwaway chain; not deployed to the production chain; not
-independently audited.** See `docs/VERIFICATION.md` for what has been
-established and what has not.
-
-## Properties
-
-1. **Both or neither.** A payout to either party is possible only after both legs are confirmed
-   in escrow (INV-DVP-2). A trade whose second leg never arrives is reclaimable in full by the party
-   that funded, once the deadline has passed (INV-DVP-4).
-2. **Conservation.** Per trade, what leaves the core on each leg never exceeds what was escrowed on
-   that leg; the core mints and burns nothing (INV-DVP-1).
-3. **No double resolution.** No escrow is both settled and refunded; terminal states are mutually
-   exclusive (INV-DVP-3).
-4. **Idempotent settlement.** A payout retried after a transient ledger failure does not pay twice;
-   a repeated matched-settlement call re-drives the existing trade rather than creating a second
-   (INV-DVP-5, `matchSeq`).
-5. **A ledger's `Duplicate` reply is never trusted on its own**; the named escrow is verified first.
-6. **Every order, funding, settlement and abort is appended to a Merkle mountain range** whose root
-   is queryable, so a settlement trail can be verified outside the chain.
-
-## Design
-
-`docs/DESIGN.md`: the escrow state machine, why escrow-and-settle rather than a transfer between
-parties, the trust model, the matching engine's sealed windows, and the listing gate.
+| **`core/`: the settlement core** | Two-phase escrow (fund, settle, abort); both-or-neither settlement gated on both legs confirmed in escrow; reclaim in full after the deadline; idempotent retry of a failed payout with a fixed `created_at_time` so the ledger deduplicates; a ledger `Duplicate` verified against the named escrow before it is trusted; five invariants checked on every transition; a Merkle mountain range receipt for every event; the ICRC-7 leg for unique assets. |
+| **`matching/`: the batch matching engine** | Orders staged into windows and cleared at one uniform price that maximises executed volume; price-time priority with pro-rata at the margin; reservation against the core rather than custody; each fill a settlement obligation driven through the core as a matched trade; clearing metered against an instruction budget and resumed across rounds, so batch size is unbounded without a partially applied chunk. |
+| **`listing/`: the listing registry** | The issuer-gated record of what is tradeable: fungible shares and unique-asset collections, funded-check at listing time; consulted by the matching engine when configured. |
 
 ## Layout
 
 ```
-core/src/       DvpTypes, DvpLogic (pure decision core), DvpCore (the actor), Guards,
-                ICRC and ICRC7 interfaces, MerkleMMR
-core/test/      run_tests.mo (90,035 checks incl. a 10,000-trial property simulation),
-                run_tests_icrc7.mo (25,033 checks)
-core/fixtures/  the ledger fixtures (ICRC-1/2, and the flaky variant for failure injection)
-test/pocket/    battery.py: the settlement battery on a Thebes chain (pocket-thebes or any network)
+core/src/       DvpTypes, DvpLogic (the pure decision core), DvpCore (the actor),
+                Guards, the ICRC-1/2 and ICRC-7 interfaces, MerkleMMR, the land ledger
+core/test/      the interpreter batteries (90,035 and 25,033 checks)
+core/fixtures/  the ledger fixtures: an ICRC-1/2 ledger and its flaky variant for
+                failure injection
 matching/src/   MatchTypes, MatchLogic (pure), Matching (the actor), Guards, ICRC
-matching/test/  run_tests_matching.mo (53,425 checks, 4,000 randomised windows)
+matching/test/  the interpreter battery (53,425 checks over 4,000 randomised windows)
 listing/src/    ListingRegistry
-docs/           DESIGN.md, VERIFICATION.md
+test/pocket/    battery.py: the settlement battery on a Thebes chain
+deploy/         an example thebes-deploy manifest
+docs/           DESIGN.md, VERIFICATION.md, the run of record
 ```
 
-## Build and test
+## Building and testing
 
-```sh
+Requirements: `moc` 1.4.1 and `mops` (`mops install` fetches `core` and `sha2`),
+`thebes-deploy` for a chain, Python 3 for the chain battery.
+
+```
 mops install
 S=$(mops sources)
 moc --legacy-persistence $S -o build/DvpCore.wasm         core/src/DvpCore.mo
@@ -70,21 +101,33 @@ moc -r $S core/test/run_tests_icrc7.mo
 moc -r $S matching/test/run_tests_matching.mo
 ```
 
-Toolchain: moc 1.4.1, `mo:core` 2.4.0, `sha2` 0.1.9 (pinned in `mops.lock`). The example manifest
-`deploy/example.thebes.toml` deploys with `thebes-deploy`; the validator list is the network's own.
+The contracts are built with legacy (classical) persistence so that an in-place
+upgrade keeps its state. `test/pocket/README.md` describes the battery on a
+chain; `deploy/example.thebes.toml` is the manifest shape.
 
 ## Known limitations
 
-- **Time.** Funding deadlines are compared against the contract clock. On the Thebes substrate the
-  contract clock is derived from block height until real block timestamps are activated, so a
-  deadline expressed in seconds is a deadline in blocks. Deadlines are to be expressed against the
-  application calendar; this change is scheduled and not yet made.
-- **Read after write.** A query issued immediately after a successful update may be served by a
-  validator that has not yet applied it. Clients re-read until the update is reflected;
-  `test/pocket/battery.py` shows the pattern.
-- **Cycle cost.** A settlement is three to four inter-canister calls; the cost per trade under the
-  substrate's credit gate has not been measured on the production binary.
-- **Matching and listing not yet run on the production binary.** The settlement core has been;
-  the M-series rows for the matching engine have not.
+- **Time.** Funding deadlines are compared against the contract clock, which on
+  the substrate is derived from block height until real block timestamps are
+  activated; a deadline in seconds is a deadline in blocks (measured in
+  `docs/VERIFICATION.md`). The scheduled change expresses deadlines against the
+  application calendar.
+- **Read after write.** A query issued immediately after an update may be served
+  by a validator that has not yet applied it; clients re-read until the update
+  is reflected, as `test/pocket/battery.py` does.
+- **Matching and listing on the production binary.** The settlement core has
+  been run there; the matching engine's rows have not yet.
+- **Cycle cost per settlement** under the substrate's credit gate is not yet a
+  recorded figure.
 
-Attribution: Thebes Core Team. Licence: Apache 2.0.
+## Design
+
+`docs/DESIGN.md` describes the escrow state machine, why escrow-and-settle
+rather than a transfer between parties, the trust model, the invariants, the
+ledger-reply rules, the receipts, the matching engine and the listing gate.
+
+## Licence
+
+Apache License 2.0 (see `LICENSE`).
+
+Attribution: Thebes Core Team.
