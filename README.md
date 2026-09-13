@@ -1,18 +1,39 @@
 # Tachyon: Delivery-versus-Payment Settlement on Thebes
 
-A settlement layer that runs as a smart contract: an asset leg and a cash leg
-move together, or neither moves. Every trade is a two-phase escrow whose only
-exits are settlement to the counterparty or refund to the owner; every order,
-funding, settlement and abort is a leaf of a Merkle mountain range whose root
-the network certifies; a batch matching engine clears orders at a single
-uniform price per window and settles each fill through the same core.
+**Tachyon is a delivery-versus-payment (DvP) settlement engine that runs as a
+smart contract on the Thebes substrate.** An asset leg and a cash leg move
+together, or neither moves. It settles any ICRC-1/ICRC-2 token against any
+other, fungible shares against cash, and ICRC-7 unique assets against cash,
+through a two-phase escrow, a batch matching engine with a single uniform
+clearing price per window, and a certified receipt for every event. Written
+in Motoko. Apache 2.0.
 
-Tachyon is written in Motoko for the Thebes substrate. It implements BIS DvP
-Model 1 (gross, simultaneous, both-or-neither) over any ICRC-1/ICRC-2 ledger
-for cash and fungible assets and any ICRC-7 ledger for unique assets, so the
-same core settles token against token, shares against cash, and a registered
-unique asset against cash. Its matching engine follows the frequent batch
-auction of Budish, Cramton and Shim.
+- **Both or neither.** A payout requires both legs confirmed in escrow; a trade
+  whose second leg never arrives is reclaimable in full after its deadline.
+- **Conservation.** Per trade and per leg, nothing leaves the core beyond what
+  was escrowed; the core mints and burns nothing.
+- **Idempotent settlement.** A payout retried after a ledger failure never pays
+  twice; a repeated matched settlement re-drives the same trade.
+- **Certified receipts.** Every order, funding, settlement and abort is a leaf of
+  a Merkle mountain range whose root the network certifies; a receipt and its
+  inclusion proof verify outside the chain.
+- **Sealed batch matching.** Orders are staged into windows and cleared at one
+  uniform price (a frequent batch auction), each fill settled through the core.
+
+| | |
+|---|---|
+| Model | BIS DvP Model 1: gross, simultaneous, both-or-neither |
+| Legs | ICRC-1/ICRC-2 (cash, fungible assets), ICRC-7 (unique assets) |
+| Matching | frequent batch auction, uniform clearing price, price-time priority, bounded clearing |
+| Proofs | Merkle mountain range receipts with a certified root |
+| Verification | 168,493 interpreter checks; 25 of 25 rows on a four-validator chain running the production node binary |
+| Status | not deployed to the production chain; not independently audited |
+
+Tachyon implements BIS DvP Model 1 (gross, simultaneous, both-or-neither) over
+any ICRC-1/ICRC-2 ledger for cash and fungible assets and any ICRC-7 ledger for
+unique assets, so the same core settles token against token, shares against
+cash, and a registered unique asset against cash. Its matching engine follows
+the frequent batch auction of Budish, Cramton and Shim.
 
 **Type-safe, memory-safe, no silent errors.** Motoko is a strongly and
 statically typed language of the ML family. It has option types in place of
