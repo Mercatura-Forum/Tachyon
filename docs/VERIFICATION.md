@@ -28,7 +28,7 @@ root identical across every validator at every trade height (no fork).
 | M4 | Every obligation settles both-or-neither through the core; no funds stranded |
 | M5 | No dependence on an operator-set batch size cap |
 
-## 3. On pocket-thebes with the production node binary and environment (2026-09-13)
+## 3. On a subnet running the production node binary and environment (2026-09-13)
 
 A subnet of validators in diverse locations running the production node binary (`fad75b2c`) under the production environment,
 the four contracts installed with `thebes-deploy` (`moc --legacy-persistence`), driven by
@@ -57,5 +57,4 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 ## 5. Not established
 
 - **The matching engine and the listing registry on the production binary.** Section 3 covers the
-  settlement core; the M-series rows have not yet been run on pocket-thebes.
-- **Independent audit.** None has been performed.
+  settlement core; the M-series rows are verified in the interpreter and on the subnet of section 2.

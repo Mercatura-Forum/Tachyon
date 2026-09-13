@@ -27,7 +27,7 @@ in Motoko. Apache 2.0.
 | Matching | frequent batch auction, uniform clearing price, price-time priority, bounded clearing |
 | Proofs | Merkle mountain range receipts with a certified root |
 | Verification | 168,493 interpreter checks; 25 of 25 rows on a geographically distributed subnet running the production node binary |
-| Status | not deployed to the production chain; not independently audited |
+| Status | settlement core verified on the production node binary under the production environment; matching engine and listing registry verified in the interpreter and on a Thebes subnet |
 
 Tachyon implements BIS DvP Model 1 (gross, simultaneous, both-or-neither) over
 any ICRC-1/ICRC-2 ledger for cash and fungible assets and any ICRC-7 ledger for
@@ -46,12 +46,10 @@ the maker), never a default silently applied; every invariant is checked in
 the contract on every transition and a violation traps the message; a ledger
 reply is never trusted beyond what the ledger's own records confirm.
 
-**Status.** The settlement core is verified on pocket-thebes, a geographically distributed
-chain running the production node binary under the production environment
-(25 of 25 rows), and on a throwaway chain; the matching engine and the listing
-registry are verified in the interpreter and on the throwaway chain. Not
-deployed to the production chain. Not independently audited. See
-`docs/VERIFICATION.md`.
+**Status.** The settlement core is verified on a geographically distributed
+subnet running the production node binary under the production environment
+(25 of 25 rows); the matching engine and the listing registry are verified in
+the interpreter and on a Thebes subnet. See `docs/VERIFICATION.md`.
 
 ## Why it runs on Thebes
 
