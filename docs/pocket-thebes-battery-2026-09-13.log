@@ -1,0 +1,39 @@
+maker=<maker> taker=<taker> core=wo4es-tqaad-etgrk-3la3q cash=j6i3f-kqaab-64ksj-tt2gq shares=yn2bi-3yaad-cbzjx-2vs7q flaky=cx5mm-haaad-a77fb-i2n3q
+  PASS  the core reports its own principal as the manifest cid maps it
+== T1 happy path
+  PASS  T1 openTrade
+  T1 openTrade note: "asset leg escrowed at ledger block 3" makerEscrowed=true
+  PASS  T1 fundMaker reports the maker leg escrowed (inline at open, or now)
+  PASS  T1 fundTaker escrowed and auto-settled
+  PASS  T1 status Settled
+  PASS  T1 taker received asset minus one payout fee
+  PASS  T1 maker received cash minus one payout fee
+  PASS  T1 core holds no residual asset or cash
+  PASS  T1 receipt chain ORDER, FUND, FUND, SETTLED
+  PASS  T1 audit root present
+== T5 adversarial
+  PASS  T5 settle again is a no-op: refused or reported already settled, and no second payment
+  PASS  T5 reclaim after settle refused
+  PASS  T5 settle before both escrowed refused
+  PASS  T5 taker cannot fund the maker leg
+== T3 abort and reclaim
+  PASS  T3 maker leg escrowed
+  PASS  T3 reclaim before the deadline refused
+  PASS  T3 reclaim after the deadline accepted
+  PASS  T3 status Aborted
+  PASS  T3 maker got the asset back minus the escrow and refund fees
+T3 clock measurement: a 20 chain-second deadline was accepted 13 wall seconds after open
+== T4 idempotent retry under an injected failure
+  T4 fundMaker: 67_871 = 5 : nat;       3_050_377_874 = true;       3_878_592_285 = "leg escrowed; awaiting counterparty";     }   }, ) 
+  T4 first attempt note: 063_776_325 = true;       2_293_067_871 = 5 : nat;       3_050_377_874 = true;       3_878_592_285 = "both legs escrowed; legA->taker paid; legB pending: ledger temporarily unavailable";     }   }, ) 
+  T4 retry: aker paid; legB->maker paid";       1_513_678_431 = true;       2_293_067_871 = 5 : nat;       2_559_269_873 = 2_990 : nat;       3_729_512_818 = 1_490 : nat;       3_986_651_872 = true;     }   }, ) 
+  T4 second retry: _398_258 = "already settled";       1_513_678_431 = true;       2_293_067_871 = 5 : nat;       2_559_269_873 = 2_990 : nat;       3_729_512_818 = 1_490 : nat;       3_986_651_872 = true;     }   }, ) 
+  PASS  T4 status Settled after the retry
+  PASS  T4 maker paid exactly once on the flaky ledger
+  PASS  T4 taker received the asset exactly once
+  PASS  T4 core holds no residual on the flaky ledger
+  PASS  T4 no invariant violation logged
+== T2 no fork
+  PASS  T2 validators agree on the state root at a common height
+
+25 passed, 0 failed

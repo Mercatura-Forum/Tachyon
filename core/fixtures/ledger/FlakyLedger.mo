@@ -1,4 +1,4 @@
-/// IndexedLedger.mo - Self-Indexed ICRC-1/ICRC-2 Token Ledger (v3 - persistent)
+/// FlakyLedger.mo - the IndexedLedger fixture with one addition: an owner-set count of transfers that fail with TemporarilyUnavailable, for the retry battery.
 ///
 /// Refactored to use modular components with externalized stable state:
 ///   - Balances.mo (port of DFINITY balances.rs)
@@ -31,23 +31,7 @@ import BLog "BlockLog";
 import Cert "CertifiedTree";
 import Bloom "BloomFilter";
 
-// FlakyLedger - a REAL ICRC-1/2 ledger (verbatim IndexedLedger logic) with one addition:
-// a controller-settable clean-transient fault injector on icrc1_transfer, used ONLY as a
-// throwaway TEST FIXTURE to drive the DvP core's idempotent-retry path. The
-// injected failure returns BEFORE any state change or dedup record, so it is a genuine
-// transient (a retry re-sends normally) - not a stub of the DvP core, which stays pristine.
-shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
-
-  // T4 fault injection: the next N icrc1_transfer calls return #TemporarilyUnavailable
-  // (clean, no commit) before falling through to normal behavior.
-  var failTransfersRemaining : Nat = 0;
-
-  public shared ({ caller }) func set_fail_next(n : Nat) : async () {
-    if (not Principal.equal(caller, initMsg.caller)) Runtime.trap("Not owner");
-    failTransfersRemaining := n;
-  };
-
-  public query func fail_next_remaining() : async Nat { failTransfersRemaining };
+shared(initMsg) persistent actor class FlakyLedger(args : T.InitArgs) = self {
 
   // ═══════════════════════════════════════════════════════
   //  CORE STATE - stable records (survive upgrades)
@@ -71,8 +55,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   var feeCollector : ?T.Account = null;
 
   // Dedup: Bloom filter (O(1) fast path) + Map (exact fallback)
-  var recentTxs = Map.empty<Nat64, Nat>();
-  var bloomState : Bloom.State = Bloom.newState(86_400_000_000_000); // 24h window
+  var recentTxs = Map.empty<Blob, { blockIndex : Nat; timestamp : Nat64 }>();
   let TX_WINDOW_NS : Nat64 = 86_400_000_000_000;
   let PERMITTED_DRIFT_NS : Nat64 = 60_000_000_000;
 
@@ -109,25 +92,30 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   // Prune up to 20 expired entries per call (amortized GC)
   var dedupPruneCounter : Nat = 0;
   func pruneDedupMap() {
-    dedupPruneCounter += 1;
-    if (dedupPruneCounter % 10 != 0) return; // prune every 10th call
     let n = now();
-    let cutoff = n - TX_WINDOW_NS - PERMITTED_DRIFT_NS - 60_000_000_000; // 1 min margin
-    let toDelete = List.empty<Nat64>();
-    var count : Nat = 0;
-    for ((ts, _) in Map.entries(recentTxs)) {
-      if (count >= 20) return;
-      if (ts < cutoff) {
-        List.add(toDelete, ts);
-        count += 1;
-      };
+    let stale = List.empty<Blob>();
+    for ((k, e) in Map.entries(recentTxs)) {
+      if (e.timestamp + TX_WINDOW_NS + PERMITTED_DRIFT_NS < n) List.add(stale, k);
     };
-    for (ts in List.values(toDelete)) {
-      ignore Map.delete(recentTxs, Nat64.compare, ts);
-    };
+    for (k in List.values(stale)) ignore Map.delete(recentTxs, Blob.compare, k);
   };
 
-  func checkDedupAndTime(created_at_time : ?Nat64) : { #ok; #TooOld; #InFuture : Nat64; #Duplicate : Nat } {
+  /// The ICRC-1 deduplication key: the caller, the time, the amount and the memo. Checked
+  /// before a transfer is attempted; RECORDED only when its block is appended, so a refused
+  /// transfer never poisons a retry that reuses the same created_at_time.
+  func dedupKey(caller : Principal, ts : Nat64, amount : Nat, memo : ?Blob) : Blob {
+    let buf = List.empty<Nat8>();
+    for (b in Principal.toBlob(caller).vals()) List.add(buf, b);
+    var t = ts; var i = 0;
+    while (i < 8) { List.add(buf, Nat8.fromNat(Nat64.toNat(t % 256))); t := t / 256; i += 1 };
+    var a = amount;
+    while (a > 0) { List.add(buf, Nat8.fromNat(a % 256)); a := a / 256 };
+    List.add(buf, 255 : Nat8);
+    switch (memo) { case (?m) { for (b in m.vals()) List.add(buf, b) }; case null {} };
+    Blob.fromArray(List.toArray(buf))
+  };
+
+  func checkDedupAndTime(caller : Principal, created_at_time : ?Nat64, amount : Nat, memo : ?Blob) : { #ok; #TooOld; #InFuture : Nat64; #Duplicate : Nat } {
     pruneDedupMap();
     switch (created_at_time) {
       case null #ok;
@@ -135,22 +123,19 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
         let n = now();
         if (ts + TX_WINDOW_NS + PERMITTED_DRIFT_NS < n) return #TooOld;
         if (ts > n + PERMITTED_DRIFT_NS) return #InFuture(n);
-        // Bloom filter fast path: if definitely NOT seen, skip Map lookup entirely
-        if (not Bloom.mightContain(bloomState, ts, n)) {
-          Bloom.add(bloomState, ts, n);
-          Map.add(recentTxs, Nat64.compare, ts, BLog.length(blockState));
-          return #ok;
-        };
-        // Bloom says "maybe seen" - fall through to exact Map check
-        switch (Map.get(recentTxs, Nat64.compare, ts)) {
-          case (?idx) #Duplicate(idx);
-          case null {
-            Bloom.add(bloomState, ts, n);
-            Map.add(recentTxs, Nat64.compare, ts, BLog.length(blockState));
-            #ok
-          };
+        switch (Map.get(recentTxs, Blob.compare, dedupKey(caller, ts, amount, memo))) {
+          case (?e) #Duplicate(e.blockIndex);
+          case null #ok;
         };
       };
+    };
+  };
+
+  /// Record the key of a transfer whose block has just been appended.
+  func recordDedup(caller : Principal, created_at_time : ?Nat64, amount : Nat, memo : ?Blob, idx : Nat) {
+    switch (created_at_time) {
+      case (?ts) Map.add(recentTxs, Blob.compare, dedupKey(caller, ts, amount, memo), { blockIndex = idx; timestamp = ts });
+      case null {};
     };
   };
 
@@ -179,8 +164,17 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
   //  ICRC-1: TRANSFER
   // ═══════════════════════════════════════════════════════
 
+  // Failure injection for the settlement battery: the next n transfers answer TemporarilyUnavailable.
+  var failTransfersRemaining : Nat = 0;
+
+  public shared ({ caller }) func set_fail_next(n : Nat) : async () {
+    if (not Principal.equal(caller, initMsg.caller)) Runtime.trap("Not owner");
+    failTransfersRemaining := n;
+  };
+
+  public query func fail_next_remaining() : async Nat { failTransfersRemaining };
+
   public shared ({ caller }) func icrc1_transfer(transferArgs : T.TransferArgs) : async { #Ok : Nat; #Err : T.TransferError } {
-    // T4 clean-transient injection - fire BEFORE any state/dedup mutation so a retry re-sends.
     if (failTransfersRemaining > 0) {
       failTransfersRemaining -= 1;
       return #Err(#TemporarilyUnavailable);
@@ -200,7 +194,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     validateMemo(transferArgs.memo);
 
-    switch (checkDedupAndTime(transferArgs.created_at_time)) {
+    switch (checkDedupAndTime(caller, transferArgs.created_at_time, transferArgs.amount, transferArgs.memo)) {
       case (#TooOld) return #Err(#TooOld);
       case (#InFuture(t)) return #Err(#CreatedInFuture({ ledger_time = t }));
       case (#Duplicate(idx)) return #Err(#Duplicate({ duplicate_of = idx }));
@@ -215,6 +209,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       };
       let tx = makeTx("burn", ?from, null, null, amount, ?fee, transferArgs.memo);
       let idx = appendAndCertify(tx, ?fee);
+      recordDedup(caller, transferArgs.created_at_time, transferArgs.amount, transferArgs.memo, idx);
       return #Ok(idx);
     };
 
@@ -226,6 +221,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
       };
       let tx = makeTx("mint", null, ?to, null, amount, null, transferArgs.memo);
       let idx = appendAndCertify(tx, null);
+      recordDedup(caller, transferArgs.created_at_time, transferArgs.amount, transferArgs.memo, idx);
       return #Ok(idx);
     };
 
@@ -236,6 +232,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
     };
     let tx = makeTx("transfer", ?from, ?to, null, amount, ?fee, transferArgs.memo);
     let idx = appendAndCertify(tx, ?fee);
+    recordDedup(caller, transferArgs.created_at_time, transferArgs.amount, transferArgs.memo, idx);
     #Ok(idx)
   };
 
@@ -264,7 +261,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     validateMemo(approveArgs.memo);
 
-    switch (checkDedupAndTime(approveArgs.created_at_time)) {
+    switch (checkDedupAndTime(caller, approveArgs.created_at_time, approveArgs.amount, approveArgs.memo)) {
       case (#TooOld) return #Err(#TooOld);
       case (#InFuture(t)) return #Err(#CreatedInFuture({ ledger_time = t }));
       case (#Duplicate(idx)) return #Err(#Duplicate({ duplicate_of = idx }));
@@ -296,6 +293,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     let tx = makeTx("approve", ?from, null, ?spender, approveArgs.amount, ?fee, approveArgs.memo);
     let idx = appendAndCertify(tx, ?fee);
+    recordDedup(caller, approveArgs.created_at_time, approveArgs.amount, approveArgs.memo, idx);
     #Ok(idx)
   };
 
@@ -316,7 +314,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     validateMemo(tfArgs.memo);
 
-    switch (checkDedupAndTime(tfArgs.created_at_time)) {
+    switch (checkDedupAndTime(caller, tfArgs.created_at_time, tfArgs.amount, tfArgs.memo)) {
       case (#TooOld) return #Err(#TooOld);
       case (#InFuture(t)) return #Err(#CreatedInFuture({ ledger_time = t }));
       case (#Duplicate(idx)) return #Err(#Duplicate({ duplicate_of = idx }));
@@ -355,6 +353,7 @@ shared(initMsg) persistent actor class IndexedLedger(args : T.InitArgs) = self {
 
     let tx = makeTx("transfer", ?from, ?to, ?spender, amount, ?fee, tfArgs.memo);
     let idx = appendAndCertify(tx, ?fee);
+    recordDedup(caller, tfArgs.created_at_time, tfArgs.amount, tfArgs.memo, idx);
     #Ok(idx)
   };
 

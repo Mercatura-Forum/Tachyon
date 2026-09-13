@@ -1,3 +1,6 @@
 .mops/
 build/
 .dfx/
+.thebes/
+test/pocket/out/
+test/pocket/pocket.thebes.toml

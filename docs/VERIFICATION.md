@@ -28,20 +28,50 @@ root identical across all four validators at every trade height (no fork).
 | M4 | Every obligation settles both-or-neither through the core; no funds stranded |
 | M5 | No dependence on an operator-set batch size cap |
 
-## 3. On local replicas (September 2026)
+## 3. On pocket-thebes with the production node binary and environment (2026-09-13)
+
+Four validators running the production node binary (`fad75b2c`) under the production environment,
+the four contracts installed with `thebes-deploy` (`moc --legacy-persistence`), driven by
+`test/pocket/battery.py`. Log: `docs/pocket-thebes-battery-2026-09-13.log`. **25 of 25 rows pass.**
+
+| Row | What was shown |
+|---|---|
+| T1 | Maker leg escrowed inline at open, taker leg escrowed, auto-settled: asset to taker and cash to maker each minus one fee, core residual zero, receipt chain ORDER, FUND, FUND, SETTLED, audit root present |
+| T5 | Settle again is a no-op (reported already settled, no second payment); reclaim after settle refused; settle before both escrowed refused; taker cannot fund the maker leg |
+| T3 | Reclaim refused before the deadline; accepted after it; status Aborted; maker refunded minus exactly the escrow and refund fees |
+| T4 | Cash ledger injected to fail its first payout: first attempt paid leg A and reported leg B pending; the retry settled; maker paid exactly once, taker received exactly once, zero residual, no invariant violation |
+| T2 | All four validators report the same state root at a common height |
+
+Three substrate behaviours were measured during the run and are absorbed by the harness as a real
+client must absorb them:
+
+- **The contract clock is block-derived.** A deadline of 20 chain-seconds was accepted 13 wall
+  seconds after the trade opened (about 1.5 chain-seconds per wall second on this bed). Deadlines
+  in seconds are deadlines in blocks until real block timestamps are activated.
+- **A query issued right after an update may be served by a validator that has not applied it.**
+  The harness re-reads a status until it reflects the update.
+- **A call whose nonce the chain has already executed for the sender is refused
+  (`REPLAY_REJECTED`)** and must be resubmitted; an approval is confirmed by reading the allowance
+  back before the escrow that depends on it.
+
+The run also exposed a defect in the vendored ledger fixture, fixed here: the deduplication key was
+recorded before the transfer was validated, so a transfer refused on allowance poisoned every retry
+that reused the same `created_at_time`; and the key was `created_at_time` alone. The fixture now
+keys on caller, time, amount and memo, and records the key only when the block is appended. The
+core's rule that a ledger `Duplicate` is verified against the named escrow before it is trusted is
+what turned the defect into a refusal rather than a loss.
+
+## 4. On local replicas (September 2026)
 
 The core as a consumer of journal-backed ledgers: reservation escrow on such ledgers, and the rule
 that a ledger `Duplicate` reply is not trusted until the named escrow is verified.
 
-## 4. Not established
+## 5. Not established
 
-- **The production node binary and the production environment.** Every replica run above used the
-  node binary of June 2026 or a local replica. A run on the production binary with the production
-  environment is scheduled before any production use.
-- **The contract clock.** On the substrate the contract clock is derived from block height until
-  real block timestamps are activated. Funding deadlines are currently compared against that
-  clock; the scheduled change expresses them against the application calendar.
-- **Read-after-write.** A query immediately after an update may be served by a validator that has
-  not applied it. The client-side sequence-and-retry pattern is not part of this repository.
-- **Cycle cost per settlement** under the substrate's credit gate.
+- **The matching engine and the listing registry on the production binary.** Section 3 covers the
+  settlement core; the M-series rows have not yet been run on pocket-thebes.
+- **The contract clock.** Deadlines are compared against the block-derived clock (measured in
+  section 3); the scheduled change expresses them against the application calendar.
+- **Cycle cost per settlement** under the substrate's credit gate: the engine reports 14,000 to
+  17,000 cycles per lifted reply on this bed; the per-trade figure is not yet a recorded number.
 - **Independent audit.** None has been performed.
