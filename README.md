@@ -137,6 +137,15 @@ chain; `deploy/example.thebes.toml` is the manifest shape.
 rather than a transfer between parties, the trust model, the invariants, the
 ledger-reply rules, the receipts, the matching engine and the listing gate.
 
+## Contributing
+
+This repository was published as a single commit, by design: the product was built in a
+private tree through iteration, test batteries, oracle comparison and review, and the public
+repository is the clean cut of the result, without the lab work behind it. From this release
+onward, work continues here in the open. Open an issue for a defect or a question, with the
+file and line; open a pull request against `main` with the battery green. Contributions are
+attributed to the team.
+
 ## Licence
 
 Apache License 2.0 (see `LICENSE`).
