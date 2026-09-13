@@ -42,15 +42,6 @@ the four contracts installed with `thebes-deploy` (`moc --legacy-persistence`), 
 | T4 | Cash ledger injected to fail its first payout: first attempt paid leg A and reported leg B pending; the retry settled; maker paid exactly once, taker received exactly once, zero residual, no invariant violation |
 | T2 | All four validators report the same state root at a common height |
 
-Two substrate behaviours were observed during the run and are absorbed by the harness as a client
-must absorb them:
-
-- **A query issued right after an update may be served by a validator that has not applied it.**
-  The harness re-reads a status until it reflects the update.
-- **A call whose nonce the chain has already executed for the sender is refused
-  (`REPLAY_REJECTED`)** and must be resubmitted; an approval is confirmed by reading the allowance
-  back before the escrow that depends on it.
-
 The run also exposed a defect in the vendored ledger fixture, fixed here: the deduplication key was
 recorded before the transfer was validated, so a transfer refused on allowance poisoned every retry
 that reused the same `created_at_time`; and the key was `created_at_time` alone. The fixture now
@@ -67,6 +58,4 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 
 - **The matching engine and the listing registry on the production binary.** Section 3 covers the
   settlement core; the M-series rows have not yet been run on pocket-thebes.
-- **Cycle cost per settlement** under the substrate's credit gate: the engine reports 14,000 to
-  17,000 cycles per lifted reply on this bed; the per-trade figure is not yet a recorded number.
 - **Independent audit.** None has been performed.

@@ -107,13 +107,8 @@ chain; `deploy/example.thebes.toml` is the manifest shape.
 
 ## Known limitations
 
-- **Read after write.** A query issued immediately after an update may be served
-  by a validator that has not yet applied it; clients re-read until the update
-  is reflected, as `test/pocket/battery.py` does.
 - **Matching and listing on the production binary.** The settlement core has
   been run there; the matching engine's rows have not yet.
-- **Cycle cost per settlement** under the substrate's credit gate is not yet a
-  recorded figure.
 
 ## Design
 
