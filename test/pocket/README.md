@@ -1,6 +1,6 @@
 # The settlement battery on a Thebes chain
 
-1. Stand up a chain (pocket-thebes, or any four-validator network) and create two identities:
+1. Stand up a chain (pocket-thebes, or any Thebes subnet) and create two identities:
    `thebes-deploy identity new tachyon-maker` and `thebes-deploy identity new tachyon-taker`.
 2. Write `test/pocket/pocket.thebes.toml` from `deploy/example.thebes.toml`: the network's
    validators, the four contracts (`cash`, `shares`, `cash_flaky`, `core`), and an initial balance

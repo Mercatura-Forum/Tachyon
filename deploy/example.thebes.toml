@@ -1,4 +1,4 @@
-# Example thebes-deploy manifest for Tachyon on a four-validator Thebes network.
+# Example thebes-deploy manifest for Tachyon on a Thebes subnet.
 # Replace the validator list with the network's own; cids are assigned at install.
 [project]
 name = "tachyon"

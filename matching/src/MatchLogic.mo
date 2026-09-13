@@ -7,7 +7,7 @@
 ///
 /// Microstructure: frequent batch auction, single uniform clearing price p* per window
 /// (Budish-Cramton-Shim). p* maximises executable volume; ties broken to minimum imbalance, then
-/// lowest price (deterministic ⇒ identical p* on all 4 nodes ⇒ INV-E2/INV-C2).
+/// lowest price (deterministic ⇒ identical p* on every node of the subnet ⇒ INV-E2/INV-C2).
 
 import Array "mo:core/Array";
 import Nat "mo:core/Nat";
