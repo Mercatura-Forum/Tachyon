@@ -1,0 +1,7 @@
+[package]
+name = "tachyon"
+version = "0.1.0"
+
+[dependencies]
+core = "2.4.0"
+sha2 = "0.1.9"

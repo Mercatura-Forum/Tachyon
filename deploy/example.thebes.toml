@@ -1,0 +1,36 @@
+# Example thebes-deploy manifest for Tachyon on a four-validator Thebes network.
+# Replace the validator list with the network's own; cids are assigned at install.
+[project]
+name = "tachyon"
+default_network = "local"
+chain_id = 4
+
+[networks.local]
+validators = [
+    "http://127.0.0.1:18080",
+    "http://127.0.0.1:18081",
+    "http://127.0.0.1:18082",
+    "http://127.0.0.1:18083",
+]
+routing = "smart"
+
+[canisters.cash]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/IndexedLedger.wasm"
+init = '(record { decimals = 2 : nat8; fee = 10 : nat; name = "Cash"; symbol = "CASH"; max_memo_length = null; max_supply = null; minting_account = record { owner = principal "2vxsx-fae"; subaccount = null }; initial_balances = vec {} })'
+
+[canisters.core]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/DvpCore.wasm"
+
+[canisters.matching]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/Matching.wasm"
+
+[canisters.listing]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/ListingRegistry.wasm"
