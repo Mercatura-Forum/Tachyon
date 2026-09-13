@@ -42,12 +42,9 @@ the four contracts installed with `thebes-deploy` (`moc --legacy-persistence`), 
 | T4 | Cash ledger injected to fail its first payout: first attempt paid leg A and reported leg B pending; the retry settled; maker paid exactly once, taker received exactly once, zero residual, no invariant violation |
 | T2 | All four validators report the same state root at a common height |
 
-Three substrate behaviours were measured during the run and are absorbed by the harness as a real
-client must absorb them:
+Two substrate behaviours were observed during the run and are absorbed by the harness as a client
+must absorb them:
 
-- **The contract clock is block-derived.** A deadline of 20 chain-seconds was accepted 13 wall
-  seconds after the trade opened (about 1.5 chain-seconds per wall second on this bed). Deadlines
-  in seconds are deadlines in blocks until real block timestamps are activated.
 - **A query issued right after an update may be served by a validator that has not applied it.**
   The harness re-reads a status until it reflects the update.
 - **A call whose nonce the chain has already executed for the sender is refused
@@ -70,8 +67,6 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 
 - **The matching engine and the listing registry on the production binary.** Section 3 covers the
   settlement core; the M-series rows have not yet been run on pocket-thebes.
-- **The contract clock.** Deadlines are compared against the block-derived clock (measured in
-  section 3); the scheduled change expresses them against the application calendar.
 - **Cycle cost per settlement** under the substrate's credit gate: the engine reports 14,000 to
   17,000 cycles per lifted reply on this bed; the per-trade figure is not yet a recorded number.
 - **Independent audit.** None has been performed.

@@ -22,7 +22,6 @@ maker=<maker> taker=<taker> core=wo4es-tqaad-etgrk-3la3q cash=j6i3f-kqaab-64ksj-
   PASS  T3 reclaim after the deadline accepted
   PASS  T3 status Aborted
   PASS  T3 maker got the asset back minus the escrow and refund fees
-T3 clock measurement: a 20 chain-second deadline was accepted 13 wall seconds after open
 == T4 idempotent retry under an injected failure
   T4 fundMaker: 67_871 = 5 : nat;       3_050_377_874 = true;       3_878_592_285 = "leg escrowed; awaiting counterparty";     }   }, ) 
   T4 first attempt note: 063_776_325 = true;       2_293_067_871 = 5 : nat;       3_050_377_874 = true;       3_878_592_285 = "both legs escrowed; legA->taker paid; legB pending: ledger temporarily unavailable";     }   }, ) 

@@ -166,9 +166,7 @@ r = td('call', 'core', 'settle', f'({tid2} : nat)', identity='tachyon-maker'); r
 r = td('call', 'core', 'fundMaker', f'({tid2} : nat)', identity='tachyon-taker'); row('T5 taker cannot fund the maker leg', not is_ok(r), r[-160:])
 
 # T3 abort: one leg funded, the deadline passes, the funded party reclaims in full.
-# The deadline is in chain seconds (block-derived clock): 20 chain-seconds elapse in about two wall
-# seconds on a 4-validator bed, so the refusal row uses a long deadline and the acceptance row a
-# short one, and the wall time to acceptance is recorded as the clock measurement.
+# The refusal row uses a long deadline and the acceptance row a short one.
 log('== T3 abort and reclaim')
 approve('shares', 'tachyon-maker', CORE, 2_000 + FEE)
 tid3a, o3a = open_trade('tachyon-maker', TAKER, SHARES, 2_000, CASH, 1_000, 3600)
@@ -177,7 +175,6 @@ r = td('call', 'core', 'reclaim', f'({tid3a} : nat)', identity='tachyon-maker');
 approve('shares', 'tachyon-maker', CORE, 2_000 + FEE)
 m0 = {'ms': bal('shares', MAKER)}
 tid3, o3 = open_trade('tachyon-maker', TAKER, SHARES, 2_000, CASH, 1_000, 20)
-t_open = time.time()
 td('call', 'core', 'fundMaker', f'({tid3} : nat)', identity='tachyon-maker')
 t0 = time.time(); r = ''
 while time.time() - t0 < 600:
@@ -187,7 +184,6 @@ while time.time() - t0 < 600:
 row('T3 reclaim after the deadline accepted', is_ok(r) or status_of(tid3) == 'Aborted', r[-200:])
 row('T3 status Aborted', status_of(tid3, 'Aborted') == 'Aborted', status_of(tid3))
 row('T3 maker got the asset back minus the escrow and refund fees', m0['ms'] - bal('shares', MAKER) == 2 * FEE, (m0['ms'], bal('shares', MAKER)))
-log(f'T3 clock measurement: a 20 chain-second deadline was accepted {time.time() - t_open:.0f} wall seconds after open')
 
 # T4 idempotent retry: the cash payout fails once on the flaky ledger; the retry settles; no double payment.
 log('== T4 idempotent retry under an injected failure')

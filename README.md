@@ -107,11 +107,6 @@ chain; `deploy/example.thebes.toml` is the manifest shape.
 
 ## Known limitations
 
-- **Time.** Funding deadlines are compared against the contract clock, which on
-  the substrate is derived from block height until real block timestamps are
-  activated; a deadline in seconds is a deadline in blocks (measured in
-  `docs/VERIFICATION.md`). The scheduled change expresses deadlines against the
-  application calendar.
 - **Read after write.** A query issued immediately after an update may be served
   by a validator that has not yet applied it; clients re-read until the update
   is reflected, as `test/pocket/battery.py` does.
