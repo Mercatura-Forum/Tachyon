@@ -44,6 +44,7 @@ the state machine, and neither is available to a controller.
 | INV-DVP-3 | No double resolution: no escrow is both settled and refunded. |
 | INV-DVP-4 | No stranding: a terminal status implies every escrowed leg is resolved to exactly one of settled or refunded. |
 | INV-DVP-5 | Idempotent settlement: a payout replayed after a transient failure does not pay twice. |
+| INV-DEL-1 to 5 | The same five over a delivery's single leg, the gate being the escrow and the taker's acceptance (section 6a). |
 
 Each invariant is checked in the contract on every transition (`checkInvariants`); a violation
 traps the message, which discards the transition. The pure decision core (`DvpLogic.mo`) holds
@@ -66,6 +67,31 @@ including a randomised property simulation over fund, settle, abort, retry and r
 Every order, funding, settlement and abort is appended to a Merkle mountain range. The root is
 queryable (`auditRoot`), the events are enumerable (`auditEvents`), and a settlement trail can be
 re-derived and verified outside the chain.
+
+## 6a. Delivery free of payment
+
+A securities movement with no cash against it (a collateral pledge under a credit support annex,
+its return, a transfer to a counterparty's custody account) is the case the DvP models exclude
+(BIS CPSS 1992). The core settles it as a **delivery**: one leg, from a maker to a named taker,
+through the trade's own escrow, payout and refund helpers on the trade's own leg state, so a
+delivery's receipt has the shape of a trade's, one leg short.
+
+- **Open and fund.** The maker opens the delivery to a named taker and escrows the leg into the
+  core (`openDelivery` for a fungible leg, `openTokenDelivery` for a unique asset; `fundDelivery`
+  re-drives an escrow whose reply was lost).
+- **Accept.** The leg moves only when the taker has accepted it (`acceptDelivery`), within the
+  deadline. This is Model 1's discipline applied to one leg: the asset moves when both parties have
+  acted, never by the maker's act alone, so a delivery to the wrong account is refused by the
+  account it reaches rather than reversed. A payout whose ledger did not answer is re-driven by
+  `settleDelivery`, never twice.
+- **Reclaim.** Past the deadline an unaccepted delivery is reclaimed by either party to the maker,
+  in full and once; a delivery never escrowed closes with nothing moved.
+
+The invariants are the trade's, one leg short: INV-DEL-1 conservation, INV-DEL-2 the gate (a payout
+requires the escrow and the acceptance), INV-DEL-3 no double resolution, INV-DEL-4 no stranding,
+INV-DEL-5 idempotence. Deliveries share the trades' id space, so no leg key names two escrows, and
+the audit trail records DELIVERY, FUND, ESCROWED, ACCEPTED and DELIVERED or RECLAIMED under the same
+root as the trades.
 
 ## 7. Matching
 
@@ -101,6 +127,6 @@ unchanged.
   (1992): the three DvP models; Model 1 is implemented here.
 - E. Budish, P. Cramton and J. Shim, *The High-Frequency Trading Arms Race: Frequent Batch
   Auctions as a Market Design Response*, Quarterly Journal of Economics (2015).
-- ICRC-1, ICRC-2 and ICRC-7 token standards (Internet Computer), including the ICRC-1
+- ICRC-1, ICRC-2 and ICRC-7 token standards, including the ICRC-1
   deduplication rule on `created_at_time`.
 - Merkle mountain ranges (P. Todd, 2012; used by OpenTimestamps and Grin).

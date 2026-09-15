@@ -123,6 +123,67 @@ module {
     }
   };
 
+  // ── Delivery free of payment (one leg) ────────────────────────────────────────
+  // A delivery moves one leg from the maker to a named taker with no cash against it: the
+  // collateral pledge, the return, the transfer between two custody accounts. The maker
+  // escrows the leg into the core; the leg moves only when the taker has accepted it, so a
+  // delivery to the wrong account is refused by the account it reaches, never reversed. Past
+  // the deadline an unaccepted delivery is reclaimed by the maker. The leg's escrow, payout
+  // and refund are the trade's own helpers on the trade's own leg state, so a delivery's
+  // receipt has the shape of a trade's, one leg short.
+  //
+  // Open      : awaiting the maker's escrow.
+  // Escrowed  : the leg is in the core; awaiting the taker's acceptance.
+  // Delivered : accepted and paid out to the taker.
+  // Reclaimed : the deadline passed unaccepted; the escrowed leg returned to the maker.
+  public type DeliveryStatus = { #Open; #Escrowed; #Delivered; #Reclaimed };
+
+  public type Delivery = {
+    id : Nat;                   // in the trades' own id space, so a leg key never collides
+    maker : Principal;          // delivers the leg
+    taker : Principal;          // receives it, by its own acceptance
+    leg : Leg;
+    legState : LegState;
+    deadline : Nat64;
+    var accepted : Bool;
+    var status : DeliveryStatus;
+    createdAt : Nat64;
+  };
+
+  public type DeliveryView = {
+    id : Nat;
+    maker : Principal;
+    taker : Principal;
+    leg : Leg;
+    legState : LegStateView;
+    deadline : Nat64;
+    accepted : Bool;
+    status : DeliveryStatus;
+    createdAt : Nat64;
+  };
+
+  public func deliveryView(d : Delivery) : DeliveryView {
+    { id = d.id; maker = d.maker; taker = d.taker; leg = d.leg; legState = legStateView(d.legState); deadline = d.deadline; accepted = d.accepted; status = d.status; createdAt = d.createdAt }
+  };
+
+  public type OpenDeliveryResult = {
+    deliveryId : Nat;
+    status : DeliveryStatus;
+    makerEscrowed : Bool;
+    note : Text;
+  };
+
+  public type DeliveryResult = {
+    deliveryId : Nat;
+    status : DeliveryStatus;
+    escrowed : Bool;
+    accepted : Bool;
+    delivered : Bool;           // paid out to the taker
+    reclaimed : Bool;           // refunded to the maker
+    amount : Nat;               // the units paid out or refunded (net of the ledger fee)
+    note : Text;
+  };
+
   // ── Public call result types ───────────────────────────────────────────────────
   public type OpenResult = {
     tradeId : Nat;

@@ -83,7 +83,7 @@ custody is:
 
 | Contract | What it does |
 |---|---|
-| **`core/`: the settlement core** | Two-phase escrow (fund, settle, abort); both-or-neither settlement gated on both legs confirmed in escrow; reclaim in full after the deadline; idempotent retry of a failed payout with a fixed `created_at_time` so the ledger deduplicates; a ledger `Duplicate` verified against the named escrow before it is trusted; five invariants checked on every transition; a Merkle mountain range receipt for every event; the ICRC-7 leg for unique assets. |
+| **`core/`: the settlement core** | Two-phase escrow (fund, settle, abort); both-or-neither settlement gated on both legs confirmed in escrow; reclaim in full after the deadline; idempotent retry of a failed payout with a fixed `created_at_time` so the ledger deduplicates; a ledger `Duplicate` verified against the named escrow before it is trusted; five invariants checked on every transition; a Merkle mountain range receipt for every event; the ICRC-7 leg for unique assets; a delivery free of payment (one leg, moved by the taker's acceptance, reclaimed past the deadline) under the same receipts and invariants. |
 | **`matching/`: the batch matching engine** | Orders staged into windows and cleared at one uniform price that maximises executed volume; price-time priority with pro-rata at the margin; reservation against the core rather than custody; each fill a settlement obligation driven through the core as a matched trade; clearing metered against an instruction budget and resumed across rounds, so batch size is unbounded without a partially applied chunk. |
 | **`listing/`: the listing registry** | The issuer-gated record of what is tradeable: fungible shares and unique-asset collections, funded-check at listing time; consulted by the matching engine when configured. |
 
@@ -98,7 +98,7 @@ core/fixtures/  the ledger fixtures: an ICRC-1/2 ledger and its flaky variant fo
 matching/src/   MatchTypes, MatchLogic (pure), Matching (the actor), Guards, ICRC
 matching/test/  the interpreter battery (53,425 checks over 4,000 randomised windows)
 listing/src/    ListingRegistry
-test/pocket/    battery.py: the settlement battery on a Thebes chain
+test/chain/    battery.py: the settlement battery on a Thebes chain
 deploy/         an example thebes-deploy manifest
 docs/           DESIGN.md, VERIFICATION.md, the run of record
 ```
@@ -117,11 +117,12 @@ moc --legacy-persistence $S -o build/ListingRegistry.wasm listing/src/ListingReg
 
 moc -r $S core/test/run_tests.mo
 moc -r $S core/test/run_tests_icrc7.mo
+moc -r $S core/test/run_tests_delivery.mo
 moc -r $S matching/test/run_tests_matching.mo
 ```
 
 The contracts are built with legacy (classical) persistence so that an in-place
-upgrade keeps its state. `test/pocket/README.md` describes the battery on a
+upgrade keeps its state. `test/chain/README.md` describes the battery on a
 chain; `deploy/example.thebes.toml` is the manifest shape.
 
 ## Known limitations

@@ -44,7 +44,7 @@ let MAKER = Principal.fromText("rsrwg-uo6vu-aqcai-baeaq-caiba-eaqca-ibaea-qcaib-
 let TAKER = Principal.fromText("ugtbj-v66vu-baeaq-caiba-eaqca-ibaea-qcaib-aeaqc-aibae-aqcai-bae");
 // A valid, distinct principal standing in for the DvP core (the registry only checks
 // equality; the on-chain core's real principal is used in the L1-L6 throwaway battery).
-let CORE = Principal.fromText("7dqsm-7qaaa-aaaaa-ad5fa-cai");
+let CORE = Principal.fromText("hrdhi-ood5o-nsg5q-qnbjo-gxg7c-kql6u-y6awo-4uywd-n3jfg-cv5ae-mae");
 func acct(p : Principal) : I.Account { { owner = p; subaccount = null } };
 func ownerIs(st : R.State, tid : Nat, p : Principal) : Bool {
   switch (R.ownerOf(st, tid)) { case (?a) Principal.equal(a.owner, p); case null false };

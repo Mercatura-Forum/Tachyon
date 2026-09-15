@@ -1,6 +1,6 @@
 /// Balances.mo - Account balance management (port of balances.rs)
 ///
-/// Mechanical port of dfinity/ic rs/ledger_suite/common/ledger_core/src/balances.rs
+/// Mechanical port of the reference ledger's balances module
 ///
 /// Key behaviors matching Rust:
 ///   - debit auto-removes account from map when balance reaches zero

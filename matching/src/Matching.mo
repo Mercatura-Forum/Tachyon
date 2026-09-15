@@ -38,7 +38,7 @@ shared (install) persistent actor class Matching(cfg : {
   sharesLedger : Principal;
   cashLedger : Principal;
   dvpCore : Principal;
-  instrBudget : ?Nat64;        // IC-side per-chunk instruction budget; null => 20 B
+  instrBudget : ?Nat64;        // per-chunk instruction budget; null => 20 B
   maxFillsPerChunk : ?Nat;     // egypt-side per-chunk fill cap; null => production default (1000)
   listingRegistry : ?Principal; // P4-D: issuer-listing gate. null => no gate (M1-M5 reference behaviour).
 }) = self {
@@ -77,11 +77,11 @@ shared (install) persistent actor class Matching(cfg : {
 
   // A chunk ends when EITHER bound trips (after >= 1 fill of progress):
   //  • MATCH_INSTR_BUDGET - `Prim.performanceCounter(0)` instruction budget (mirror CLMM
-  //    SWAP_INSTR_BUDGET); this is the bound on the REAL IC.
+  //    SWAP_INSTR_BUDGET); this is the bound on the target chain.
   //  • MAX_FILLS_PER_CHUNK - a deterministic fills-per-chunk cap. THIS is the operative bound on
   //    the EGYPT engine, whose `ic0.performance_counter` returns the block timestamp_ns (constant
   //    within a message - host.rs:2652), so the instruction-budget term never fires here. Bounding
-  //    by fill count keeps each chunk's work well under the engine instruction limit regardless of
+  //    by fill count keeps each chunk's work well under the engine's per-message bound regardless of
   //    crossing depth.
   // Both are configurable so a test instance can force chunking with a feasible order count; the
   // chunking/resume logic is byte-identical for ALL chunk sizes (proven by the pure battery).
@@ -293,7 +293,7 @@ shared (install) persistent actor class Matching(cfg : {
           n += 1;
         };
       };
-      // egypt bound (operative): fills/chunk cap.  IC bound: instruction budget. Either ends the chunk.
+      // fill-count bound (operative): fills/chunk cap. Instruction bound: the budget. Either ends the chunk.
       if (n >= MAX_FILLS_PER_CHUNK or Prim.performanceCounter(0) - start > MATCH_INSTR_BUDGET) { complete := false; break loop_ };
     };
     Map.add(chunkCounts, Nat.compare, w, cidN(chunkCounts, w) + 1);

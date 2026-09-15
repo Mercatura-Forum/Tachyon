@@ -1,7 +1,7 @@
 /// Guards.mo - Per-caller mutex with auto-expiry for reentrancy prevention
 ///
 /// Ported from menes_icp_pool/Guards.mo. Prevents concurrent async calls
-/// from the same caller (TOCTOU defense per IC canister-security skill).
+/// from the same caller (TOCTOU defense).
 ///
 /// Usage:
 ///   if (not mutex.tryAcquire("swap:" # Principal.toText(caller))) return #err("busy");

@@ -1,8 +1,8 @@
 /// ICRC7.mo - ICRC-7 (NFT) + ICRC-37 (NFT approval) interface types.
 ///
-/// Matches the canonical DFINITY Candid definitions verbatim (fetched this session):
-///   ICRC-7:  https://raw.githubusercontent.com/dfinity/ICRC/main/ICRCs/ICRC-7/ICRC-7.did
-///   ICRC-37: https://raw.githubusercontent.com/dfinity/ICRC/main/ICRCs/ICRC-37/ICRC-37.did
+/// Matches the canonical Candid definitions of the standards verbatim:
+///   ICRC-7:  https://<reference>
+///   ICRC-37: https://<reference>
 ///
 /// Both the land ledger (LandRegistry/LandLedger/FlakyLandLedger) and the DvP core's
 /// `#icrc7` leg handler import these types. The `Ledger7` actor type is the surface the

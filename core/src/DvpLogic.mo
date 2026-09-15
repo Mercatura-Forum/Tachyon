@@ -65,6 +65,50 @@ module {
     };
   };
 
+  // ── Delivery gates (one leg, free of payment) ──────────────────────────────────────────
+  // The maker funds an Open delivery within its window.
+  public func canFundDelivery(status : T.DeliveryStatus, now : Nat64, deadline : Nat64) : Result_<()> {
+    switch (status) {
+      case (#Open) { if (now > deadline) #err("past funding deadline") else #ok(()) };
+      case (#Escrowed) #err("delivery already escrowed");
+      case (#Delivered) #err("delivery already delivered");
+      case (#Reclaimed) #err("delivery reclaimed");
+    };
+  };
+  // The taker accepts an escrowed delivery within its window; acceptance is what opens the gate.
+  public func canAccept(status : T.DeliveryStatus, escrowed : Bool, now : Nat64, deadline : Nat64) : Result_<()> {
+    switch (status) {
+      case (#Escrowed) { if (not escrowed) #err("delivery gate: the leg must be escrowed") else if (now > deadline) #err("past the deadline - the maker reclaims") else #ok(()) };
+      case (#Open) #err("delivery not escrowed - nothing to accept");
+      case (#Delivered) #err("already delivered");
+      case (#Reclaimed) #err("delivery reclaimed");
+    };
+  };
+  // The payout fires only for an escrowed and accepted delivery (INV-DEL-2).
+  public func canDeliver(status : T.DeliveryStatus, escrowed : Bool, accepted : Bool) : Result_<()> {
+    switch (status) {
+      case (#Escrowed) { if (escrowed and accepted) #ok(()) else #err("delivery gate: escrowed and accepted") };
+      case (#Open) #err("delivery not escrowed");
+      case (#Delivered) #err("already delivered");
+      case (#Reclaimed) #err("delivery reclaimed");
+    };
+  };
+  // Reclaim is allowed after the deadline on a delivery the taker has not accepted.
+  public func canReclaimDelivery(status : T.DeliveryStatus, accepted : Bool, now : Nat64, deadline : Nat64) : Result_<()> {
+    switch (status) {
+      case (#Open or #Escrowed) {
+        if (accepted) #err("accepted - this delivery delivers, it cannot be reclaimed")
+        else if (now <= deadline) #err("deadline not reached")
+        else #ok(())
+      };
+      case (#Delivered) #err("delivered - cannot reclaim (INV-DEL-3)");
+      case (#Reclaimed) #err("already reclaimed");
+    };
+  };
+  public func isDeliveryTerminal(status : T.DeliveryStatus) : Bool {
+    switch (status) { case (#Delivered) true; case (#Reclaimed) true; case (_) false };
+  };
+
   // ── Terminal-state predicates ──────────────────────────────────────────────────────────
   public func isTerminal(status : T.TradeStatus) : Bool {
     switch (status) { case (#Settled) true; case (#Aborted) true; case (_) false };

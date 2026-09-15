@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Tachyon on a Thebes chain: the settlement battery driven through thebes-deploy.
 
-    python3 test/pocket/battery.py <manifest.toml> <network> [--out DIR]
+    python3 test/chain/battery.py <manifest.toml> <network> [--out DIR]
 
 The manifest names the ledgers and the core (see deploy/example.thebes.toml); cids must be
 installed. Two identities, `tachyon-maker` and `tachyon-taker`, must exist (`thebes-deploy
 identity new`), and each must hold an initial balance on the cash and asset ledgers.
 
 Rows: T1 happy path, T3 abort and reclaim, T4 idempotent retry under an injected ledger
-failure, T5 adversarial refusals, T2 no fork (state root identical across validators at the
+failure, T5 adversarial refusals, D1 a delivery free of payment accepted, D2 one reclaimed, D3 one the
+taker does not accept, D4 the invariant log, T2 no fork (state root identical across validators at the
 same height). Every row states its own pass condition before the calls are made.
 """
 import argparse, base64, json, os, re, subprocess, sys, time, urllib.request, zlib
 
 TD = os.environ.get('THEBES_DEPLOY', '/usr/local/bin/thebes-deploy')
 a = argparse.ArgumentParser()
-a.add_argument('manifest'); a.add_argument('network'); a.add_argument('--out', default='test/pocket/out')
+a.add_argument('manifest'); a.add_argument('network'); a.add_argument('--out', default='test/chain/out')
 A = a.parse_args()
 os.makedirs(A.out, exist_ok=True)
 LOG = open(os.path.join(A.out, 'battery.log'), 'w')
@@ -137,7 +138,9 @@ FEE = 10
 
 # T1 happy path: asset to taker, cash to maker, core residual zero, MMR root re-derivable.
 log('== T1 happy path')
-m0 = {'ms': bal('shares', MAKER), 'mc': bal('cash', MAKER), 'ts': bal('shares', TAKER), 'tc': bal('cash', TAKER)}
+# the chain persists between runs: the core's holdings at the start are the baseline every residual row is against
+k0 = {'s': bal('shares', CORE), 'c': bal('cash', CORE), 'f': bal('cash_flaky', CORE)}
+log(f'  core holdings at the start: {k0}')
 approve('shares', 'tachyon-maker', CORE, 10_000 + FEE); approve('cash', 'tachyon-taker', CORE, 5_000 + FEE)
 m0 = {'ms': bal('shares', MAKER), 'mc': bal('cash', MAKER), 'ts': bal('shares', TAKER), 'tc': bal('cash', TAKER)}
 tid, out = open_trade('tachyon-maker', TAKER, SHARES, 10_000, CASH, 5_000, 3600)
@@ -150,7 +153,7 @@ st = status_of(tid, 'Settled'); row('T1 status Settled', st == 'Settled', st)
 m1 = {'ms': bal('shares', MAKER), 'mc': bal('cash', MAKER), 'ts': bal('shares', TAKER), 'tc': bal('cash', TAKER)}
 row('T1 taker received asset minus one payout fee', m1['ts'] - m0['ts'] == 10_000 - FEE, (m0, m1))
 row('T1 maker received cash minus one payout fee', m1['mc'] - m0['mc'] == 5_000 - FEE, (m0, m1))
-row('T1 core holds no residual asset or cash', bal('shares', CORE) == 0 and bal('cash', CORE) == 0, (bal('shares', CORE), bal('cash', CORE)))
+row('T1 core holds no residual asset or cash from the trade', bal('shares', CORE) == k0['s'] and bal('cash', CORE) == k0['c'], (k0, bal('shares', CORE), bal('cash', CORE)))
 ev = td('query', 'core', 'auditEvents', f'({tid} : nat)')
 row('T1 receipt chain ORDER, FUND, FUND, SETTLED', all(k in ev for k in ('ORDER', 'FUND', 'SETTLED')), ev[-300:])
 root = td('query', 'core', 'auditRootHex'); row('T1 audit root present', re.search(r'[0-9a-f]{64}', root) is not None, root[-100:])
@@ -202,8 +205,97 @@ if st != 'Settled':
 row('T4 status Settled after the retry', status_of(tid4, 'Settled') == 'Settled', status_of(tid4))
 row('T4 maker paid exactly once on the flaky ledger', bal('cash_flaky', MAKER) - m0['mf'] == 1_500 - FEE, (m0['mf'], bal('cash_flaky', MAKER)))
 row('T4 taker received the asset exactly once', bal('shares', TAKER) - m0['ts'] == 3_000 - FEE, (m0['ts'], bal('shares', TAKER)))
-row('T4 core holds no residual on the flaky ledger', bal('cash_flaky', CORE) == 0, bal('cash_flaky', CORE))
+row('T4 core holds no residual on the flaky ledger from the trade', bal('cash_flaky', CORE) == k0['f'], (k0['f'], bal('cash_flaky', CORE)))
 inv = td('query', 'core', 'invariantLog'); row('T4 no invariant violation logged', 'fail' not in inv.lower(), inv[-200:])
+
+# D1 delivery free of payment: the maker escrows one leg, the taker accepts, the leg moves once.
+log('== D1 delivery accepted')
+DSTATUS = {candid_hash(s): s for s in ('Open', 'Escrowed', 'Delivered', 'Reclaimed')}
+def dstatus_of(did, expect=None):
+    for attempt in range(12 if expect else 1):
+        out = td('query', 'core', 'getDelivery', f'({did} : nat)')
+        v = field(out, 'status') or ''
+        got = None
+        for h, sname in DSTATUS.items():
+            if f'{h:,}'.replace(',', '_') in v or sname in v: got = sname
+        if expect is None or got == expect: return got
+        time.sleep(1)
+    return got
+def open_delivery(maker, taker_p, ledger, amount, deadline):
+    out = td('call', 'core', 'openDelivery', f'(record {{ taker = principal "{taker_p}"; ledger = principal "{ledger}"; amount = {amount} : nat; deadlineSecs = {deadline} : nat }})', identity=maker)
+    v = field(out, 'deliveryId')
+    m = re.match(r'([0-9_]+)', v or '')
+    return (int(m.group(1).replace('_', '')) if m else None), out
+n0 = nat_in(td('query', 'core', 'deliveriesOpened')) or 0
+approve('shares', 'tachyon-maker', CORE, 4_000 + FEE)
+d0 = {'ms': bal('shares', MAKER), 'ts': bal('shares', TAKER)}
+did, od = open_delivery('tachyon-maker', TAKER, SHARES, 4_000, 3600)
+row('D1 openDelivery', did is not None, od[-200:])
+fd = td('call', 'core', 'fundDelivery', f'({did} : nat)', identity='tachyon-maker')
+row('D1 the leg escrowed (inline at open, or now)', (is_ok(fd) and (field(fd, 'escrowed') or '').startswith('true')) or (field(od, 'makerEscrowed') or '').startswith('true'), fd[-200:])
+row('D1 status Escrowed, awaiting the taker', dstatus_of(did, 'Escrowed') == 'Escrowed', dstatus_of(did))
+c0 = bal('shares', CORE)
+row('D1 the core holds the leg and the taker has nothing yet', c0 >= 4_000 and bal('shares', TAKER) == d0['ts'], (c0, bal('shares', TAKER)))
+r = td('call', 'core', 'acceptDelivery', f'({did} : nat)', identity='tachyon-maker'); row('D1 the maker cannot accept its own delivery', not is_ok(r), r[-160:])
+r = td('call', 'core', 'settleDelivery', f'({did} : nat)', identity='tachyon-maker'); row('D1 no payout before the acceptance (the gate)', not is_ok(r), r[-160:])
+ad = td('call', 'core', 'acceptDelivery', f'({did} : nat)', identity='tachyon-taker'); row('D1 the taker accepts and the leg is paid out', is_ok(ad) and (field(ad, 'delivered') or '').startswith('true'), ad[-200:])
+row('D1 status Delivered', dstatus_of(did, 'Delivered') == 'Delivered', dstatus_of(did))
+row('D1 taker received the leg minus one payout fee, once', bal('shares', TAKER) - d0['ts'] == 4_000 - FEE, (d0['ts'], bal('shares', TAKER)))
+row('D1 the core released the leg', bal('shares', CORE) == c0 - 4_000, (c0, bal('shares', CORE)))
+ev = td('query', 'core', 'auditEvents', f'({did} : nat)')
+row('D1 receipt chain DELIVERY, FUND, ESCROWED, ACCEPTED, DELIVERED', all(k in ev for k in ('DELIVERY', 'FUND', 'ESCROWED', 'ACCEPTED', 'DELIVERED')), ev[-300:])
+b1 = bal('shares', TAKER)
+r = td('call', 'core', 'acceptDelivery', f'({did} : nat)', identity='tachyon-taker'); row('D1 a second acceptance reports delivered and pays nothing', ('already delivered' in r or is_ok(r)) and bal('shares', TAKER) == b1, r[-160:])
+r = td('call', 'core', 'reclaimDelivery', f'({did} : nat)', identity='tachyon-maker'); row('D1 reclaim after delivery refused (INV-DEL-3)', not is_ok(r), r[-160:])
+
+# D2 reclaim: the taker never accepts, the deadline passes, the maker reclaims in full, once.
+log('== D2 delivery reclaimed')
+# the refusal row uses a long deadline (the chain clock runs ahead of the wall clock) and is then accepted;
+# the acceptance row a short one.
+approve('shares', 'tachyon-maker', CORE, 700 + FEE)
+did2a, _ = open_delivery('tachyon-maker', TAKER, SHARES, 700, 3600)
+td('call', 'core', 'fundDelivery', f'({did2a} : nat)', identity='tachyon-maker')
+r = td('call', 'core', 'reclaimDelivery', f'({did2a} : nat)', identity='tachyon-maker'); row('D2 reclaim before the deadline refused', not is_ok(r), r[-160:])
+r = td('call', 'core', 'acceptDelivery', f'({did2a} : nat)', identity='tachyon-taker'); row('D2 the long-dated delivery accepted instead', is_ok(r), r[-160:])
+approve('shares', 'tachyon-maker', CORE, 2_500 + FEE)
+d0 = {'ms': bal('shares', MAKER)}
+did2, od2 = open_delivery('tachyon-maker', TAKER, SHARES, 2_500, 20)
+td('call', 'core', 'fundDelivery', f'({did2} : nat)', identity='tachyon-maker')
+t0 = time.time(); r = ''
+while time.time() - t0 < 600:
+    r = td('call', 'core', 'reclaimDelivery', f'({did2} : nat)', identity='tachyon-maker')
+    if is_ok(r) or dstatus_of(did2) == 'Reclaimed': break
+    time.sleep(5)
+row('D2 reclaim after the deadline accepted', is_ok(r) or dstatus_of(did2) == 'Reclaimed', r[-200:])
+row('D2 status Reclaimed', dstatus_of(did2, 'Reclaimed') == 'Reclaimed', dstatus_of(did2))
+row('D2 maker got the leg back minus the escrow and refund fees', d0['ms'] - bal('shares', MAKER) == 2 * FEE, (d0['ms'], bal('shares', MAKER)))
+r = td('call', 'core', 'acceptDelivery', f'({did2} : nat)', identity='tachyon-taker'); row('D2 acceptance after the reclaim refused', not is_ok(r), r[-160:])
+b2 = bal('shares', MAKER)
+r = td('call', 'core', 'reclaimDelivery', f'({did2} : nat)', identity='tachyon-maker'); row('D2 a second reclaim reports reclaimed and returns nothing', ('already reclaimed' in r or is_ok(r)) and bal('shares', MAKER) == b2, r[-160:])
+
+# D3 the wrong account: a delivery to a taker who does not accept it past its deadline goes back to the maker.
+log('== D3 a delivery the taker does not accept')
+approve('shares', 'tachyon-maker', CORE, 1_200 + FEE)
+did3, _ = open_delivery('tachyon-maker', TAKER, SHARES, 1_200, 20)
+td('call', 'core', 'fundDelivery', f'({did3} : nat)', identity='tachyon-maker')
+# the chain's clock is read through a probe: an unfunded delivery opened in the same breath with the same
+# window, whose funding is refused as past its deadline once the chain is there (nothing of it ever moves)
+didp, _ = open_delivery('tachyon-maker', TAKER, SHARES, FEE + 1, 20)
+r = td('call', 'core', 'acceptDelivery', f'({did3} : nat)', identity='tachyon-maker'); row('D3 only the named taker accepts', not is_ok(r), r[-160:])
+t0 = time.time(); r = ''
+while time.time() - t0 < 600:
+    r = td('call', 'core', 'fundDelivery', f'({didp} : nat)', identity='tachyon-maker')
+    if not is_ok(r) and 'deadline' in r: break
+    time.sleep(5)
+row('D3 the probe delivery is past its deadline unfunded', not is_ok(r) and 'deadline' in r, r[-160:])
+time.sleep(5)
+r = td('call', 'core', 'acceptDelivery', f'({did3} : nat)', identity='tachyon-taker')
+row('D3 acceptance past the deadline refused', not is_ok(r) and 'deadline' in r, r[-160:])
+row('D3 the leg still in the core', dstatus_of(did3, 'Escrowed') == 'Escrowed')
+r = td('call', 'core', 'reclaimDelivery', f'({did3} : nat)', identity='tachyon-taker'); row('D3 the taker may reclaim to the maker', is_ok(r) and dstatus_of(did3, 'Reclaimed') == 'Reclaimed', r[-160:])
+r = td('call', 'core', 'reclaimDelivery', f'({didp} : nat)', identity='tachyon-maker'); row('D3 the probe reclaimed with nothing moved', is_ok(r) and (field(r, 'amount') or '').startswith('0') and dstatus_of(didp, 'Reclaimed') == 'Reclaimed', r[-160:])
+inv = td('query', 'core', 'invariantLog'); row('D4 no invariant violation logged across trades and deliveries', 'fail' not in inv.lower(), inv[-200:])
+n = td('query', 'core', 'deliveriesOpened'); row('D4 five deliveries opened in this run', (nat_in(n) or 0) - n0 == 5, n[-60:])
 
 # T2 no fork: every validator reports the same state root at the same height.
 log('== T2 no fork')

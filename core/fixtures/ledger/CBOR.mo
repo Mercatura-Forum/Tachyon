@@ -1,6 +1,6 @@
 /// CBOR.mo - CBOR encoder + decoder for ICRC-3 block encoding
 ///
-/// Implements the subset of CBOR needed for IC hash trees and ICRC-3 blocks:
+/// Implements the subset of CBOR needed for hash trees and ICRC-3 blocks:
 ///   - Unsigned integers (major type 0)
 ///   - Negative integers (major type 1)
 ///   - Byte strings (major type 2)
@@ -9,7 +9,7 @@
 ///   - Maps (major type 5)
 ///   - Tag 55799 (self-describe CBOR - required by ICRC-3)
 ///
-/// Matches the encoding used by the Rust `ciborium` crate in the DFINITY ledger.
+/// Matches the encoding used by the Rust `ciborium` crate in the reference ledger.
 
 import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";

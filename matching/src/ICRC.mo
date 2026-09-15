@@ -1,8 +1,8 @@
 /// ICRC.mo - ICRC-1/ICRC-2 ledger interface types
 ///
 /// Matches the official Candid definitions exactly:
-///   ICRC-1: https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-1/ICRC-1.did
-///   ICRC-2: https://github.com/dfinity/ICRC-1/blob/main/standards/ICRC-2/ICRC-2.did
+///   ICRC-1: https://<reference>
+///   ICRC-2: https://<reference>
 
 import Principal "mo:core/Principal";
 

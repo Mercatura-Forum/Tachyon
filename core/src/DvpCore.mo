@@ -1,7 +1,7 @@
 /// DvpCore.mo - Delivery-versus-Payment atomic-swap core (BIS DvP Model 1).
 ///
 /// Gross, simultaneous, both-or-neither settlement of an asset leg against a cash leg,
-/// over two ICRC ledgers. Two-phase escrow state machine (the canonical IC
+/// over two ICRC ledgers. Two-phase escrow state machine (the canonical
 /// deposit-then-settle pattern): each party funds its leg INTO this canister's own
 /// account; settlement fires only when BOTH legs are escrowed and pays out from the
 /// balance the core already custodies (so a payout cannot fail for allowance reasons and
@@ -62,6 +62,11 @@ shared (initMsg) persistent actor class DvpCore() = self {
   // time. Stored per leg and REUSED on retry so a true replay hits the ledger dedup window.
   var catCursor : Nat64 = 0;
 
+  // Deliveries free of payment (one leg, maker -> taker by the taker's acceptance). They share the
+  // trades' id space so a leg key ("<id>|A") never names two escrows.
+  let deliveries = Map.empty<Nat, T.Delivery>();
+  var deliveryCount : Nat = 0;
+
   // Audit-MMR over all lifecycle events.
   let mmr : MMR.State = MMR.newState();
   let auditLog = List.empty<T.AuditEvent>();
@@ -117,7 +122,7 @@ shared (initMsg) persistent actor class DvpCore() = self {
   // ── Duplicate verification ──────────────────────────────────────────────────────────────────
   // ICRC-ME registers a dedup key when it CHECKS a transfer, before the balance or allowance
   // check, so a refused transfer poisons its key and a retry with the same created_at_time
-  // answers #Duplicate with an index that names no escrow (measured on PocketIC, S1.2). A
+  // answers #Duplicate with an index that names no escrow (measured on a local chain). A
   // #Duplicate is therefore never trusted: the named block (legacy) or reservation (journal)
   // must be this leg's escrow - right owner, right recipient (the core), right amount -
   // otherwise the escrow did not land, the stored created_at_time is discarded so the next
@@ -965,6 +970,197 @@ shared (initMsg) persistent actor class DvpCore() = self {
     checkInvariants(trade, "settleMatchFor");
     settleResultOf(trade, note)
   };
+
+  // ══ Delivery free of payment ═══════════════════════════════════════════════════════════════════
+  //
+  // A delivery is one leg with no cash against it: a collateral pledge under a credit support annex,
+  // its return, a transfer between two custody accounts of one party (BIS CPSS 1992 treats these as the
+  // case the DvP models exclude). It runs the trade's own escrow, payout and refund helpers over the
+  // trade's own leg state, through a carrier record the helpers read the leg from; the only new logic is
+  // the gate: the leg moves when the maker has escrowed it AND the taker has accepted it (Model 1's
+  // discipline applied to one leg), never by the maker's act alone, so a delivery to the wrong account is
+  // refused by the account it reaches rather than reversed. Past the deadline an unaccepted delivery is
+  // reclaimed to the maker in full. The audit events, the MMR leaves and the invariants are the trade's,
+  // one leg short: DELIVERY, FUND_A, ESCROWED, ACCEPTED, DELIVERED or RECLAIMED.
+  //
+  // INV-DEL-1 conservation: the payout or refund never exceeds the escrow (trap).
+  // INV-DEL-2 gate: a payout implies the leg escrowed and the taker's acceptance (trap).
+  // INV-DEL-3 no double resolve: a leg is paid out or refunded, never both (trap).
+  // INV-DEL-4 no stranding: a terminal status implies the escrowed leg resolved (logged).
+  // INV-DEL-5 idempotence: the helpers' per-leg markers and stored created_at_time, as a trade's.
+
+  /// The carrier the trade helpers read a delivery's leg from: the delivery's id, deadline and leg state
+  /// (shared, so the helpers' markers land on the delivery), the leg on side A, and a leg B that is never
+  /// escrowed, paid or refunded.
+  func carrier(d : T.Delivery) : T.Trade {
+    { id = d.id; maker = d.maker; var taker = ?d.taker; legA = d.leg; legB = d.leg; legAState = d.legState; legBState = T.newLegState(); deadline = d.deadline; var status = #Open; createdAt = d.createdAt }
+  };
+
+  func checkDeliveryInvariants(d : T.Delivery, phase : Text) {
+    let a = d.legState;
+    if (a.payout != null and a.refund != null) Runtime.trap("INV-DEL-3 fail @" # phase # ": leg paid AND refunded, delivery " # Nat.toText(d.id));
+    if (a.payout != null and a.payoutAmount > a.escrowedAmount) Runtime.trap("INV-DEL-1 fail @" # phase # ": payout>escrow, delivery " # Nat.toText(d.id));
+    if (a.refund != null and a.refundAmount > a.escrowedAmount) Runtime.trap("INV-DEL-1 fail @" # phase # ": refund>escrow, delivery " # Nat.toText(d.id));
+    if (a.payout != null and not (a.escrowed and d.accepted)) Runtime.trap("INV-DEL-2 fail @" # phase # ": payout without escrow and acceptance, delivery " # Nat.toText(d.id));
+    switch (d.status) {
+      case (#Delivered) { if (a.payout == null) logInv("[ORACLE-FAIL] INV-DEL-4 @" # phase # ": Delivered but the leg unpaid, delivery " # Nat.toText(d.id)) };
+      case (#Reclaimed) { if (a.escrowed and a.refund == null) logInv("[ORACLE-FAIL] INV-DEL-4 @" # phase # ": Reclaimed but the escrowed leg unrefunded, delivery " # Nat.toText(d.id)) };
+      case (_) {};
+    };
+  };
+
+  func deliveryResultOf(d : T.Delivery, note : Text) : T.DeliveryResult {
+    let st = d.legState;
+    { deliveryId = d.id; status = d.status; escrowed = st.escrowed; accepted = d.accepted; delivered = st.payout != null; reclaimed = st.refund != null;
+      amount = if (st.payout != null) st.payoutAmount else st.refundAmount; note }
+  };
+
+  // The maker's escrow landed: the delivery is Escrowed (once), and delivers at once when already accepted.
+  func afterDeliveryEscrow(d : T.Delivery) : async* Text {
+    if (not d.legState.escrowed) return "leg not escrowed";
+    switch (d.status) {
+      case (#Open) { d.status := #Escrowed; appendEvent(d.id, "ESCROWED|id=" # Nat.toText(d.id)) };
+      case (_) {};
+    };
+    if (d.accepted) { let r = await* deliverInner(d); "escrowed; " # r.note } else "escrowed; awaiting the taker's acceptance"
+  };
+
+  // Pay the escrowed and accepted leg out to the taker. Idempotent; Delivered once the payout is recorded.
+  func deliverInner(d : T.Delivery) : async* T.DeliveryResult {
+    if (not (d.legState.escrowed and d.accepted)) Runtime.trap("INV-DEL-2: deliverInner without escrow and acceptance, delivery " # Nat.toText(d.id));
+    let note = switch (await* payoutLeg(carrier(d), #A, d.taker)) { case (#ok(_)) "leg->taker paid"; case (#err(e)) "leg pending: " # e };
+    if (d.legState.payout != null) {
+      switch (d.status) {
+        case (#Delivered) {};
+        case (_) { d.status := #Delivered; appendEvent(d.id, "DELIVERED|id=" # Nat.toText(d.id) # "|legA_to_taker=" # Nat.toText(d.legState.payoutAmount)) };
+      };
+    };
+    checkDeliveryInvariants(d, "deliver");
+    deliveryResultOf(d, note)
+  };
+
+  func reclaimDeliveryInner(d : T.Delivery) : async* T.DeliveryResult {
+    let note = switch (await* refundLeg(carrier(d), #A, d.maker)) { case (#ok(_)) "leg refund ok"; case (#err(e)) "leg refund pending: " # e };
+    if ((not d.legState.escrowed) or d.legState.refund != null) {
+      switch (d.status) {
+        case (#Reclaimed) {};
+        case (_) { d.status := #Reclaimed; appendEvent(d.id, "RECLAIMED|id=" # Nat.toText(d.id) # "|legA_to_maker=" # Nat.toText(d.legState.refundAmount)) };
+      };
+    };
+    checkDeliveryInvariants(d, "reclaimDelivery");
+    deliveryResultOf(d, note)
+  };
+
+  func openDeliveryWith(caller : Principal, taker : Principal, leg : T.Leg, deadlineSecs : Nat) : async* Result.Result<T.OpenDeliveryResult, Text> {
+    let id = nextTradeId;
+    nextTradeId += 1;
+    deliveryCount += 1;
+    let deadline = now64() + Nat64.fromNat(deadlineSecs) * 1_000_000_000;
+    let d : T.Delivery = { id; maker = caller; taker; leg; legState = T.newLegState(); deadline; var accepted = false; var status = #Open; createdAt = now64() };
+    Map.add(deliveries, Nat.compare, id, d);
+    let legText = switch (leg.kind) { case (#icrc1({ amount })) Principal.toText(leg.ledger) # ":" # Nat.toText(amount); case (#icrc7({ tokenId })) Principal.toText(leg.ledger) # ":token:" # Nat.toText(tokenId) };
+    appendEvent(id, "DELIVERY|id=" # Nat.toText(id) # "|maker=" # Principal.toText(caller) # "|taker=" # Principal.toText(taker) # "|legA=" # legText # "|deadline=" # Nat64.toText(deadline));
+    let note = switch (await* escrowLeg(carrier(d), #A, caller)) {
+      case (#ok(idx)) { let n = await* afterDeliveryEscrow(d); "leg escrowed at ledger block " # Nat.toText(idx) # "; " # n };
+      case (#err(e)) "leg escrow not yet in - " # e # " (approve the core, then call fundDelivery)";
+    };
+    checkDeliveryInvariants(d, "openDelivery");
+    #ok({ deliveryId = id; status = d.status; makerEscrowed = d.legState.escrowed; note })
+  };
+
+  /// The maker opens a delivery of `amount` on `ledger` to `taker` and escrows it inline (the maker has
+  /// approved the core for `amount + fee`). The record is created before the pull, so what reaches the
+  /// core is always tracked and re-drivable through fundDelivery.
+  public shared ({ caller }) func openDelivery(args : { taker : Principal; ledger : Principal; amount : Nat; deadlineSecs : Nat }) : async Result.Result<T.OpenDeliveryResult, Text> {
+    requireAuth(caller);
+    if (args.amount == 0) return #err("zero amount");
+    if (args.deadlineSecs == 0) return #err("deadline must be > 0 seconds");
+    if (Principal.equal(args.taker, caller)) return #err("maker and taker must differ");
+    if (Principal.isAnonymous(args.taker)) return #err("the taker is a principal");
+    let fee = try { await ledgerOf(args.ledger).icrc1_fee() } catch (_e) { return #err("ledger unreachable") };
+    if (args.amount <= fee) return #err("amount must exceed the ledger fee");
+    await* openDeliveryWith(caller, args.taker, { ledger = args.ledger; kind = #icrc1({ amount = args.amount }) }, args.deadlineSecs)
+  };
+
+  /// The maker opens a delivery of the unique asset `tokenId` on `ledger` to `taker` (the maker has
+  /// `icrc37_approve`d the core for the token).
+  public shared ({ caller }) func openTokenDelivery(args : { taker : Principal; ledger : Principal; tokenId : Nat; deadlineSecs : Nat }) : async Result.Result<T.OpenDeliveryResult, Text> {
+    requireAuth(caller);
+    if (args.deadlineSecs == 0) return #err("deadline must be > 0 seconds");
+    if (Principal.equal(args.taker, caller)) return #err("maker and taker must differ");
+    if (Principal.isAnonymous(args.taker)) return #err("the taker is a principal");
+    await* openDeliveryWith(caller, args.taker, { ledger = args.ledger; kind = #icrc7({ tokenId = args.tokenId }) }, args.deadlineSecs)
+  };
+
+  /// The maker re-drives the escrow (idempotent), for an open delivery within its window.
+  public shared ({ caller }) func fundDelivery(id : Nat) : async Result.Result<T.DeliveryResult, Text> {
+    requireAuth(caller);
+    let d = switch (Map.get(deliveries, Nat.compare, id)) { case (?x) x; case null return #err("no such delivery") };
+    if (not Principal.equal(caller, d.maker)) return #err("only the maker funds the leg");
+    switch (L.canFundDelivery(d.status, now64(), d.deadline)) { case (#err(e)) return #err(e); case (#ok(())) {} };
+    if (not acquire(id, "fund")) return #err("operation already in progress for this delivery");
+    let res = switch (await* escrowLeg(carrier(d), #A, d.maker)) {
+      case (#err(e)) #err(e);
+      case (#ok(_)) { let n = await* afterDeliveryEscrow(d); #ok(deliveryResultOf(d, n)) };
+    };
+    release(id, "fund");
+    res
+  };
+
+  /// The taker accepts an escrowed delivery within its window: the acceptance opens the gate and the leg
+  /// is paid out to the taker at once. Idempotent: an accepted delivery whose payout is pending is
+  /// re-driven, and a delivered one reports itself.
+  public shared ({ caller }) func acceptDelivery(id : Nat) : async Result.Result<T.DeliveryResult, Text> {
+    requireAuth(caller);
+    let d = switch (Map.get(deliveries, Nat.compare, id)) { case (?x) x; case null return #err("no such delivery") };
+    if (not Principal.equal(caller, d.taker)) return #err("only the named taker accepts a delivery");
+    switch (d.status) { case (#Delivered) return #ok(deliveryResultOf(d, "already delivered")); case (_) {} };
+    if (not d.accepted) {
+      switch (L.canAccept(d.status, d.legState.escrowed, now64(), d.deadline)) { case (#err(e)) return #err(e); case (#ok(())) {} };
+      d.accepted := true;
+      appendEvent(id, "ACCEPTED|id=" # Nat.toText(id) # "|taker=" # Principal.toText(caller));
+    };
+    if (not acquire(id, "deliver")) return #err("operation already in progress for this delivery");
+    let res = await* deliverInner(d);
+    release(id, "deliver");
+    #ok(res)
+  };
+
+  /// Re-drive the payout of an accepted delivery whose ledger did not answer the first time. Permissionless
+  /// among authenticated principals: the payout goes only to the named taker, and never twice.
+  public shared ({ caller }) func settleDelivery(id : Nat) : async Result.Result<T.DeliveryResult, Text> {
+    requireAuth(caller);
+    let d = switch (Map.get(deliveries, Nat.compare, id)) { case (?x) x; case null return #err("no such delivery") };
+    switch (d.status) {
+      case (#Delivered) return #ok(deliveryResultOf(d, "already delivered"));
+      case (#Reclaimed) return #err("delivery is reclaimed - cannot deliver (INV-DEL-3)");
+      case (_) {};
+    };
+    switch (L.canDeliver(d.status, d.legState.escrowed, d.accepted)) { case (#err(e)) return #err(e); case (#ok(())) {} };
+    if (not acquire(id, "deliver")) return #err("operation already in progress for this delivery");
+    let res = await* deliverInner(d);
+    release(id, "deliver");
+    #ok(res)
+  };
+
+  /// The maker or the taker reclaims an unaccepted delivery past the deadline: the escrowed leg returns to
+  /// the maker in full, never twice; a delivery that was never escrowed closes with nothing moved.
+  public shared ({ caller }) func reclaimDelivery(id : Nat) : async Result.Result<T.DeliveryResult, Text> {
+    requireAuth(caller);
+    let d = switch (Map.get(deliveries, Nat.compare, id)) { case (?x) x; case null return #err("no such delivery") };
+    if (not (Principal.equal(caller, d.maker) or Principal.equal(caller, d.taker))) return #err("only the maker or the taker may reclaim");
+    switch (d.status) { case (#Reclaimed) return #ok(deliveryResultOf(d, "already reclaimed")); case (_) {} };
+    switch (L.canReclaimDelivery(d.status, d.accepted, now64(), d.deadline)) { case (#err(e)) return #err(e); case (#ok(())) {} };
+    if (not acquire(id, "reclaim")) return #err("operation already in progress for this delivery");
+    let res = await* reclaimDeliveryInner(d);
+    release(id, "reclaim");
+    #ok(res)
+  };
+
+  public query func getDelivery(id : Nat) : async ?T.DeliveryView {
+    switch (Map.get(deliveries, Nat.compare, id)) { case (?d) ?T.deliveryView(d); case null null };
+  };
+  public query func deliveriesOpened() : async Nat { deliveryCount };
 
   // ── Queries ────────────────────────────────────────────────────────────────────────
   public query func matchingEnginePrincipal() : async ?Principal { matchingEngine };

@@ -105,8 +105,8 @@ shared (initMsg) persistent actor class FlakyLandLedger(args : { name : Text; sy
 
   public query func icrc7_supported_standards() : async [{ name : Text; url : Text }] {
     [
-      { name = "ICRC-7"; url = "https://github.com/dfinity/ICRC/tree/main/ICRCs/ICRC-7" },
-      { name = "ICRC-37"; url = "https://github.com/dfinity/ICRC/tree/main/ICRCs/ICRC-37" },
+      { name = "ICRC-7"; url = "https://<reference>" },
+      { name = "ICRC-37"; url = "https://<reference>" },
     ];
   };
 

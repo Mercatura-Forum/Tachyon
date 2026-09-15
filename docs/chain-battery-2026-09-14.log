@@ -1,0 +1,71 @@
+maker=volj5-uurp6-hruca-rrai6-fzv7j-qzf6o-llsss-hxjy3-szye3-kjbiu-iqe taker=wozht-fmqc5-lsoft-56yhz-phh3h-tb5go-246dr-5kqok-n6cad-f6gze-rae core=wo4es-tqaad-etgrk-3la3q cash=j6i3f-kqaab-64ksj-tt2gq shares=yn2bi-3yaad-cbzjx-2vs7q flaky=cx5mm-haaad-a77fb-i2n3q
+  PASS  the core reports its own principal as the manifest cid maps it
+== T1 happy path
+  core holdings at the start: {'s': 0, 'c': 0, 'f': 0}
+  PASS  T1 openTrade
+  T1 openTrade note: "asset leg escrowed at ledger block 70" makerEscrowed=true
+  PASS  T1 fundMaker reports the maker leg escrowed (inline at open, or now)
+  PASS  T1 fundTaker escrowed and auto-settled
+  PASS  T1 status Settled
+  PASS  T1 taker received asset minus one payout fee
+  PASS  T1 maker received cash minus one payout fee
+  PASS  T1 core holds no residual asset or cash from the trade
+  PASS  T1 receipt chain ORDER, FUND, FUND, SETTLED
+  PASS  T1 audit root present
+== T5 adversarial
+  PASS  T5 settle again is a no-op: refused or reported already settled, and no second payment
+  PASS  T5 reclaim after settle refused
+  PASS  T5 settle before both escrowed refused
+  PASS  T5 taker cannot fund the maker leg
+== T3 abort and reclaim
+  PASS  T3 maker leg escrowed
+  PASS  T3 reclaim before the deadline refused
+  PASS  T3 reclaim after the deadline accepted
+  PASS  T3 status Aborted
+  PASS  T3 maker got the asset back minus the escrow and refund fees
+== T4 idempotent retry under an injected failure
+  T4 fundMaker: 7_871 = 33 : nat;       3_050_377_874 = true;       3_878_592_285 = "leg escrowed; awaiting counterparty";     }   }, ) 
+  T4 first attempt note: 63_776_325 = true;       2_293_067_871 = 33 : nat;       3_050_377_874 = true;       3_878_592_285 = "both legs escrowed; legA->taker paid; legB pending: ledger temporarily unavailable";     }   }, ) 
+  T4 retry: ker paid; legB->maker paid";       1_513_678_431 = true;       2_293_067_871 = 33 : nat;       2_559_269_873 = 2_990 : nat;       3_729_512_818 = 1_490 : nat;       3_986_651_872 = true;     }   }, ) 
+  T4 second retry: 398_258 = "already settled";       1_513_678_431 = true;       2_293_067_871 = 33 : nat;       2_559_269_873 = 2_990 : nat;       3_729_512_818 = 1_490 : nat;       3_986_651_872 = true;     }   }, ) 
+  PASS  T4 status Settled after the retry
+  PASS  T4 maker paid exactly once on the flaky ledger
+  PASS  T4 taker received the asset exactly once
+  PASS  T4 core holds no residual on the flaky ledger from the trade
+  PASS  T4 no invariant violation logged
+== D1 delivery accepted
+  PASS  D1 openDelivery
+  PASS  D1 the leg escrowed (inline at open, or now)
+  PASS  D1 status Escrowed, awaiting the taker
+  PASS  D1 the core holds the leg and the taker has nothing yet
+  PASS  D1 the maker cannot accept its own delivery
+  PASS  D1 no payout before the acceptance (the gate)
+  PASS  D1 the taker accepts and the leg is paid out
+  PASS  D1 status Delivered
+  PASS  D1 taker received the leg minus one payout fee, once
+  PASS  D1 the core released the leg
+  PASS  D1 receipt chain DELIVERY, FUND, ESCROWED, ACCEPTED, DELIVERED
+  PASS  D1 a second acceptance reports delivered and pays nothing
+  PASS  D1 reclaim after delivery refused (INV-DEL-3)
+== D2 delivery reclaimed
+  PASS  D2 reclaim before the deadline refused
+  PASS  D2 the long-dated delivery accepted instead
+  PASS  D2 reclaim after the deadline accepted
+  PASS  D2 status Reclaimed
+  PASS  D2 maker got the leg back minus the escrow and refund fees
+  PASS  D2 acceptance after the reclaim refused
+  PASS  D2 a second reclaim reports reclaimed and returns nothing
+== D3 a delivery the taker does not accept
+  PASS  D3 only the named taker accepts
+  PASS  D3 the probe delivery is past its deadline unfunded
+  PASS  D3 acceptance past the deadline refused
+  PASS  D3 the leg still in the core
+  PASS  D3 the taker may reclaim to the maker
+  PASS  D3 the probe reclaimed with nothing moved
+  PASS  D4 no invariant violation logged across trades and deliveries
+  PASS  D4 five deliveries opened in this run
+== T2 no fork
+  PASS  T2 validators agree on the state root at a common height
+
+53 passed, 0 failed
+exit 0

@@ -1,6 +1,6 @@
 /// StableLog.mo - Append-only log backed by Region stable memory
 ///
-/// First-on-ICP: A Motoko equivalent of Rust's ic-stable-structures StableLog.
+/// A Motoko equivalent of the stable-structures StableLog.
 /// Survives upgrades, scales to gigabytes, O(1) append and O(1) random access.
 ///
 /// Layout in Region:

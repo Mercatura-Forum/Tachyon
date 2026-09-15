@@ -1,6 +1,6 @@
 /// Archive.mo - Read-only archive canister for overflow blocks
 ///
-/// Port of dfinity/ic rs/ledger_suite/icrc1/archive/src/main.rs
+/// Port of the reference ledger's archive canister
 ///
 /// When the main ledger's block log exceeds a threshold, it spawns
 /// an Archive canister and moves old blocks there. The archive is
