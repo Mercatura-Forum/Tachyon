@@ -2,5 +2,6 @@
 build/
 .dfx/
 .thebes/
-test/pocket/out/
-test/pocket/pocket.thebes.toml
+test/chain/out/
+test/chain/pocket.thebes.toml
+__pycache__/

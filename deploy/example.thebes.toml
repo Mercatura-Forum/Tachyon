@@ -1,36 +1,91 @@
 # Example thebes-deploy manifest for Tachyon on a Thebes subnet.
-# Replace the validator list with the network's own; cids are assigned at install.
+# Replace the validator list with the network's own. Pre-allocate distinct numeric cids
+# before installing: the matching engines' init records name the ledgers, the core and the
+# registry by principal, and a cid maps to its principal from the raw 8-byte big-endian
+# encoding (test/chain/battery.py, `cid_principal`). For a localhost bed,
+# `thebes-deploy start` launches four validators on 127.0.0.1:18480-18483.
+#
+# The settlement rows of the chain battery need cash, shares, cash_flaky and core; the
+# matching and listing rows need the other five. A manifest without [canisters.matching]
+# runs the settlement rows only.
 [project]
 name = "tachyon"
 default_network = "local"
-chain_id = 4
+chain_id = 31337
 
 [networks.local]
 validators = [
-    "http://127.0.0.1:18080",
-    "http://127.0.0.1:18081",
-    "http://127.0.0.1:18082",
-    "http://127.0.0.1:18083",
+    "http://127.0.0.1:18480",
+    "http://127.0.0.1:18481",
+    "http://127.0.0.1:18482",
+    "http://127.0.0.1:18483",
 ]
 routing = "smart"
+chain_id = 31337
+
+# ── ledgers ────────────────────────────────────────────────────────────────────────────────
+# Give tachyon-maker and tachyon-taker an initial balance on cash, shares and cash_flaky.
+# shares_empty stays at zero supply on purpose: the listing battery proves the funded check
+# refuses it.
 
 [canisters.cash]
 type = "backend-motoko"
 cid = "auto"
 wasm = "build/IndexedLedger.wasm"
-init = '(record { decimals = 2 : nat8; fee = 10 : nat; name = "Cash"; symbol = "CASH"; max_memo_length = null; max_supply = null; minting_account = record { owner = principal "2vxsx-fae"; subaccount = null }; initial_balances = vec {} })'
+init = '(record { name = "Cash"; symbol = "CASH"; decimals = 2 : nat8; fee = 10 : nat; minting_account = record { owner = principal "2vxsx-fae"; subaccount = null }; initial_balances = vec { record { record { owner = principal "<tachyon-maker>"; subaccount = null }; 100_000_000 : nat }; record { record { owner = principal "<tachyon-taker>"; subaccount = null }; 100_000_000 : nat } }; max_memo_length = null; max_supply = null })'
+
+[canisters.shares]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/IndexedLedger.wasm"
+init = '(record { name = "Shares"; symbol = "SHR"; decimals = 0 : nat8; fee = 10 : nat; minting_account = record { owner = principal "2vxsx-fae"; subaccount = null }; initial_balances = vec { record { record { owner = principal "<tachyon-maker>"; subaccount = null }; 100_000_000 : nat }; record { record { owner = principal "<tachyon-taker>"; subaccount = null }; 100_000_000 : nat } }; max_memo_length = null; max_supply = null })'
+
+[canisters.cash_flaky]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/FlakyLedger.wasm"
+init = '(record { name = "FlakyCash"; symbol = "FCASH"; decimals = 2 : nat8; fee = 10 : nat; minting_account = record { owner = principal "2vxsx-fae"; subaccount = null }; initial_balances = vec { record { record { owner = principal "<tachyon-maker>"; subaccount = null }; 100_000_000 : nat }; record { record { owner = principal "<tachyon-taker>"; subaccount = null }; 100_000_000 : nat } }; max_memo_length = null; max_supply = null })'
+
+[canisters.shares_empty]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/IndexedLedger.wasm"
+init = '(record { name = "EmptyShares"; symbol = "EMPT"; decimals = 0 : nat8; fee = 10 : nat; minting_account = record { owner = principal "2vxsx-fae"; subaccount = null }; initial_balances = vec {}; max_memo_length = null; max_supply = null })'
+
+# ── the settlement core ────────────────────────────────────────────────────────────────────
 
 [canisters.core]
 type = "backend-motoko"
 cid = "auto"
 wasm = "build/DvpCore.wasm"
 
+# ── the matching engines ───────────────────────────────────────────────────────────────────
+# `matching` is the battery's engine: maxFillsPerChunk = 2 forces multi-chunk clears with a
+# small book (the chunking and resume logic is byte-identical at every chunk size; the
+# interpreter battery proves the equivalence across sizes). `matching_gated` points at the
+# listing registry, so its intake is refused until a market is listed.
+
 [canisters.matching]
 type = "backend-motoko"
 cid = "auto"
 wasm = "build/Matching.wasm"
+init = '(record { sharesLedger = principal "<shares>"; cashLedger = principal "<cash>"; dvpCore = principal "<core>"; instrBudget = null; maxFillsPerChunk = opt (2 : nat); listingRegistry = null })'
+
+[canisters.matching_gated]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/Matching.wasm"
+init = '(record { sharesLedger = principal "<shares>"; cashLedger = principal "<cash>"; dvpCore = principal "<core>"; instrBudget = null; maxFillsPerChunk = null; listingRegistry = opt principal "<listing>" })'
+
+# ── the listing registry and a land collection ─────────────────────────────────────────────
 
 [canisters.listing]
 type = "backend-motoko"
 cid = "auto"
 wasm = "build/ListingRegistry.wasm"
+
+[canisters.land]
+type = "backend-motoko"
+cid = "auto"
+wasm = "build/LandLedger.wasm"
+init = '(record { name = "Land Titles"; symbol = "LAND"; description = null })'

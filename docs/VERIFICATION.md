@@ -67,6 +67,50 @@ the log's first lines.
 | D4 | No invariant violation logged across the run's trades and deliveries; five deliveries opened in the run |
 | T2 | Every validator report the same state root at a common height |
 
+## 3b. The matching engine and the listing registry on a localhost chain of the production node binary (2026-09-24)
+
+A localhost chain stood up by `thebes-deploy start`: four validators and one boundary on
+127.0.0.1 running the toolchain's production node binary (`egypt-node`, sha256 `d34849bd…`),
+chain id 31337, the Motoko legacy-ABI gate armed from genesis. The nine contracts of
+`deploy/example.thebes.toml` installed with `thebes-deploy` (`moc --legacy-persistence`),
+driven by `test/chain/battery.py`. The ground truth for every matching row is a stateful
+Python twin of `MatchLogic.mo` inside the battery — clearing price, priority sorts, the
+all-or-none fixpoint, the fill schedule, reservation arithmetic and per-fill-fee settlement
+deltas — fed exactly the submits, cancels and clears the battery drives on-chain. Log:
+`docs/chain-battery-2026-09-24.log`. **113 of 113 rows pass** (T1–T5 and D1–D4 reproduced
+on this bed, then M0–M5, MD, L1–L8, MF, and T2 last).
+
+| Row | What was shown |
+|---|---|
+| M0 | A caller that is not the bound engine can never `settleMatchFor`; only the installer binds or rotates the relayer |
+| M1 | A two-sided window cleared at one uniform price: obligations, book and reservations byte-identical to the twin; the 2-fill cap chunks the clear and the engine's own Timer completes it |
+| M2 | Every obligation settled through the core by seq: balance deltas exact to the per-fill fee, zero core residual, the matchSeq → trade round trip, the ORDER receipt carrying its matchSeq, an idempotent re-drive |
+| M3 | The first chunk reports its budget exhausted; the pre-await-armed chunk-resume Timer completes the clear unaided and the chunk count equals the arithmetic; the chunked schedule equals the twin's unbounded one; `settleMatched` settles exactly one obligation per call — the Timer it arms after its await is registered but never fires (defect recorded below); one call per obligation drains the window exactly |
+| M4 | Time priority at one price: the oldest resting bid fills first, the newest same-price bid gets nothing; an all-or-none ask that cannot fully fill is killed before any mutation, its reservation released, the survivors' schedule equal to the twin's |
+| M5 | Non-owner cancel, closed-window cancel, intake beyond the caller's allowance, unknown seq and zero deadline all refused; rotated away, the unbound engine is refused by the core and nothing moves; rotated back, the same obligation re-drives to settled |
+| MD | A fill at or below the asset ledger's fee: the core refuses it before any trade exists (nothing escrows — funds safe), and it permanently head-blocks `settleMatched`'s drain of its window (defect recorded below) |
+| L | The gated engine refuses an unlisted market at intake; issuer authorization is admin-only; a zero-supply ledger is refused as unfunded by the live cross-canister check; the funded pair lists and intake opens; delisting flips the gate off; a land collection is listable only once a title is minted |
+| MF | Both engines' invariant logs empty; no obligation of the run stranded (the dust probe excepted by design); the global obligation summary equal to the twin to the last byte |
+| T2 | Every validator reports the same state root at a common height |
+
+The run recorded three defects, each pinned by a battery row that must flip with its fix:
+
+- **A dust fill is permanently unsettleable and head-blocks its window** (MD1–MD3). The
+  engine's intake accepts any qty ≥ 1 and the planner emits boundary fills of any size, but
+  `settleMatchFor` refuses `assetAmount <= fee`; such an obligation is refused before a
+  trade exists, and `settleMatched` retries the window's first unsettled obligation
+  forever, so the fills behind it are never attempted. Funds are safe throughout: nothing
+  escrows for the refused fill and its reservation was already released at the clear.
+- **A Timer armed after a cross-canister await never fires on this bed** (M3f).
+  `settleMatched`'s continuation Timer is registered (the node's timer index grows) and
+  never dispatched, across three battery runs and a 150-second controlled observation; the
+  chunk-resume Timer, armed in an await-free message, fired in every run. The autonomous
+  window drain therefore does not run; every settlement in this section was driven by
+  explicit calls, one obligation per call.
+- **Reservation fee margins strand** (M1f, M4f). A filled bid's one-fee margin stays in
+  `reservedCash` (intake reserves `limit·qty + fee`; a fill releases `limit·qty`), and a
+  sell reserves no fee though its escrow costs one; the twin models both exactly.
+
 ## 4. On local replicas (September 2026)
 
 The core as a consumer of journal-backed ledgers: reservation escrow on such ledgers, and the rule
@@ -74,5 +118,10 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 
 ## 5. Not established
 
-- **The matching engine and the listing registry on the production binary.** Section 3 covers the
-  settlement core; the M-series rows are verified in the interpreter and on the subnet of section 2.
+- **The matching engine and the listing registry on a geographically distributed subnet
+  under the production environment.** Section 3b establishes them on the production node
+  binary on one machine, with `test/chain/battery.py` now covering them end to end; the
+  distributed composition of section 3's bed remains to be run.
+- **`settleMatched` as an autonomous drain.** Until the post-await Timer defect of section
+  3b is resolved, the engine settles matched windows one obligation per explicit call; the
+  battery asserts the current behaviour and must be flipped with the fix.

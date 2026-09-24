@@ -26,8 +26,8 @@ in Motoko. Apache 2.0.
 | Legs | ICRC-1/ICRC-2 (cash, fungible assets), ICRC-7 (unique assets) |
 | Matching | frequent batch auction, uniform clearing price, price-time priority, bounded clearing |
 | Proofs | Merkle mountain range receipts with a certified root |
-| Verification | 168,493 interpreter checks; 25 of 25 rows on a geographically distributed subnet running the production node binary |
-| Status | settlement core verified on the production node binary under the production environment; matching engine and listing registry verified in the interpreter and on a Thebes subnet |
+| Verification | 168,493 interpreter checks; 25 of 25 rows on a geographically distributed subnet running the production node binary; 113 of 113 rows (settlement, matching, listing) on a localhost chain of the production node binary against a Python twin of the clearing logic |
+| Status | settlement core verified on the production node binary under the production environment; matching engine and listing registry verified in the interpreter, on a Thebes subnet, and on a localhost chain of the production node binary |
 
 Tachyon implements BIS DvP Model 1 (gross, simultaneous, both-or-neither) over
 any ICRC-1/ICRC-2 ledger for cash and fungible assets and any ICRC-7 ledger for
@@ -117,6 +117,9 @@ S=$(mops sources)
 moc --legacy-persistence $S -o build/DvpCore.wasm         core/src/DvpCore.mo
 moc --legacy-persistence $S -o build/Matching.wasm        matching/src/Matching.mo
 moc --legacy-persistence $S -o build/ListingRegistry.wasm listing/src/ListingRegistry.mo
+moc --legacy-persistence $S -o build/IndexedLedger.wasm   core/fixtures/ledger/IndexedLedger.mo
+moc --legacy-persistence $S -o build/FlakyLedger.wasm     core/fixtures/ledger/FlakyLedger.mo
+moc --legacy-persistence $S -o build/LandLedger.wasm      core/src/land/LandLedger.mo
 
 moc -r $S core/test/run_tests.mo
 moc -r $S core/test/run_tests_icrc7.mo
