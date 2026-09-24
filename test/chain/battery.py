@@ -29,9 +29,10 @@ order fills first, the newest gets nothing) and an all-or-none order that cannot
 before any mutation with its reservation released; M5 adversarial refusals (non-owner cancel,
 closed-window cancel, an order beyond the caller's allowance, unknown seq, zero deadline) and the
 relayer rotation (the unbound engine refused by the core, the re-bound engine re-drives the same
-obligation to settled); MD the dust fill pinned exactly as it behaves today (a fill at or below
-the asset ledger's fee is refused by the core before any trade exists, funds safe, and it
-head-blocks settleMatched's Timer chain - the recorded liveness defect); L1-L8 the listing gate
+obligation to settled); MD the dust discipline (an order whose every fill would be dust is refused
+at intake; a boundary remainder fill at or below the fee still clears exactly as the twin plans it,
+the core refuses it before any trade exists - funds safe - and the drain VOIDS it, recorded with
+its reason, and completes the window past it: the recorded liveness gap closed); L1-L8 the listing gate
 (an unlisted market refused at intake, issuer
 authorization admin-only, a zero-supply ledger refused as unfunded by the live cross-canister
 check, the funded pair listed and accepted, delisting flips the gate off, a land collection
@@ -511,6 +512,12 @@ if MATCHING:
     row('M0a the engine\'s config names the core and the ledgers as the manifest maps them',
         all(p.split('-')[0] in cfgout for p in (CORE, SHARES, CASH)) and (field(cfgout, 'maxFillsPerChunk') or '').startswith('2'), cfgout[-300:])
 
+    # the standing approvals FIRST: the drain below settles stale obligations left by an earlier
+    # run, and those settles escrow through the core against these same allowances - granted
+    # after the drain they would refuse leg escrow with the T rows' small residue.
+    approve('shares', 'tachyon-maker', CORE, 100_000)
+    approve('cash', 'tachyon-taker', CORE, 500_000)
+
     # drain: cancel every resting order of the open window (owner unknown - try both identities),
     # then settle any unsettled obligation left by an earlier run. Not rows; bed hygiene.
     for _ in range(3):
@@ -521,12 +528,13 @@ if MATCHING:
         for i in ids:
             td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity='tachyon-maker')
             td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity='tachyon-taker')
-    # settle each stale obligation directly by seq (settleMatched would head-block on a dust
-    # obligation - see the MD rows); a seq the core permanently refuses is logged and left.
+    # settle each stale obligation directly by seq; one the core permanently refuses (dust left
+    # unsettled by an earlier run) is VOIDED by the engine - resolved, no longer counted unsettled.
     stale = [int(x.replace('_', '')) for x in re.findall(r'\b(?:seq|' + SKEY + r') = ([0-9_]+)', td('query', 'matching', 'unsettledObligations'))]
     for q in stale:
         out = td('call', 'matching', 'settleObligation', f'({q} : nat, 600 : nat)')
-        if not is_ok(out): log(f'  drain: stale obligation {q} refused ({err_text(out)[:80]}) - left unsettled')
+        if 'VOIDED' in out or 'voided' in out: log(f'  drain: stale obligation {q} voided (permanently unsettleable dust from an earlier run)')
+        elif not is_ok(out): log(f'  drain: stale obligation {q} refused ({err_text(out)[:80]}) - left unsettled')
 
     TW.next_id = (nat_in(td('query', 'matching', 'orderCount')) or 0) + 1
     TW.next_seq = obl_sum().count(';')
@@ -536,8 +544,6 @@ if MATCHING:
     TW.res_shares['tachyon-taker'] = ts0; TW.res_cash['tachyon-taker'] = tc0
     log(f'  seed: next_id={TW.next_id} next_seq={TW.next_seq} window={TW.window} resv maker={ms0}/{mc0} taker={ts0}/{tc0}')
 
-    approve('shares', 'tachyon-maker', CORE, 100_000)
-    approve('cash', 'tachyon-taker', CORE, 500_000)
     BASE = {('shares', 'tachyon-maker'): bal('shares', MAKER), ('cash', 'tachyon-maker'): bal('cash', MAKER),
             ('shares', 'tachyon-taker'): bal('shares', TAKER), ('cash', 'tachyon-taker'): bal('cash', TAKER)}
     kM = {'s': bal('shares', CORE), 'c': bal('cash', CORE)}
@@ -716,7 +722,7 @@ if MATCHING:
     row('M5b the owner cancels and the reservation is released to the twin\'s number', is_ok(r) and resv_ok, r[-120:])
     r = td('call', 'matching', 'cancelOrder', f'({a1} : nat)', identity='tachyon-maker')
     row('M5c an order of a closed window cannot be cancelled', not is_ok(r), r[-120:])
-    r = td('call', 'matching', 'submitOrder', '(record { side = variant { buy }; limitPrice = 10 : nat; qty = 10 : nat; allOrNone = false })', identity='tachyon-maker')
+    r = td('call', 'matching', 'submitOrder', '(record { side = variant { buy }; limitPrice = 10 : nat; qty = 20 : nat; allOrNone = false })', identity='tachyon-maker')
     row('M5d an order beyond the caller\'s allowance to the core is refused at intake',
         not is_ok(r) and 'allowance' in r, r[-200:])
     r = td('call', 'matching', 'settleObligation', '(999_999 : nat, 600 : nat)')
@@ -740,38 +746,69 @@ if MATCHING:
     row('M5h rotated back, the same obligation re-drives to SETTLED', is_ok(r) and is_ok(r2) and 'SETTLED' in r2, r2[-160:])
     bal_row('M5i balances after the rotation window exact to the twin')
 
-    # ── MD the dust fill: a recorded defect, asserted exactly as it behaves today ────────────
-    # The engine's intake accepts any qty >= 1 and the planner emits boundary fills of any
-    # size, but the core refuses assetAmount <= the asset ledger's fee
-    # (DvpCore.mo settleMatchFor validation), so a fill whose qty is at or below the shares
-    # fee is PERMANENTLY unsettleable: every attempt is refused before a trade is created
-    # (nothing escrows - funds are safe), and settleMatched's Timer chain retries the window's
-    # first unsettled obligation forever, so one dust fill head-blocks the window's autonomous
-    # settlement. These rows pin the behaviour; the engine-side fix (an intake floor tied to
-    # the ledger fees, or settleMatched skipping a permanently refused head) flips MD2/MD3 and
-    # must update them.
-    log('== MD dust: a fill at the ledger fee is unsettleable and head-blocks settleMatched')
-    dq = FEE_S // 2 if FEE_S > 1 else 1
-    da, _ = submit('tachyon-maker', 'sell', 10, dq)
-    db, _ = submit('tachyon-taker', 'buy', 10, dq)
+    # ── MD the dust discipline: intake floors, the boundary void, the drain completes ────────
+    # The core refuses a settlement whose asset amount is at or below the asset ledger's fee
+    # (DvpCore.mo settleMatchFor validation) BEFORE any trade exists, so nothing ever escrows
+    # for such a fill. The engine now (a) refuses at intake any order whose EVERY fill would
+    # land under a floor (qty <= sharesFee; for a bid also limitPrice*qty <= cashFee), and
+    # (b) resolves a boundary remainder fill the core permanently refuses as VOIDED - recorded
+    # with its reason, excluded from the unsettled set, skipped by the drain - so one dust fill
+    # can no longer head-block a window's settlement (the liveness gap of the first 2026-09-24
+    # record, closed). The void fires only while no trade exists for the seq; an obligation
+    # with a trade is never voided.
+    log('== MD dust: intake floors; a boundary dust fill is voided and the drain completes')
+    r = td('call', 'matching', 'submitOrder', f'(record {{ side = variant {{ sell }}; limitPrice = 10 : nat; qty = {FEE_S} : nat; allOrNone = false }})', identity='tachyon-maker')
+    row('MD0a a sell whose qty is at or below the shares ledger fee is refused at intake', not is_ok(r) and 'fee' in r, r[-200:])
+    r = td('call', 'matching', 'submitOrder', f'(record {{ side = variant {{ buy }}; limitPrice = 10 : nat; qty = {FEE_S} : nat; allOrNone = false }})', identity='tachyon-taker')
+    row('MD0b a buy whose qty is at or below the shares ledger fee is refused at intake', not is_ok(r) and 'fee' in r, r[-200:])
+    # a KNOWN book for the boundary scenario: the bed persists, so partially filled orders of the
+    # M rows still rest in the open window (M4's marginal bid, M1's unfilled ask) and would absorb
+    # the boundary fills. Cancel them first, mirroring the twin - the same hygiene as the M0 drain.
+    w_open = nat_in(td('query', 'matching', 'getCurrentWindow')) or 0
+    rest = td('query', 'matching', 'ordersInWindow', f'({w_open} : nat)')
+    for i in [int(x.replace('_', '')) for x in re.findall(r'\b(?:id|' + IDKEY + r') = ([0-9_]+)', rest)]:
+        o = TW.orders.get(i)
+        if o and o['status'] in 'OP' and o['rem'] > 0:
+            out = td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity=o['owner'])
+            if is_ok(out): TW.cancel(i)
+    # a floor-passing book whose schedule still holds one boundary remainder fill under the fee:
+    # asks 12 and 20, bids 15 and 17, all at one price -> fills 12, 3 (dust, mid-window), 17.
+    a1d, _ = submit('tachyon-maker', 'sell', 10, 12)
+    a2d, _ = submit('tachyon-maker', 'sell', 10, 20)
+    b1d, _ = submit('tachyon-taker', 'buy', 10, 15)
+    b2d, _ = submit('tachyon-taker', 'buy', 10, 17)
     wF = TW.window
     pF, killedF, schedF = TW.clear()
     td('call', 'matching', 'clearWindow')
-    row('MD1 the dust window clears one fill at or below the shares fee, schedule equal to the twin',
-        wait_clear_gone(wF, 300) and len(schedF) == 1 and schedF[0]['qty'] == dq and obl_sum() == OSUM0 + TW.obl_text(),
+    dustF = [f for f in schedF if f['qty'] <= FEE_S]
+    row('MD1 the boundary window clears: three fills, exactly one at or below the shares fee, schedule equal to the twin',
+        wait_clear_gone(wF, 300) and len(schedF) == 3 and len(dustF) == 1 and obl_sum() == OSUM0 + TW.obl_text(),
         TW.obl_text(schedF))
-    qF = [o['seq'] for o in TW.obls if o['window'] == wF][0]
-    r = td('call', 'matching', 'settleObligation', f'({qF} : nat, 600 : nat)')
-    tm = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {qF} : nat)')
-    row('MD2 the core refuses the dust obligation before any trade exists: no escrow, no trade id',
-        (not is_ok(r)) and 'must exceed the asset ledger fee' in r and 'null' in tm, (r[-160:], tm[-60:]))
-    bal_row('MD2b no balance moved for the dust fill (funds safe)')
-    # pass conditions read the chain by query, never a call's printed result: two same-identity
-    # updates back to back can be deduplicated by the ingress nonce window, the second answered
-    # with the first's result.
-    r = td('call', 'matching', 'settleMatched', f'({wF} : nat, 600 : nat)')
-    row('MD3 settleMatched cannot pass the permanently refused head (the recorded liveness gap)',
-        unsettled_in({wF}) == [wF], r[-200:])
+    dust_list = [o['seq'] for o in TW.obls if o['window'] == wF and o['qty'] <= FEE_S]
+    dust_seq = dust_list[0] if dust_list else 999_999_999   # no dust -> the rows below fail, the battery continues
+    good_seqs = [o['seq'] for o in TW.obls if o['window'] == wF and o['qty'] > FEE_S]
+    # drain the window with settleMatched, one resolution (settle or void) per call - the
+    # settleMatched Timer chain is the still-open post-await Timer defect. Pass conditions read
+    # the chain by query, never a call's printed result: two same-identity updates back to back
+    # can be deduplicated by the ingress nonce window, the second answered with the first's result.
+    guard = 0
+    while unsettled_in({wF}) and guard < 10:
+        td('call', 'matching', 'settleMatched', f'({wF} : nat, 600 : nat)')
+        guard += 1
+        time.sleep(3)
+    for q in good_seqs: TW.settle(q)
+    vq = td('query', 'matching', 'voidedObligations')
+    voided_now = [int(x.replace('_', '')) for x in re.findall(r'\b(?:seq|' + SKEY + r') = ([0-9_]+)', vq)]
+    tm = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {dust_seq} : nat)')
+    row('MD2 the drain voids the permanently refused dust fill: recorded with its reason, no trade ever created',
+        dust_seq in voided_now and 'ledger fee' in vq and 'null' in tm, (vq[-200:], tm[-60:]))
+    row('MD3 the drain completes the window past the voided fill - nothing left unsettled (the liveness gap closed)',
+        not unsettled_in({wF}), f'settleMatched calls={guard}')
+    bal_row('MD3b the two good fills settled exact to the twin; the voided fill moved nothing')
+    r = td('call', 'matching', 'settleObligation', f'({dust_seq} : nat, 600 : nat)')
+    tm2 = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {dust_seq} : nat)')
+    row('MD4 settleObligation on the voided seq reports the final resolution and creates no trade',
+        is_ok(r) and 'voided' in r.lower() and 'null' in tm2, r[-200:])
 
     # ── L rows: the listing registry gates the gated engine's intake ─────────────────────────
     log('== L listing: the issuer gate, the funded check, the land collection')
@@ -792,7 +829,7 @@ if MATCHING:
     vf = td('call', 'listing', 'verifyShareFunded', f'(principal "{SHARES}")')
     row('L5 the funded pair lists; tradeable; the live re-verification confirms the supply',
         is_ok(r) and 'true' in tr and is_ok(vf), (r[-120:], tr[-60:], vf[-100:]))
-    oidB, r = submit('tachyon-maker', 'sell', 10, 10, engine='matching_gated', mirror=False)
+    oidB, r = submit('tachyon-maker', 'sell', 10, 20, engine='matching_gated', mirror=False)
     r2 = td('call', 'matching_gated', 'cancelOrder', f'({oidB} : nat)', identity='tachyon-maker') if oidB else ''
     row('L6 the gated engine accepts intake once the pair is listed (and the probe order cancels clean)',
         oidB is not None and is_ok(r2), (r[-160:] if isinstance(r, str) else r))
@@ -820,8 +857,8 @@ if MATCHING:
     invB = td('query', 'matching_gated', 'invariantLog')
     row('MF1 both engines\' invariant logs are empty (no-stranding oracle)',
         text_of(inv) in (None, '') and text_of(invB) in (None, ''), (inv[-120:], invB[-120:]))
-    row('MF2 no obligation of this run is left unsettled (the dust window excepted by design)',
-        not unsettled_in(set(range(wA, TW.window + 1)) - {wF}))
+    row('MF2 no obligation of this run is left unsettled - the voided dust fill is resolved, not stranded',
+        not unsettled_in(set(range(wA, TW.window + 1))))
     row('MF3 the global obligation summary equals the twin to the last byte', obl_sum() == OSUM0 + TW.obl_text(),
         f'twin_total={TW.next_seq}')
     inv = td('query', 'core', 'invariantLog')

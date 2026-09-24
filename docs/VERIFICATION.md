@@ -101,6 +101,7 @@ The run recorded three defects, each pinned by a battery row that must flip with
   trade exists, and `settleMatched` retries the window's first unsettled obligation
   forever, so the fills behind it are never attempted. Funds are safe throughout: nothing
   escrows for the refused fill and its reservation was already released at the clear.
+  *Fixed engine-side and verified in section 3c.*
 - **A Timer armed after a cross-canister await never fires on this bed** (M3f).
   `settleMatched`'s continuation Timer is registered (the node's timer index grows) and
   never dispatched, across three battery runs and a 150-second controlled observation; the
@@ -111,6 +112,41 @@ The run recorded three defects, each pinned by a battery row that must flip with
   `reservedCash` (intake reserves `limit·qty + fee`; a fill releases `limit·qty`), and a
   sell reserves no fee though its escrow costs one; the twin models both exactly.
 
+## 3c. The dust-fill liveness defect of 3b fixed and verified in place (2026-09-24)
+
+The first defect of section 3b is resolved engine-side, in the two parts the record named, and
+verified on the same bed. At intake, the engine refuses any order whose every possible fill
+would be refused by the core's fee floors (`qty <= sharesFee`; for a bid also
+`limitPrice*qty <= cashFee`), reading the fees live. At settlement, a boundary remainder fill
+the core permanently refuses is resolved as VOIDED — the permanence judgment re-evaluates the
+core's own validation predicate from `DvpCore.settleMatchFor` against the obligation's
+immutable price and qty and the ledgers' live fees, never the error text — and fires only
+while no trade exists for the seq (`dvpTradeId` null: the core refused before creating the
+trade, so nothing ever escrowed; an obligation that owns a trade is never voided — the trade's
+own deadline/reclaim machinery owns its funds). A voided obligation is recorded with its
+reason (query `voidedObligations`), logged as a normal event beside the FOK kills, excluded
+from the unsettled set and skipped by the drain, so `settleMatched` completes a window past
+it. Voided is final, like a FOK kill.
+
+The voided state is a new stable map: the engines were upgraded IN PLACE on the running bed of
+section 3b (`thebes-deploy upgrade`, stable types checked compatible), the persisted book,
+obligations and reservations surviving — witnessed by the battery's seed lines — and the two
+stale dust obligations the 3b runs had left permanently unsettled were voided by the first
+drain of the new code. Run of record: `docs/chain-battery-2026-09-24b.log`, **116 of 116 rows
+pass** on the same four-validator localhost chain and binary (sha256 `d34849bd…`). The MD rows
+now pin the fixed behaviour:
+
+| Row | What was shown |
+|---|---|
+| MD0 | An order whose qty is at or below the shares ledger fee is refused at intake, both sides |
+| MD1 | A floor-passing book still yields a boundary remainder fill at or below the fee, mid-window; the three-fill schedule equals the twin's |
+| MD2 | The drain voids the permanently refused fill: recorded with its reason, no trade ever created |
+| MD3 | The drain completes the window past the voided fill — nothing left unsettled (the 3b liveness gap closed) |
+| MD3b | The two good fills settle exact to the twin; the voided fill moves nothing |
+| MD4 | `settleObligation` on the voided seq reports the final resolution and creates no trade |
+
+MF2 tightens with the fix: no obligation of the run is left unsettled, with no dust exception.
+
 ## 4. On local replicas (September 2026)
 
 The core as a consumer of journal-backed ledgers: reservation escrow on such ledgers, and the rule
@@ -119,8 +155,8 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 ## 5. Not established
 
 - **The matching engine and the listing registry on a geographically distributed subnet
-  under the production environment.** Section 3b establishes them on the production node
-  binary on one machine, with `test/chain/battery.py` now covering them end to end; the
+  under the production environment.** Sections 3b and 3c establish them on the production
+  node binary on one machine, with `test/chain/battery.py` covering them end to end; the
   distributed composition of section 3's bed remains to be run.
 - **`settleMatched` as an autonomous drain.** Until the post-await Timer defect of section
   3b is resolved, the engine settles matched windows one obligation per explicit call; the

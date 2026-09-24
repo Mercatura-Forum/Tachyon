@@ -94,6 +94,11 @@ shared (install) persistent actor class Matching(cfg : {
   let orders = Map.empty<Nat, T.Order>();
   let obligations = List.empty<T.Obligation>();
   var nextObligationSeq : Nat = 0;
+  // Obligations resolved as VOIDED (seq -> reason): permanently unsettleable through the core -
+  // the core refuses the fill BEFORE any trade exists (dust: an amount at or below a ledger fee),
+  // so nothing ever escrowed and there is nothing to return. Voided is a FINAL resolution, like a
+  // FOK kill: the settlement drain skips these instead of head-blocking on them.
+  let voidedSeqs = Map.empty<Nat, Text>();
   let pendingClears = Map.empty<Nat, T.PendingClear>();   // window -> resumable clear state
   let chunkCounts = Map.empty<Nat, Nat>();                // window -> chunk-messages used
 
@@ -103,7 +108,8 @@ shared (install) persistent actor class Matching(cfg : {
 
   // diagnostic invariant log (M4 no-stranding ANOMALIES; asserted EMPTY in tests; never traps)
   let invLog = List.empty<Text>();
-  // normal-event audit log for FOK kills (a kill is expected behaviour, NOT an anomaly)
+  // normal-event audit log for FOK kills and voided obligations (both are expected behaviour,
+  // NOT anomalies - the invariant log stays clean across them)
   let killLog = List.empty<Text>();
 
   transient let selfPrincipal = Principal.fromActor(self);
@@ -162,6 +168,16 @@ shared (install) persistent actor class Matching(cfg : {
       case null {};
     };
 
+    // Intake floor tied to the ledger fees: the core refuses a settlement whose asset amount is at
+    // or below the asset ledger fee (and whose cash amount is at or below the cash ledger fee), so
+    // an order whose EVERY possible fill lands under a floor could clear but never settle. Refuse
+    // it here instead: any fill's qty <= the order's qty, so qty <= sharesFee guarantees dust; and
+    // a bid's cash per fill is at most limitPrice*qty, so limitPrice*qty <= cashFee guarantees dust.
+    // (A boundary REMAINDER fill of a floor-passing order can still be dust - the settlement drain
+    // resolves that case by voiding, below.)
+    let sharesFee = try { await sharesL().icrc1_fee() } catch (_) { return #err("shares ledger unreachable") };
+    if (args.qty <= sharesFee) return #err("qty must exceed the shares ledger fee (" # Nat.toText(sharesFee) # ") - every fill of this order would be unsettleable");
+
     switch (args.side) {
       case (#sell) {
         // need `qty` shares; check free balance ∧ free allowance(owner -> core) on the shares ledger
@@ -177,6 +193,7 @@ shared (install) persistent actor class Matching(cfg : {
       case (#buy) {
         // need limitPrice*qty cash (+ one escrow fee margin); check free balance ∧ allowance on cash
         let fee = try { await cashL().icrc1_fee() } catch (_) { return #err("cash ledger unreachable") };
+        if (args.limitPrice * args.qty <= fee) return #err("order cash value must exceed the cash ledger fee (" # Nat.toText(fee) # ") - every fill of this order would be unsettleable");
         let need = args.limitPrice * args.qty + fee;
         let bal = try { await cashL().icrc1_balance_of({ owner = caller; subaccount = null }) } catch (_) { return #err("cash ledger unreachable") };
         let alw = try { (await cashL().icrc2_allowance({ account = { owner = caller; subaccount = null }; spender = { owner = dvpCore; subaccount = null } })).allowance } catch (_) { return #err("cash allowance read failed") };
@@ -374,7 +391,7 @@ shared (install) persistent actor class Matching(cfg : {
   // intake) and pays shares→buyer + cash→seller, both-or-neither, in one block, NO trader action.
   // Idempotent end-to-end: the core keys on the obligation `seq`, so a re-call re-drives the SAME
   // trade and never double-settles; we also short-circuit if the obligation is already linked.
-  func settleOneObligation(ob : T.Obligation, deadlineSecs : Nat) : async Result.Result<Text, Text> {
+  func settleOneObligation(ob : T.Obligation, deadlineSecs : Nat) : async* Result.Result<Text, Text> {
     if (ob.settled) return #ok("obligation " # Nat.toText(ob.seq) # " already settled (trade " # (switch (ob.dvpTradeId) { case (?t) Nat.toText(t); case null "?" }) # ")");
     let cashAmount = ob.price * ob.qty;
     let r = try {
@@ -400,42 +417,106 @@ shared (install) persistent actor class Matching(cfg : {
     };
   };
 
+  func isVoided(seq : Nat) : Bool {
+    switch (Map.get(voidedSeqs, Nat.compare, seq)) { case (?_) true; case null false }
+  };
+
+  // The core's settleMatchFor validation, mirrored STRUCTURALLY (DvpCore refuses
+  // assetAmount <= assetFee and cashAmount <= cashFee before any trade is created): the only
+  // refusal that is a pure function of the obligation's immutable fields and the ledgers' fees -
+  // i.e. PERMANENT - as opposed to transient conditions (balance, allowance, a ledger outage) that
+  // a retry can clear. Returns the reason when the obligation can never settle; null (= retryable)
+  // when it can, or when a fee cannot be read right now.
+  func dustReason(ob : T.Obligation) : async* ?Text {
+    let feeA = try { await sharesL().icrc1_fee() } catch (_) { return null };
+    if (ob.qty <= feeA) return ?("asset amount " # Nat.toText(ob.qty) # " is at or below the shares ledger fee " # Nat.toText(feeA));
+    let feeB = try { await cashL().icrc1_fee() } catch (_) { return null };
+    if (ob.price * ob.qty <= feeB) return ?("cash amount " # Nat.toText(ob.price * ob.qty) # " is at or below the cash ledger fee " # Nat.toText(feeB));
+    null
+  };
+
+  // After the core refuses an obligation, resolve it as VOIDED iff the refusal is permanent AND no
+  // trade exists for it (dvpTradeId null - the core refused BEFORE creating the trade, so nothing
+  // ever escrowed and there is nothing to return; a trade that DOES exist owns its funds through
+  // the trade's own deadline/reclaim machinery and is NEVER voided). Returns the resolution note,
+  // or null when the refusal is transient and the obligation stays retryable.
+  func voidIfPermanentlyRefused(ob : T.Obligation) : async* ?Text {
+    if (ob.settled or ob.dvpTradeId != null) return null;
+    switch (await* dustReason(ob)) {
+      case null null;
+      case (?why) {
+        // re-check after the fee-read awaits: a concurrent call may have settled it (settled wins)
+        if (ob.settled or ob.dvpTradeId != null) return null;
+        if (not isVoided(ob.seq)) {
+          Map.add(voidedSeqs, Nat.compare, ob.seq, why);
+          List.add(killLog, "VOID obligation " # Nat.toText(ob.seq) # " (permanently unsettleable: " # why # ")");
+        };
+        ?("obligation " # Nat.toText(ob.seq) # " VOIDED - permanently unsettleable: " # why)
+      };
+    };
+  };
+
   // Settle ONE obligation by seq (authenticated; settlement of a cleared match is deterministic and
-  // safe to trigger by anyone - the obligation's parties/price/qty are immutable).
+  // safe to trigger by anyone - the obligation's parties/price/qty are immutable). A voided
+  // obligation reports its (final) resolution; a permanent refusal voids it here too.
   public shared ({ caller }) func settleObligation(seq : Nat, deadlineSecs : Nat) : async Result.Result<Text, Text> {
     requireAuth(caller);
     if (deadlineSecs == 0) return #err("deadlineSecs must be > 0");
-    for (ob in List.values(obligations)) { if (ob.seq == seq) return await settleOneObligation(ob, deadlineSecs) };
+    for (ob in List.values(obligations)) {
+      if (ob.seq == seq) {
+        switch (Map.get(voidedSeqs, Nat.compare, seq)) {
+          case (?why) return #ok("obligation " # Nat.toText(seq) # " already voided - permanently unsettleable: " # why);
+          case null {};
+        };
+        let r = await* settleOneObligation(ob, deadlineSecs);
+        switch (r) {
+          case (#ok(_)) return r;
+          case (#err(e)) {
+            switch (await* voidIfPermanentlyRefused(ob)) {
+              case (?note) return #ok(note);
+              case null return #err(e);
+            };
+          };
+        };
+      };
+    };
     #err("no such obligation seq " # Nat.toText(seq));
   };
 
   func countUnsettled(window : Nat) : Nat {
     var rem = 0;
-    for (o in List.values(obligations)) { if (o.window == window and not o.settled) rem += 1 };
+    for (o in List.values(obligations)) { if (o.window == window and not o.settled and not isVoided(o.seq)) rem += 1 };
     rem
   };
 
   // Autonomous batch settle of a window - EGYPT-CORRECT one-await-per-message + Timer self-chain.
   // On egypt a `for` loop whose body contains an inter-canister `await` commits after the FIRST
   // iteration (the same scheduling property that forces the chunked-clear `continueClear` Timer
-  // pattern), so a single message can drive AT MOST one settlement. settleMatched therefore settles
-  // the FIRST unsettled obligation of the window (one await), then arms a `Timer.setTimer(#seconds 0)`
-  // to continue with the next, until none remain - fully autonomous, no trader action. For a
+  // pattern), so a single message can drive AT MOST one settlement. settleMatched therefore
+  // RESOLVES the first open obligation of the window per call - settles it, or, when the core's
+  // refusal is permanent (dust) and no trade exists, VOIDS it and moves on next call, so one
+  // unsettleable fill can never head-block the window's drain - then arms a
+  // `Timer.setTimer(#seconds 0)` to continue with the next, until none remain. For a
   // deterministic, synchronous drive (tests / a relayer that wants per-match control) call
   // `settleObligation` once per obligation instead.
   public shared ({ caller }) func settleMatched(window : Nat, deadlineSecs : Nat) : async Result.Result<{ settledThisCall : Bool; remaining : Nat; note : Text }, Text> {
     requireAuth(caller);
     if (deadlineSecs == 0) return #err("deadlineSecs must be > 0");
     var target : ?T.Obligation = null;
-    label scan for (ob in List.values(obligations)) { if (ob.window == window and not ob.settled) { target := ?ob; break scan } };
+    label scan for (ob in List.values(obligations)) { if (ob.window == window and not ob.settled and not isVoided(ob.seq)) { target := ?ob; break scan } };
     switch (target) {
       case null #ok({ settledThisCall = false; remaining = 0; note = "no unsettled obligations in window " # Nat.toText(window) });
       case (?ob) {
-        let r = await settleOneObligation(ob, deadlineSecs);
+        let r = await* settleOneObligation(ob, deadlineSecs);
+        let note = switch (r) {
+          case (#ok(n)) n;
+          case (#err(e)) {
+            switch (await* voidIfPermanentlyRefused(ob)) { case (?vn) vn; case null e };
+          };
+        };
+        let ok = switch (r) { case (#ok(_)) true; case (#err(_)) false };
         let rem = countUnsettled(window);
         if (rem > 0) ignore Timer.setTimer<system>(#seconds 0, func() : async () { ignore await settleMatched(window, deadlineSecs) });
-        let note = switch (r) { case (#ok(n)) n; case (#err(e)) e };
-        let ok = switch (r) { case (#ok(_)) true; case (#err(_)) false };
         #ok({ settledThisCall = ok; remaining = rem; note });
       };
     };
@@ -467,7 +548,13 @@ shared (install) persistent actor class Matching(cfg : {
   };
   public query func unsettledObligations() : async [T.ObligationView] {
     let out = List.empty<T.ObligationView>();
-    for (b in List.values(obligations)) { if (not b.settled) List.add(out, T.obligationView(b)) };
+    for (b in List.values(obligations)) { if (not b.settled and not isVoided(b.seq)) List.add(out, T.obligationView(b)) };
+    List.toArray(out)
+  };
+  // Obligations resolved as voided (permanently unsettleable; nothing ever escrowed), with reasons.
+  public query func voidedObligations() : async [{ seq : Nat; reason : Text }] {
+    let out = List.empty<{ seq : Nat; reason : Text }>();
+    for ((seq, reason) in Map.entries(voidedSeqs)) List.add(out, { seq; reason });
     List.toArray(out)
   };
   public query func pendingClearStatus(w : Nat) : async ?{ window : Nat; clearingPrice : Nat; targetVolume : Nat; filled : Nat; i : Nat; j : Nat; chunks : Nat } {
