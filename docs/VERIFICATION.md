@@ -107,7 +107,10 @@ The run recorded three defects, each pinned by a battery row that must flip with
   never dispatched, across three battery runs and a 150-second controlled observation; the
   chunk-resume Timer, armed in an await-free message, fired in every run. The autonomous
   window drain therefore does not run; every settlement in this section was driven by
-  explicit calls, one obligation per call.
+  explicit calls, one obligation per call. *Resolved in section 3d: the engine no longer arms
+  that Timer, nor any other message the caller does not await; the drain was rebuilt as a
+  bounded inline sweep. The substrate defect itself - a post-await Timer that never fires -
+  stands, recorded here.*
 - **Reservation fee margins strand** (M1f, M4f). A filled bid's one-fee margin stays in
   `reservedCash` (intake reserves `limit·qty + fee`; a fill releases `limit·qty`), and a
   sell reserves no fee though its escrow costs one; the twin models both exactly.
@@ -147,6 +150,68 @@ now pin the fixed behaviour:
 
 MF2 tightens with the fix: no obligation of the run is left unsettled, with no dust exception.
 
+## 3d. The autonomous drain rebuilt as a bounded inline sweep, verified on a fresh chain of the same binaries (2026-09-27)
+
+The second defect of section 3b is resolved engine-side by taking the substrate primitive it
+depended on out of the drain's path entirely. The lesson of the M3f defect generalised: this
+bed does not reliably dispatch a message the caller never awaits - the post-await Timer was one
+face of it, and a fire-and-forget self-call armed after the settlement await proved to be
+another (it ran inline in one controlled trace and was dropped in a battery run). So the drain
+no longer hands the next step to any such message. `settleMatched` now performs a BOUNDED
+INLINE SWEEP: within the one message the caller awaits, it walks the window's open obligations
+in seq order and resolves each in turn - settles it through the core, or, by the unchanged 3c
+discipline, voids it when the refusal is permanent and no trade exists - advancing a cursor past
+every obligation it touches, until it has attempted `MAX_FILLS_PER_CHUNK` of them (each attempt
+is one inter-canister round trip, so this bounds the message's work exactly as the same constant
+bounds a clear chunk) or the window is empty. The relayer calls it until `remaining` reaches
+zero - the identical loop-to-completion contract as the chunked clear's `continueClear`, and for
+the same reason: one message does a bounded slice and the caller drives the rest. A transiently
+refused obligation (balance, allowance, a ledger outage, a concurrent sweep holding the core's
+per-trade lock) is stepped over within the sweep and left unsettled, so it can never head-block
+the fills behind it, and a later sweep retries it; the new public `continueSettle(window,
+deadlineSecs, afterSeq)` resumes a sweep past a given seq, the deterministic skip a relayer uses
+when a refused obligation sits at a window's head and its condition has not cleared. That the
+substrate executes every one of a message's sequential settlement awaits - not just the first -
+was confirmed directly on this bed before the run: one `settleMatched` call against a
+three-fill window settled exactly two (the `MAX_FILLS_PER_CHUNK` bound) and reported "2 of 2
+attempted settled this sweep", the third draining on the next call. No stable state was added
+and the response shape is unchanged.
+
+The verification bed is a fresh localhost chain of the same production node binary (sha256
+`d34849bd…`), stood up by `thebes-deploy start --clean` after the 3b/3c chain was retired. The
+retirement is itself a record: on that bed, every `InstallCommit(upgrade)` for the ungated
+engine's cid arrived at `post_upgrade` with a zero-length argument (four executed attempts,
+each trapped decoding the class parameter and rolled back cleanly to the old wasm, state
+intact), while the gated engine's identical wasm upgraded in place with its argument intact,
+stable types checked compatible and state preserved; during the failing attempts two of the
+four validators safety-halted on INV-D4-PEER-PARITY (one reporting an all-zero state root) -
+the halt working as designed against drifted state. The deploy tool's own recovery for a stuck
+chunked-install session is a fresh cid (the upload id derives from the cid, and a failed
+commit's session has no GC), so the chain, no longer trustworthy as a verification bed, was
+retired rather than repaired around. Raw incident logs are kept beside the run artifacts
+(`test/chain/out/incident-2026-09-27/`, local, not committed).
+
+The nine contracts of `deploy/example.thebes.toml` were installed fresh with `thebes-deploy`
+(`moc --legacy-persistence`, the same wasm the failed upgrades carried), and the full battery
+driven by `test/chain/battery.py` against the stateful Python twin. Log:
+`docs/chain-battery-2026-09-27.log`. **118 of 118 rows pass.** Against section 3c's 116: the
+five M3 drain rows that pinned the one-call-per-obligation defect became one row (M3e, the
+looped inline drain), the MD drive flipped to the looped sweep, and a new six-row M6 section
+revokes an allowance mid-drain to show the sweep step over the refused fill, settle the one
+behind it, refuse to void it, and re-drive it to settled once the allowance returns. The fresh
+bed also re-proves the L8 unminted-collection refusal, provable only while the land collection
+is empty.
+
+| Row | What was shown |
+|---|---|
+| M3e | `settleMatched` drains the whole five-fill window in bounded inline sweeps looped to completion - no Timer, no self-message - verified by query |
+| M6a | A two-party window clears two cross-party fills - the maker selling the first, the taker the second - equal to the twin |
+| M6b | The maker's shares allowance to the core revoked, the sweep's first attempt is refused at leg escrow; the same bounded sweep steps its cursor past it and settles the fill behind it - a transient refusal cannot head-block the drain |
+| M6c | The refused obligation owns a trade (the core created it before the escrow failed) and the void discipline leaves it alone - voiding stays reserved for permanent refusals with no trade |
+| M6d | The allowance restored, the next sweep re-drives the same trade to SETTLED through the core's idempotent re-drive - nothing left unsettled |
+| M6e, M6f | Balances exact to the twin, the interrupted escrow landing exactly once; the core holds no residual |
+| MD1-MD4 | The dust window drains under the looped sweep - settle, void the permanent dust refusal in stride, settle - the 3c void discipline exercised inside the bounded inline drain |
+
 ## 4. On local replicas (September 2026)
 
 The core as a consumer of journal-backed ledgers: reservation escrow on such ledgers, and the rule
@@ -155,9 +220,7 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 ## 5. Not established
 
 - **The matching engine and the listing registry on a geographically distributed subnet
-  under the production environment.** Sections 3b and 3c establish them on the production
-  node binary on one machine, with `test/chain/battery.py` covering them end to end; the
-  distributed composition of section 3's bed remains to be run.
-- **`settleMatched` as an autonomous drain.** Until the post-await Timer defect of section
-  3b is resolved, the engine settles matched windows one obligation per explicit call; the
-  battery asserts the current behaviour and must be flipped with the fix.
+  under the production environment.** Sections 3b-3d establish them on the production node
+  binary on one machine, with `test/chain/battery.py` covering them end to end - the
+  autonomous drain rows included; the distributed composition of section 3's bed remains to
+  be run.

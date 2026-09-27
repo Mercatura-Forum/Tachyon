@@ -21,15 +21,19 @@ M1 a two-sided window cleared at one uniform price, the obligations, book and re
 the twin byte for byte; M2 every obligation settled through the core by seq with exact per-fill-fee
 balance deltas, zero core residual, the matchSeq -> tradeId round trip and an idempotent re-drive;
 M3 a clear under a 2-fill cap: the first chunk reports the budget exhausted, the engine's own Timer
-resumes and completes it with no battery drive, the chunk count equals the twin's arithmetic;
-settleMatched settles exactly one obligation per call and the Timer it arms after its await never
-fires on this bed (a recorded defect - the pre-await-armed chunk-resume Timer fires every run),
-so the window drains by one call per obligation; M4 time priority at one price (the oldest resting
+resumes and completes it with no battery drive, the chunk count equals the twin's arithmetic; then
+settleMatched drains the window in bounded inline sweeps looped to completion - each call settles up
+to MAX_FILLS_PER_CHUNK obligations INSIDE the one message the caller awaits (no post-await Timer and
+no fire-and-forget self-message: the substrate does not reliably dispatch a message the caller never
+awaits, the recorded post-await-Timer defect being one face of it); M4 time priority at one price (the oldest resting
 order fills first, the newest gets nothing) and an all-or-none order that cannot fully fill killed
 before any mutation with its reservation released; M5 adversarial refusals (non-owner cancel,
 closed-window cancel, an order beyond the caller's allowance, unknown seq, zero deadline) and the
 relayer rotation (the unbound engine refused by the core, the re-bound engine re-drives the same
-obligation to settled); MD the dust discipline (an order whose every fill would be dust is refused
+obligation to settled); M6 the drain steps over a transient refusal (a revoked maker allowance blocks
+the first of two cross-party fills; the same bounded sweep steps its cursor past it and settles the
+fill behind it, the refused obligation owns a trade and is never voided, and restoring the allowance
+re-drives it to settled); MD the dust discipline (an order whose every fill would be dust is refused
 at intake; a boundary remainder fill at or below the fee still clears exactly as the twin plans it,
 the core refuses it before any trade exists - funds safe - and the drain VOIDS it, recorded with
 its reason, and completes the window past it: the recorded liveness gap closed); L1-L8 the listing gate
@@ -564,6 +568,40 @@ if MATCHING:
         want_t = (TW.res_shares.get('tachyon-taker', 0), TW.res_cash.get('tachyon-taker', 0))
         return row(name, mm == want_m and tt == want_t, f'maker {mm} vs {want_m}; taker {tt} vs {want_t}')
 
+    def approve_feed(ledger, who, amount, exact=False):
+        # A mid-battery approve burns one ledger fee from the approver - a harness action, not an
+        # engine settlement. Feed the OBSERVED burn to the twin's deltas so the balance rows stay
+        # byte-exact, and log if it is ever not exactly one fee. With exact=True (a revoke), wait
+        # until the allowance reads back EQUAL to the amount - the >= wait inside approve() is
+        # vacuous for 0 and a stale read must not race the row that depends on the revocation.
+        p = OWNER_P[who]
+        b0 = bal(ledger, p)
+        approve(ledger, who, CORE, amount)
+        if exact:
+            for _ in range(20):
+                if (allowance(ledger, p, CORE) or 0) == amount: break
+                time.sleep(1)
+        b1 = bal(ledger, p)
+        fee = FEE_S if ledger == 'shares' else FEE_C
+        if b0 - b1 != fee: log(f'  approve_feed: {who}/{ledger} burned {b0 - b1} (expected one fee {fee})')
+        TW.delta[(ledger, who)] = TW.delta.get((ledger, who), 0) - (b0 - b1)
+
+    def drain_window(window, tries=16):
+        # The autonomous drain's loop-to-completion contract: settleMatched settles a BOUNDED
+        # slice (MAX_FILLS_PER_CHUNK obligations) of the window per call inside the one message the
+        # caller awaits - no Timer, no self-message - so the relayer calls it until nothing is left
+        # or the count stops falling (a transiently refused obligation the sweep stepped over,
+        # whose underlying condition has not cleared). Reads the chain by query, never a call's
+        # printed result (ingress-nonce dedup can answer a repeated same-identity update with the
+        # earlier call's result). Returns the seqs still unsettled in the window.
+        for _ in range(tries):
+            before = len(unsettled_in({window}))
+            if before == 0: break
+            td('call', 'matching', 'settleMatched', f'({window} : nat, 600 : nat)')
+            time.sleep(3)
+            if len(unsettled_in({window})) == before: break   # no progress -> stuck head, stop looping
+        return unsettled_in({window})
+
     r = td('call', 'core', 'settleMatchFor',
            f'(record {{ matchSeq = 999_999_999 : nat; maker = principal "{MAKER}"; taker = principal "{TAKER}"; assetLedger = principal "{SHARES}"; assetAmount = 100 : nat; cashLedger = principal "{CASH}"; cashAmount = 100 : nat; deadlineSecs = 60 : nat }})')
     row('M0b a caller that is not the bound engine can never settleMatchFor', not is_ok(r), r[-200:])
@@ -651,34 +689,18 @@ if MATCHING:
         ch == TW.chunks_expected(len(schedB), 2) and (ch or 0) >= 2, f'chunks={ch} fills={len(schedB)}')
     row('M3d the chunked schedule equals the twin\'s unbounded schedule (carried remainders included)',
         obl_sum() == OSUM0 + TW.obl_text(), f'twin_suffix={TW.obl_text()[-220:]}')
-    # settleMatched settles at most ONE obligation per call on this bed: the Timer it arms
-    # AFTER its cross-canister await is registered (the node's timer index grows) but never
-    # fires, while driveChunk's Timer, armed in an await-free message, fires every run - the
-    # asymmetry is a recorded defect; an engine or substrate fix flips M3f, which must then
-    # claim the autonomous drain. Pass conditions read the chain by query (nonce dedup can
-    # answer a repeated same-identity update with the earlier call's result).
+    # The autonomous drain: settleMatched settles a bounded slice per call INSIDE the one message
+    # the caller awaits (no Timer, no self-message - the substrate does not reliably dispatch a
+    # message the caller never awaits, the recorded post-await-Timer defect being one face of it),
+    # and the relayer loops until the window is empty. drain_window does exactly that.
     seqsB = [o['seq'] for o in TW.obls if o['window'] == wB and not o['settled']]
     n0 = len(unsettled_in({wB}))
-    td('call', 'matching', 'settleMatched', f'({wB} : nat, 600 : nat)')
-    time.sleep(3)
-    n1 = len(unsettled_in({wB}))
-    row('M3e settleMatched settles exactly one obligation per call, verified by query', n0 - n1 == 1, (n0, n1))
     t0 = time.time()
-    while time.time() - t0 < 240 and len(unsettled_in({wB})) == n1: time.sleep(10)
-    n2 = len(unsettled_in({wB}))
-    row('M3f the Timer settleMatched arms after its await never fires on this bed (the recorded defect)',
-        n2 == n1, (n1, n2))
-    guard = 0
-    while unsettled_in({wB}) and guard < 12:
-        td('call', 'matching', 'settleMatched', f'({wB} : nat, 600 : nat)')
-        guard += 1
-        time.sleep(3)
+    left = drain_window(wB)
+    drain_secs = time.time() - t0
     for q in seqsB: TW.settle(q)
-    row('M3g one settleMatched call per obligation drains the window, nothing left unsettled',
-        not unsettled_in({wB}), f'calls={guard + 1}')
-    bal_row('M3h balances after the drained window exact to the twin')
-    row('M3i the core still holds no residual', bal('shares', CORE) == kM['s'] and bal('cash', CORE) == kM['c'],
-        (kM, bal('shares', CORE), bal('cash', CORE)))
+    row('M3e settleMatched drains the whole window in bounded inline sweeps (looped to completion, no self-message)',
+        n0 == len(seqsB) and n0 >= 2 and not left, (n0, left, f'{drain_secs:.0f}s'))
 
     # ── M4 time priority and the all-or-none kill ────────────────────────────────────────────
     log('== M4 priority and FOK')
@@ -746,6 +768,63 @@ if MATCHING:
     row('M5h rotated back, the same obligation re-drives to SETTLED', is_ok(r) and is_ok(r2) and 'SETTLED' in r2, r2[-160:])
     bal_row('M5i balances after the rotation window exact to the twin')
 
+    # ── M6 the autonomous drain steps over a transient refusal ───────────────────────────────
+    # A transient refusal must be SKIPPED, not head-block the window: a two-party window whose
+    # first fill settles shares from the maker and whose second settles shares from the taker,
+    # the maker's shares allowance to the core revoked before the drain. The sweep attempts the
+    # first fill - the core creates the trade, escrows the cash leg, cannot pull the asset leg,
+    # so it stays unsettled - steps its cursor past it and settles the second fill in the same
+    # bounded sweep (MAX_FILLS_PER_CHUNK is 2, so both are attempted in the one call). The refused
+    # obligation owns a trade, so the void discipline must leave it alone. Restoring the allowance,
+    # one more sweep re-drives the same trade to settled - the T4 idempotent-retry story through
+    # the engine's drain. This scenario needs a book of exactly the four orders below, so it clears
+    # the open window of any re-enqueued remainder first (like MD): a leftover order pairing with
+    # one of them could make a fill whose buyer and seller are the same trader - a self-trade the
+    # core refuses and can never settle - which is why it runs here, after the M1->M5 windows that
+    # depend on the resting remainders this drain would cancel.
+    log('== M6 the autonomous drain steps over a transient refusal')
+    w_pre = nat_in(td('query', 'matching', 'getCurrentWindow')) or 0
+    rest = td('query', 'matching', 'ordersInWindow', f'({w_pre} : nat)')
+    for i in [int(x.replace('_', '')) for x in re.findall(r'\b(?:id|' + IDKEY + r') = ([0-9_]+)', rest)]:
+        o = TW.orders.get(i)
+        if o and o['status'] in 'OP' and o['rem'] > 0:
+            out = td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity=o['owner'])
+            if is_ok(out): TW.cancel(i)
+    approve_feed('shares', 'tachyon-taker', 100_000)   # the taker sells in this window
+    approve_feed('cash', 'tachyon-maker', 100_000)     # the maker buys in this window
+    aT, _ = submit('tachyon-maker', 'sell', 10, 100)   # fill 1: seller maker (aT), buyer taker (bT)
+    aU, _ = submit('tachyon-taker', 'sell', 10, 150)   # fill 2: seller taker (aU), buyer maker (bU)
+    bT, _ = submit('tachyon-taker', 'buy', 10, 100)
+    bU, _ = submit('tachyon-maker', 'buy', 10, 150)
+    wB2 = TW.window
+    pB2, killedB2, schedB2 = TW.clear()
+    td('call', 'matching', 'clearWindow')
+    row('M6a the window clears exactly two cross-party fills (maker sells the first, taker the second), equal to the twin',
+        wait_clear_gone(wB2, 300) and len(schedB2) == 2
+        and schedB2[0]['sellId'] == aT and schedB2[0]['buyId'] == bT
+        and schedB2[1]['sellId'] == aU and schedB2[1]['buyId'] == bU
+        and obl_sum() == OSUM0 + TW.obl_text(), TW.obl_text(schedB2))
+    seqs2 = [o['seq'] for o in TW.obls if o['window'] == wB2]
+    seq1, seq2 = (seqs2 + [999_999_998, 999_999_999])[:2]
+    approve_feed('shares', 'tachyon-maker', 0, exact=True)   # revoke: fill 1's asset escrow now refused
+    left = drain_window(wB2)   # sweep attempts seq1 (refused, stepped over), settles seq2, stalls on seq1
+    TW.settle(seq2)
+    row('M6b the sweep steps over the transiently refused first fill and settles the fill behind it in one bounded sweep',
+        left == [wB2], left)
+    vq = td('query', 'matching', 'voidedObligations')
+    voided_now = [int(x.replace('_', '')) for x in re.findall(r'\b(?:seq|' + SKEY + r') = ([0-9_]+)', vq)]
+    tm = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {seq1} : nat)')
+    row('M6c the refused obligation owns a trade and is never voided (the void discipline holds under a transient refusal)',
+        seq1 not in voided_now and 'null' not in tm, (vq[-120:], tm[-80:]))
+    approve_feed('shares', 'tachyon-maker', 100_000)   # restore the allowance
+    left = drain_window(wB2)   # the refused trade re-drives to settled now the allowance is back
+    TW.settle(seq1)
+    row('M6d the allowance restored, the next sweep re-drives the same trade to SETTLED - nothing left unsettled',
+        not left, left)
+    bal_row('M6e balances after the drained window exact to the twin (the interrupted escrow landed exactly once)')
+    row('M6f the core still holds no residual', bal('shares', CORE) == kM['s'] and bal('cash', CORE) == kM['c'],
+        (kM, bal('shares', CORE), bal('cash', CORE)))
+
     # ── MD the dust discipline: intake floors, the boundary void, the drain completes ────────
     # The core refuses a settlement whose asset amount is at or below the asset ledger's fee
     # (DvpCore.mo settleMatchFor validation) BEFORE any trade exists, so nothing ever escrows
@@ -787,23 +866,20 @@ if MATCHING:
     dust_list = [o['seq'] for o in TW.obls if o['window'] == wF and o['qty'] <= FEE_S]
     dust_seq = dust_list[0] if dust_list else 999_999_999   # no dust -> the rows below fail, the battery continues
     good_seqs = [o['seq'] for o in TW.obls if o['window'] == wF and o['qty'] > FEE_S]
-    # drain the window with settleMatched, one resolution (settle or void) per call - the
-    # settleMatched Timer chain is the still-open post-await Timer defect. Pass conditions read
-    # the chain by query, never a call's printed result: two same-identity updates back to back
-    # can be deduplicated by the ingress nonce window, the second answered with the first's result.
-    guard = 0
-    while unsettled_in({wF}) and guard < 10:
-        td('call', 'matching', 'settleMatched', f'({wF} : nat, 600 : nat)')
-        guard += 1
-        time.sleep(3)
+    # drain the window with settleMatched looped to completion: the bounded inline sweeps settle
+    # the first good fill, void the permanently refused dust fill in stride, and settle the fill
+    # beyond it. drain_window reads the chain by query, never a call's printed result.
+    t0 = time.time()
+    drain_window(wF)
+    md_secs = time.time() - t0
     for q in good_seqs: TW.settle(q)
     vq = td('query', 'matching', 'voidedObligations')
     voided_now = [int(x.replace('_', '')) for x in re.findall(r'\b(?:seq|' + SKEY + r') = ([0-9_]+)', vq)]
     tm = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {dust_seq} : nat)')
     row('MD2 the drain voids the permanently refused dust fill: recorded with its reason, no trade ever created',
         dust_seq in voided_now and 'ledger fee' in vq and 'null' in tm, (vq[-200:], tm[-60:]))
-    row('MD3 the drain completes the window past the voided fill - nothing left unsettled (the liveness gap closed)',
-        not unsettled_in({wF}), f'settleMatched calls={guard}')
+    row('MD3 the looped drain completes the window past the voided fill - nothing left unsettled (settle, void, settle)',
+        not unsettled_in({wF}), f'drained in {md_secs:.0f}s')
     bal_row('MD3b the two good fills settled exact to the twin; the voided fill moved nothing')
     r = td('call', 'matching', 'settleObligation', f'({dust_seq} : nat, 600 : nat)')
     tm2 = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {dust_seq} : nat)')

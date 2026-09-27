@@ -489,37 +489,88 @@ shared (install) persistent actor class Matching(cfg : {
     rem
   };
 
-  // Autonomous batch settle of a window - EGYPT-CORRECT one-await-per-message + Timer self-chain.
-  // On egypt a `for` loop whose body contains an inter-canister `await` commits after the FIRST
-  // iteration (the same scheduling property that forces the chunked-clear `continueClear` Timer
-  // pattern), so a single message can drive AT MOST one settlement. settleMatched therefore
-  // RESOLVES the first open obligation of the window per call - settles it, or, when the core's
-  // refusal is permanent (dust) and no trade exists, VOIDS it and moves on next call, so one
-  // unsettleable fill can never head-block the window's drain - then arms a
-  // `Timer.setTimer(#seconds 0)` to continue with the next, until none remain. For a
-  // deterministic, synchronous drive (tests / a relayer that wants per-match control) call
-  // `settleObligation` once per obligation instead.
+  // The window's first obligation still open for the drain - unsettled, not voided and, with
+  // `after` set, strictly beyond it. Obligations append in seq order, so the first hit is the
+  // lowest eligible seq.
+  func nextUnsettledAfter(window : Nat, after : ?Nat) : ?T.Obligation {
+    for (ob in List.values(obligations)) {
+      if (ob.window == window and not ob.settled and not isVoided(ob.seq)) {
+        switch (after) { case null return ?ob; case (?a) { if (ob.seq > a) return ?ob } };
+      };
+    };
+    null
+  };
+
+  // One INLINE sweep of a window's drain. Walks the window's open obligations in seq order,
+  // starting after the cursor, and resolves each in turn WITHIN THIS MESSAGE - settles it
+  // through the core (one settleMatchFor await), or, when the core's refusal is permanent (dust)
+  // and no trade exists, voids it in place - advancing the cursor past every obligation it
+  // touches. It stops after `budget` obligations attempted (each attempt is one inter-canister
+  // round trip, so this bounds the message's work exactly as MAX_FILLS_PER_CHUNK bounds a clear
+  // chunk) or when the window has no obligation left beyond the cursor.
+  //
+  // NO Timer and NO fire-and-forget self-call chain the next step: both hand work to a message
+  // the caller never awaits, and this substrate does not reliably dispatch such a message - the
+  // recorded post-await-Timer defect is one face of it, and a self-call armed after the failing
+  // settleMatchFor is another (it ran inline in one manual trace, was dropped in a battery run).
+  // The sweep therefore settles every obligation it can INSIDE the one awaited message, so its
+  // progress is exactly what the caller reads back - deterministic, independent of self-message
+  // delivery. A window wider than `budget` (or holding a transiently refused obligation the
+  // sweep steps over) is drained by calling again: the relayer loops until `remaining` is zero
+  // or stops falling. A transiently refused obligation (balance, allowance, a ledger outage, a
+  // concurrent sweep holding the core's per-trade lock) is stepped over and left unsettled - it
+  // can never head-block the fills behind it within the budget - and a later sweep retries it.
+  func driveSettle(window : Nat, deadlineSecs : Nat, after : ?Nat, budget : Nat) : async* { settledThisCall : Bool; remaining : Nat; note : Text } {
+    var cursor = after;
+    var settled = 0;
+    var attempts = 0;
+    var lastNote = "";
+    label sweep while (attempts < budget) {
+      switch (nextUnsettledAfter(window, cursor)) {
+        case null break sweep;
+        case (?ob) {
+          attempts += 1;
+          let r = await* settleOneObligation(ob, deadlineSecs);
+          switch (r) {
+            case (#ok(n)) { settled += 1; lastNote := n };
+            case (#err(e)) {
+              lastNote := switch (await* voidIfPermanentlyRefused(ob)) { case (?vn) vn; case null e };
+            };
+          };
+          cursor := ?ob.seq;   // advance past this obligation whether it settled, voided or was skipped
+        };
+      };
+    };
+    let rem = countUnsettled(window);
+    let note = if (attempts == 0) "no unsettled obligations in window " # Nat.toText(window)
+               else Nat.toText(settled) # " of " # Nat.toText(attempts) # " attempted settled this sweep; " # Nat.toText(rem) # " unsettled remain in window " # Nat.toText(window)
+                    # (if (rem > 0) " (sweep again to continue)" else "") # (if (lastNote != "") " [last: " # lastNote # "]" else "");
+    { settledThisCall = settled > 0; remaining = rem; note };
+  };
+
+  // Autonomous batch settle of a window, one bounded inline sweep per call: settles up to
+  // MAX_FILLS_PER_CHUNK obligations of the window from the head, voiding any permanent dust
+  // refusal in stride and stepping over a transient one, and reports how many remain. The
+  // relayer calls it until `remaining` reaches zero (or stops falling, when a transient refusal
+  // needs its underlying condition cleared first) - the SAME loop-to-completion contract as the
+  // chunked clear's `continueClear`, and for the same reason: a single message does a bounded
+  // slice of the work and the caller drives the rest. For per-match control (tests, or a relayer
+  // that wants one obligation at a time) call `settleObligation` by seq instead.
   public shared ({ caller }) func settleMatched(window : Nat, deadlineSecs : Nat) : async Result.Result<{ settledThisCall : Bool; remaining : Nat; note : Text }, Text> {
     requireAuth(caller);
     if (deadlineSecs == 0) return #err("deadlineSecs must be > 0");
-    var target : ?T.Obligation = null;
-    label scan for (ob in List.values(obligations)) { if (ob.window == window and not ob.settled and not isVoided(ob.seq)) { target := ?ob; break scan } };
-    switch (target) {
-      case null #ok({ settledThisCall = false; remaining = 0; note = "no unsettled obligations in window " # Nat.toText(window) });
-      case (?ob) {
-        let r = await* settleOneObligation(ob, deadlineSecs);
-        let note = switch (r) {
-          case (#ok(n)) n;
-          case (#err(e)) {
-            switch (await* voidIfPermanentlyRefused(ob)) { case (?vn) vn; case null e };
-          };
-        };
-        let ok = switch (r) { case (#ok(_)) true; case (#err(_)) false };
-        let rem = countUnsettled(window);
-        if (rem > 0) ignore Timer.setTimer<system>(#seconds 0, func() : async () { ignore await settleMatched(window, deadlineSecs) });
-        #ok({ settledThisCall = ok; remaining = rem; note });
-      };
-    };
+    #ok(await* driveSettle(window, deadlineSecs, null, MAX_FILLS_PER_CHUNK));
+  };
+
+  // Resume a sweep PAST a given seq - the deterministic skip a relayer uses when a transiently
+  // refused obligation sits at the head of a window and the underlying condition has not cleared:
+  // settling from `afterSeq` steps over it so the fills behind it still drain, without waiting on
+  // the head. `afterSeq` null is identical to settleMatched (sweep from the head). Same bounded
+  // slice (MAX_FILLS_PER_CHUNK) and loop-to-completion contract.
+  public shared ({ caller }) func continueSettle(window : Nat, deadlineSecs : Nat, afterSeq : ?Nat) : async Result.Result<{ settledThisCall : Bool; remaining : Nat; note : Text }, Text> {
+    requireAuth(caller);
+    if (deadlineSecs == 0) return #err("deadlineSecs must be > 0");
+    #ok(await* driveSettle(window, deadlineSecs, afterSeq, MAX_FILLS_PER_CHUNK));
   };
 
   // ── Queries ──────────────────────────────────────────────────────────────────────────────────
