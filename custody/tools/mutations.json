@@ -88,5 +88,122 @@
   "new": "        for ((h, bal) in sorted.vals()) { let p = position(s, x.asset, h); matched += 1; List.add(rows, (h, p, bal)) };\n",
   "mutant": "every balance counted as matched",
   "test": "Custody"
+ },
+ {
+  "id": "M11",
+  "property": "the underwriter's fee is rounded half up once",
+  "file": "custody/src/OfferingMath.mo",
+  "old": "let n = amount * bps; let q = n / BPS; if (2 * (n % BPS) >= BPS) q + 1 else q",
+  "new": "amount * bps / BPS",
+  "mutant": "the fee floored",
+  "test": "Offering"
+ },
+ {
+  "id": "M12",
+  "property": "each order's share is the difference of two cumulative floors, so the tranche's lots are allocated exactly",
+  "file": "custody/src/OfferingMath.mo",
+  "old": "    ((before + lots) * supply / demand) - (before * supply / demand : Nat) : Nat\n",
+  "new": "    lots * supply / demand\n",
+  "mutant": "each share floored on its own, the remainders lost",
+  "test": "Offering"
+ },
+ {
+  "id": "M13",
+  "property": "an oversubscribed retail tranche takes the institutional tranche's unfilled lots",
+  "file": "custody/src/OfferingMath.mo",
+  "old": "    let toRetail = if (spareInst < moreRetail) spareInst else moreRetail;\n",
+  "new": "    let toRetail = 0;\n",
+  "mutant": "no reallocation to the retail tranche",
+  "test": "Offering"
+ },
+ {
+  "id": "M14",
+  "property": "the offering is never priced above the book's clearing price",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "        if (x.price > clearing) return ?#PriceAboveBook({ price = x.price; clearing });\n",
+  "new": "",
+  "mutant": "a price above the book accepted",
+  "test": "Offering"
+ },
+ {
+  "id": "M15",
+  "property": "cornerstones are capped at their share of the institutional tranche",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "        if (o.cornerLots + x.lots > cap) return ?#CornerstoneCap({ cap; committed = o.cornerLots; wanted = x.lots });\n",
+  "new": "",
+  "mutant": "cornerstones above the cap",
+  "test": "Offering"
+ },
+ {
+  "id": "M16",
+  "property": "one live order per investor in an offering",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "    if (liveOrderOf(s, off, investor) != null) ?#DuplicateInvestor({ offering = off }) else null\n",
+  "new": "    null\n",
+  "mutant": "a second application from one investor",
+  "test": "Offering"
+ },
+ {
+  "id": "M17",
+  "property": "a retail application is paid in full at the top of the range",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "        if (x.paid != due) return ?#PaymentMismatch({ paid = x.paid; due });\n",
+  "new": "",
+  "mutant": "a short payment accepted",
+  "test": "Offering"
+ },
+ {
+  "id": "M18",
+  "property": "a best-efforts offering that sells less than its minimum fails",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "        if (not o.terms.firmCommitment and sold * M.BPS < o.terms.minSoldBps * OT.offerLots(o.terms)) {\n",
+  "new": "        if (false) {\n",
+  "mutant": "the minimum ignored",
+  "test": "Offering"
+ },
+ {
+  "id": "M19",
+  "property": "a bid at the offer price is in the allocation",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "if (r.live and r.price >= o.price) {",
+  "new": "if (r.live and r.price > o.price) {",
+  "mutant": "the bids at the price left out",
+  "test": "Offering"
+ },
+ {
+  "id": "M20",
+  "property": "a withdrawn bid takes nothing",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "if (r.live and r.price >= o.price) {",
+  "new": "if (r.price >= o.price) {",
+  "mutant": "a withdrawn bid allocated",
+  "test": "Offering"
+ },
+ {
+  "id": "M21",
+  "property": "the free float excludes the cornerstones' locked-up shares",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "{ floatBps = (o.bidsAlloc + o.retailAlloc) * o.terms.lot",
+  "new": "{ floatBps = (o.bidsAlloc + o.retailAlloc + o.cornerLots) * o.terms.lot",
+  "mutant": "the cornerstones counted as free float",
+  "test": "Offering"
+ },
+ {
+  "id": "M22",
+  "property": "a withdrawal refunds every retail payment in full",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "        RS.put(s.offeringRows, offerings, x.offering, { o with state = OT.WITHDRAWN; refunds = o.retailPaid });\n        [x.offering, o.retailPaid]\n",
+  "new": "        RS.put(s.offeringRows, offerings, x.offering, { o with state = OT.WITHDRAWN });\n        [x.offering, o.refunds]\n",
+  "mutant": "only the allocation's refunds returned",
+  "test": "Offering"
+ },
+ {
+  "id": "M23",
+  "property": "the allocation file closes with the underwriter's take-up",
+  "file": "custody/src/OfferingCore.mo",
+  "old": "          chain := K.tail(chain, o.terms.underwriter, o.underwriterLots);\n",
+  "new": "",
+  "mutant": "the take-up left out of the file",
+  "test": "Offering"
  }
 ]

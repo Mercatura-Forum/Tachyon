@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nile Valley Logistics IPO</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root { --bg:#f2f3f6; --ink:#181b24; --muted:#5a6072; --card:#ffffff; --line:#d5d8e1; --grid:#e7e9ef; --demand:#23407a; --tranche:#b3462e; --price:#1f7a5a; --retail:#b48a1f; --corner:#6b4fa0; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { color-scheme: dark; --bg:#11131a; --ink:#e3e5ec; --muted:#9aa0b2; --card:#191c25; --line:#2b2f3b; --grid:#232733; --demand:#7fa2e8; --tranche:#ec8a70; --price:#5cc79d; --retail:#e3bd5a; --corner:#a98de0; } }
+:root[data-theme="dark"] { color-scheme: dark; --bg:#11131a; --ink:#e3e5ec; --muted:#9aa0b2; --card:#191c25; --line:#2b2f3b; --grid:#232733; --demand:#7fa2e8; --tranche:#ec8a70; --price:#5cc79d; --retail:#e3bd5a; --corner:#a98de0; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 "Libre Franklin", -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width:1080px; margin:0 auto; padding-block:24px 64px; padding-inline:16px; }
+h1 { font-size:25px; margin:0 0 4px; text-wrap:balance; } h2 { font-size:19px; margin:30px 0 4px; text-wrap:balance; } h3 { font-size:15px; margin:0 0 8px; }
+.sub { color:var(--muted); margin:0 0 14px; max-width:780px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+.two { display:grid; grid-template-columns:3fr 2fr; gap:16px; } @media (max-width:800px) { .two { grid-template-columns:1fr; } } .two > * { min-width:0; }
+.three { display:grid; grid-template-columns:repeat(3, 1fr); gap:16px; } @media (max-width:800px) { .three { grid-template-columns:1fr; } } .three > * { min-width:0; }
+.num, td.n { font-family:"IBM Plex Mono", ui-monospace, Menlo, monospace; font-variant-numeric:tabular-nums; }
+.meta { color:var(--muted); font-size:13px; }
+.scroll { overflow-x:auto; }
+dl.kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin:0; font-size:14px; } dl.kv dt { color:var(--muted); } dl.kv dd { margin:0; text-align:right; font-family:"IBM Plex Mono", monospace; font-variant-numeric:tabular-nums; }
+table { width:100%; border-collapse:collapse; font-size:14px; } th { text-align:left; font-weight:600; color:var(--muted); font-size:12px; letter-spacing:.03em; text-transform:uppercase; padding:6px 10px 6px 0; border-bottom:1px solid var(--line); white-space:nowrap; }
+td { padding:5px 10px 5px 0; border-bottom:1px solid var(--grid); } td.n, th.n { text-align:right; white-space:nowrap; }
+.tag { display:inline-block; font-size:12px; padding:1px 8px; border-radius:10px; border:1px solid var(--line); color:var(--muted); }
+.legend { display:flex; flex-wrap:wrap; gap:14px; font-size:13px; color:var(--muted); margin-top:6px; } .legend i { display:inline-block; width:14px; height:3px; margin-right:6px; vertical-align:3px; }
+svg { display:block; width:100%; height:auto; }
+ul.refusals { columns:2 320px; margin:0; padding-left:18px; font-size:14px; } ul.refusals li { break-inside:avoid; margin-bottom:4px; } ul.refusals code { font-family:"IBM Plex Mono", monospace; font-size:12px; color:var(--muted); }
+footer { color:var(--muted); font-size:12px; margin-top:28px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Nile Valley Logistics goes public</h1>
+<p class="sub" id="lede"></p>
+
+<h2>The book</h2>
+<div class="two"><div class="card"><h3>Institutional demand at each price</h3>
+<svg id="curve" viewBox="0 0 600 300" role="img" aria-label="Cumulative institutional demand by price against the institutional tranche"></svg>
+<div class="legend"><span><i style="background:var(--demand)"></i>demand at or above the price, cornerstones included</span><span><i style="background:var(--tranche)"></i>the institutional tranche</span><span><i style="background:var(--price)"></i>the offer price</span></div></div>
+<div class="card"><h3>How the price was set</h3><dl class="kv" id="pricing"></dl><p class="meta" id="pricingNote"></p></div></div>
+
+<h2>The allocation</h2>
+<p class="sub" id="allocSub"></p>
+<div class="three" id="tranches"></div>
+
+<h2>The hand-off to the listing</h2>
+<div class="two"><div class="card"><h3>The listing gate and the proceeds</h3><dl class="kv" id="handoff"></dl></div>
+<div class="card"><h3>The register at listing</h3><dl class="kv" id="register"></dl><p class="meta">Each allotment reached the custody register as an issuance receipt from the issuer. The register was then reconciled to the ledger's balances, with no breaks.</p></div></div>
+
+<h2>Three other offerings</h2>
+<p class="sub">The same register, with the rules that decide when an offering does not simply list.</p>
+<div class="card"><div class="scroll"><table id="others"></table></div></div>
+
+<h2>What the register refused</h2>
+<p class="sub" id="refSub"></p>
+<div class="card"><ul class="refusals" id="refusals"></ul></div>
+<footer>The issuers, the investors and the figures are illustrative. Tranches, the cornerstone cap, the underwriting commitment and the listing gate are the offering's declared terms. Every figure is a row of the offering register in Tachyon, recomputed independently from the log, and its allocation file is certified by a hash chain. Thebes Core Team.</footer>
+</main>
+<script>
+const D = {"o":{"code":"NVLG","offered":60000000,"outstanding":200000000,"low":850,"high":950,"tick":5,"lot":100,"retailBps":1000,"cornerBps":3000,"uwBps":200,"firm":1,"minSold":0,"minFloat":1500,"minHolders":300},"row":{"state":4,"price":935,"corner":150000,"retailDemand":134124,"retailPaid":12741780000,"bidDemand":624000,"bidsAlloc":390000,"retailAlloc":60000,"unsold":0,"uwLots":0,"allocated":600000,"holders":955,"cashDue":56100000000,"refunds":7131780000,"chain":"a2c6fbcb7009349b1aa25f6893923f02ad0ffd5ce04e17efe4224c9d0eecfe4f"},"priced":[1,935,774000,134124,540000,60000,0,0,0],"curve":[[950,326000],[945,408000],[940,615000],[935,774000],[930,927000],[925,1028000],[920,1211000],[915,1296000],[910,1414000],[905,1519000],[900,1636000],[895,1639000],[885,1672000],[875,1716000],[870,1733000],[865,1762000],[860,1790000],[855,1832000],[850,1864000]],"clearing":940,"instLots":540000,"handoff":[1,56100000000,1122000000,54978000000,2250,955,0,935],"custody":[200000000,60000000,140000000,956],"bids":{"n":168,"withdrawn":8,"eligible":55,"allotted":55},"retail":{"n":900,"allotted":897,"small":57,"smallAllotted":54},"corners":[60000,50000,40000],"others":[{"code":"SNAI","state":"withdrawn","firm":false,"offerLots":10000,"instDemand":2700,"retailDemand":970,"inst":2700,"retail":970,"uw":0,"unsold":6330,"failed":true,"price":1000,"holders":0,"minHolders":20,"minSold":8000,"refunds":116400000,"handoff":null,"custody":null,"lot":100,"retailLots":2000},{"code":"DLTA","state":"listed","firm":true,"offerLots":20000,"instDemand":11400,"retailDemand":3167,"inst":11400,"retail":3167,"uw":5433,"unsold":0,"failed":false,"price":500,"holders":49,"minHolders":30,"minSold":0,"refunds":19002000,"handoff":[3,1000000000,20000000,980000000,1820,49,543300,500],"custody":[8000000,2000000,6000000,50],"lot":100,"retailLots":2000},{"code":"KMTR","state":"withdrawn","firm":true,"offerLots":5000,"instDemand":2350,"retailDemand":86,"inst":2350,"retail":86,"uw":2564,"unsold":0,"failed":false,"price":300,"holders":10,"minHolders":50,"minSold":0,"refunds":2752000,"handoff":null,"custody":null,"lot":100,"retailLots":500}],"refusals":[{"what":"a range off its tick","rule":"InvalidTerms"},{"what":"a retail tranche above the whole offer","rule":"InvalidTerms"},{"what":"an offer of part of a lot","rule":"InvalidTerms"},{"what":"an underwriting fee of 12%","rule":"InvalidTerms"},{"what":"a listing before the retail close","rule":"InvalidTerms"},{"what":"a ladder of 451 rungs","rule":"InvalidTerms"},{"what":"the same code twice","rule":"DuplicateCode"},{"what":"a cornerstone twice","rule":"DuplicateInvestor"},{"what":"cornerstones above 30% of the institutional tranche","rule":"CornerstoneCap"},{"what":"a cornerstone once the book is open","rule":"CornerstoneLate"},{"what":"a bid before the book opens","rule":"BookClosed"},{"what":"a second live bid from one investor","rule":"DuplicateInvestor"},{"what":"a bid off the tick","rule":"PriceOffRange"},{"what":"a bid above the range","rule":"PriceOffRange"},{"what":"a bid of nothing","rule":"InvalidLots"},{"what":"a second retail application","rule":"DuplicateInvestor"},{"what":"a retail application a piastre short","rule":"PaymentMismatch"},{"what":"a retail application above the tranche","rule":"InvalidLots"},{"what":"an unknown order","rule":"UnknownOrder"},{"what":"a price while the book is open","rule":"BookStillOpen"},{"what":"a bid after the book closed","rule":"BookClosed"},{"what":"a retail application withdrawn as a bid","rule":"NotABid"},{"what":"a retail application after the retail close","rule":"BookClosed"},{"what":"a price above the book's clearing price","rule":"PriceAboveBook"},{"what":"a price off the tick","rule":"PriceOffRange"},{"what":"an allocation before the price","rule":"NotInState"},{"what":"an uncovered book priced above the low end","rule":"PriceAboveBook"},{"what":"an allocation of a failed offering","rule":"NotInState"},{"what":"an allocation slice of nothing","rule":"InvalidLimit"},{"what":"a hand-off before the allocation is done","rule":"NotInState"},{"what":"a hand-off before the listing day","rule":"BeforeListing"},{"what":"too few holders for the listing","rule":"ListingGate"},{"what":"a listed offering withdrawn","rule":"NotInState"},{"what":"an unknown offering","rule":"UnknownOffering"},{"what":"a command dated before the register's last day","rule":"DayBackwards"}]};
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const egp = p => (p / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const n = x => x.toLocaleString('en-US');
+const O = D.o, R = D.row, P = D.priced, H = D.handoff, C = D.custody;
+const retailLots = O.offered / O.lot * O.retailBps / 10000;
+document.getElementById('lede').textContent = `The company offers ${n(O.offered)} new shares, ${(O.offered / O.outstanding * 100).toFixed(0)}% of the ${n(O.outstanding)} it will have, in lots of ${O.lot}. The price range is EGP ${egp(O.low)} to ${egp(O.high)}. ${O.retailBps / 100}% goes to the public, paid in full at the top of the range, and the rest to institutions through a book of bids. The underwriter commits to take up anything unsold, for a fee of ${O.uwBps / 100}% of the proceeds.`;
+(function () {
+  const W = 600, Hh = 300, L = 64, Rm = 12, T = 12, B = 34;
+  const pts = D.curve, lo = O.low, hi = O.high, most = Math.max(pts[pts.length - 1][1], D.instLots) * 1.05;
+  const X = v => L + (W - L - Rm) * v / most, Y = p => T + (Hh - T - B) * (hi - p) / (hi - lo);
+  let g = '';
+  for (let k = 0; k <= 4; k++) { const p = lo + (hi - lo) * k / 4; g += `<line x1="${L}" x2="${W - Rm}" y1="${Y(p)}" y2="${Y(p)}" stroke="var(--grid)"/><text x="${L - 6}" y="${Y(p) + 4}" text-anchor="end" font-size="11" fill="var(--muted)">${egp(p)}</text>`; }
+  const step = Math.pow(10, Math.floor(Math.log10(most / 4))), unit = Math.ceil(most / 4 / step) * step;
+  for (let v = 0; v <= most; v += unit) g += `<text x="${X(v)}" y="${Hh - 14}" text-anchor="middle" font-size="11" fill="var(--muted)">${n(v / 1000)}k</text>`;
+  g += `<text x="${W - Rm}" y="${Hh - 1}" text-anchor="end" font-size="11" fill="var(--muted)">lots</text>`;
+  let d = `M${X(R.corner)},${Y(hi)}`;
+  pts.forEach(([p, c]) => { d += ` L${X(c)},${Y(p)}`; });
+  d += ` L${X(pts[pts.length - 1][1])},${Y(lo)}`;
+  g += `<path d="${d}" fill="none" stroke="var(--demand)" stroke-width="2.5"/>`;
+  g += `<line x1="${X(D.instLots)}" x2="${X(D.instLots)}" y1="${T}" y2="${Hh - B}" stroke="var(--tranche)" stroke-width="2" stroke-dasharray="5 4"/>`;
+  g += `<line x1="${L}" x2="${W - Rm}" y1="${Y(R.price)}" y2="${Y(R.price)}" stroke="var(--price)" stroke-width="2"/>`;
+  g += `<text x="${W - Rm - 4}" y="${Y(R.price) - 6}" text-anchor="end" font-size="12" fill="var(--price)">offer price EGP ${egp(R.price)}</text>`;
+  g += `<text x="${X(D.instLots) + 6}" y="${Hh - B - 8}" font-size="12" fill="var(--tranche)">tranche ${n(D.instLots)} lots</text>`;
+  document.getElementById('curve').innerHTML = g;
+})();
+document.getElementById('pricing').innerHTML = [
+  ['Cornerstones, before the book', n(R.corner) + ' lots'], ['Bids received', n(D.bids.n)], ['Withdrawn to be revised', n(D.bids.withdrawn)],
+  ['Clearing price', 'EGP ' + egp(D.clearing)], ['Offer price', 'EGP ' + egp(R.price)], ['Institutional demand at the price', n(P[2]) + ' lots'],
+  ['Institutional cover', (P[2] / D.instLots).toFixed(2) + '×'], ['Retail applications', n(D.retail.n)], ['Retail cover', (R.retailDemand / retailLots).toFixed(2) + '×'],
+].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+document.getElementById('pricingNote').textContent = `The clearing price is the highest at which the cornerstones and the bids at or above it cover the institutional tranche. The issuer and the underwriter priced one tick below it. A price above it is refused.`;
+document.getElementById('allocSub').textContent = `Allocated in slices over ${n(D.bids.n + D.retail.n + D.corners.length)} orders. Cornerstones get their commitment in full. Bids at or above the price and the retail applications are allocated pro rata by cumulative rounding: each order is within one lot of its exact share, and every tranche's lots are allocated exactly.`;
+document.getElementById('tranches').innerHTML = [
+  ['Cornerstones', 'var(--corner)', [['Investors', n(D.corners.length)], ['Committed and allocated', n(R.corner) + ' lots'], ['Lock-up', 'not free float']]],
+  ['Institutional book', 'var(--demand)', [['Bids at or above the price', n(D.bids.eligible)], ['Demand', n(R.bidDemand) + ' lots'], ['Allocated', n(R.bidsAlloc) + ' lots'], ['Fill', (R.bidsAlloc / R.bidDemand * 100).toFixed(1) + '%']]],
+  ['Retail', 'var(--retail)', [['Applications', n(D.retail.n)], ['Demand', n(R.retailDemand) + ' lots'], ['Allocated', n(R.retailAlloc) + ' lots'], ['Applicants of 20 lots or less allotted', n(D.retail.smallAllotted) + ' of ' + n(D.retail.small)], ['Refunded', 'EGP ' + egp(R.refunds)]]],
+].map(([h, c, kv]) => `<div class="card" style="border-top:3px solid ${c}"><h3>${esc(h)}</h3><dl class="kv">${kv.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl></div>`).join('');
+document.getElementById('handoff').innerHTML = [
+  ['Free float', (H[4] / 100).toFixed(2) + '% (at least ' + (O.minFloat / 100).toFixed(2) + '%)'], ['Holders', n(H[5]) + ' (at least ' + n(O.minHolders) + ')'],
+  ['Gross proceeds', 'EGP ' + egp(H[1])], ['Underwriting fee', 'EGP ' + egp(H[2])], ['To the issuer', 'EGP ' + egp(H[3])], ['Reference price for the first auction', 'EGP ' + egp(H[7])],
+].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+document.getElementById('register').innerHTML = [
+  ['Shares in issue', n(C[0])], ['Delivered to allottees', n(C[1])], ['Kept by the issuer', n(C[2])], ['Holders reconciled', n(C[3])], ['Allocation file', R.chain.slice(0, 16) + '…'],
+].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+document.getElementById('others').innerHTML = '<tr><th>Offering</th><th>Commitment</th><th class="n">Offered</th><th class="n">Inst. demand</th><th class="n">Retail demand</th><th class="n">Underwriter</th><th class="n">Holders</th><th>Outcome</th></tr>' +
+  D.others.map(x => {
+    const out = x.failed ? `failed at pricing: sold ${((x.inst + x.retail) / x.offerLots * 100).toFixed(1)}%, below its ${x.minSold / 100}% minimum; EGP ${egp(x.refunds)} refunded`
+      : x.state === 'listed' ? `listed at EGP ${egp(x.price)}; the retail tranche took ${n(x.retail - x.retailLots)} unfilled institutional lots and the underwriter the other ${n(x.uw)}`
+      : `withdrawn at the listing gate: ${x.holders} holders of ${x.minHolders} needed; EGP ${egp(x.refunds)} refunded`;
+    return `<tr><td><b>${esc(x.code)}</b></td><td>${x.firm ? 'firm' : 'best efforts'}</td><td class="n">${n(x.offerLots)}</td><td class="n">${n(x.instDemand)}</td><td class="n">${n(x.retailDemand)}</td><td class="n">${x.uw ? n(x.uw) : ''}</td><td class="n">${x.failed ? '' : n(x.holders)}</td><td>${esc(out)}</td></tr>`;
+  }).join('');
+document.getElementById('refSub').textContent = `${D.refusals.length} named refusals, each leaving the register's fingerprint unchanged:`;
+document.getElementById('refusals').innerHTML = D.refusals.map(r => `<li>${esc(r.what)} <code>${esc(r.rule)}</code></li>`).join('');
+</script>
+</body>
+</html>
