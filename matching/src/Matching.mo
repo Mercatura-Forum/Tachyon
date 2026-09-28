@@ -32,6 +32,7 @@ import Runtime "mo:core/Runtime";
 
 import ICRC "ICRC";
 import L "MatchLogic";
+import R "Reservations";
 import T "MatchTypes";
 
 shared (install) persistent actor class Matching(cfg : {
@@ -105,6 +106,13 @@ shared (install) persistent actor class Matching(cfg : {
   // engine-side reservations (the escrow accounting - no custody)
   let reservedShares = Map.empty<Principal, Nat>();       // by seller owner
   let reservedCash = Map.empty<Principal, Nat>();         // by buyer owner
+  // The two additive maps that make every release EXACT instead of recomputed (Reservations.mo):
+  // the one-fee margin each LIVE order holds against its next escrow, and the exact escrow cost each
+  // created-but-unresolved obligation holds until it settles or is voided. The escrow the core pulls
+  // for a fill costs the funder `amount + one fee`, once PER FILL, so the accounting is denominated
+  // per escrow and every unit reserved has exactly one release event - see Reservations.mo.
+  let orderMargin = Map.empty<Nat, Nat>();                // orderId -> fee margin held
+  let obligationHold = Map.empty<Nat, R.Amounts>();       // obligation seq -> escrow cost held
 
   // diagnostic invariant log (M4 no-stranding ANOMALIES; asserted EMPTY in tests; never traps)
   let invLog = List.empty<Text>();
@@ -113,35 +121,46 @@ shared (install) persistent actor class Matching(cfg : {
   let killLog = List.empty<Text>();
 
   transient let selfPrincipal = Principal.fromActor(self);
+  // The reservation accounting's four maps under one handle. Transient: it is re-bound to the same
+  // persistent maps after every upgrade (Map is a mutable structure, so the module mutates the
+  // engine's own state through it) - the maps themselves keep their identity and their stable types.
+  transient let resv : R.Ledger = { cash = reservedCash; shares = reservedShares; margin = orderMargin; hold = obligationHold };
 
   func now64() : Nat64 { Nat64.fromNat(Int.abs(Time.now())) };
   func requireAuth(caller : Principal) { if (Principal.isAnonymous(caller)) Runtime.trap("anonymous principal not allowed") };
   func sharesL() : ICRC.Ledger { actor (Principal.toText(sharesLedger)) };
   func cashL() : ICRC.Ledger { actor (Principal.toText(cashLedger)) };
 
+  // Reading a reservation total. MUTATING one is Reservations.mo's alone: every credit and every
+  // release lives there, in one place, which is what makes the releases exact.
   func getN(m : Map.Map<Principal, Nat>, k : Principal) : Nat { switch (Map.get(m, Principal.compare, k)) { case (?v) v; case null 0 } };
-  func addN(m : Map.Map<Principal, Nat>, k : Principal, d : Nat) { Map.add(m, Principal.compare, k, getN(m, k) + d) };
-  func subN(m : Map.Map<Principal, Nat>, k : Principal, d : Nat) {
-    let cur = getN(m, k);
-    let nv : Nat = if (d >= cur) 0 else cur - d;
-    if (nv == 0) ignore Map.delete(m, Principal.compare, k) else Map.add(m, Principal.compare, k, nv);
-  };
   func cidN(m : Map.Map<Nat, Nat>, k : Nat) : Nat { switch (Map.get(m, Nat.compare, k)) { case (?v) v; case null 0 } };
 
   func logInv(msg : Text) { List.add(invLog, msg) };
+
+  // Record an accounting DRIFT: a reservation release that exceeded what was reserved. Unreachable
+  // by the construction of Reservations.mo (every release is an amount that module itself recorded)
+  // and proven so over random lifecycles by the interpreter battery; logged rather than trapped, so
+  // a discrepancy turns the no-stranding oracle red instead of vanishing into a clamped subtraction.
+  func drift(where : Text, d : R.Drift) {
+    if (not R.isExact(d)) {
+      logInv("reservation drift at " # where # ": released beyond the reservation by cash "
+        # Nat.toText(d.cash) # " shares " # Nat.toText(d.shares));
+    };
+  };
   func memNat(xs : [Nat], v : Nat) : Bool { for (x in xs.vals()) { if (x == v) return true }; false };
 
-  // Kill an all-or-none (FOK) order that could not fully fill: release its reservation, mark it
+  // Kill an all-or-none (FOK) order that could not fully fill: release its reservation IN FULL - the
+  // remaining notional and the fee margin both, since a killed order can produce no escrow - mark it
   // Cancelled, zero its remaining. NO fill is ever applied (Kill-before-mutate, M2). Other orders
   // are untouched (the kill decision came from the read-only clearAON fixpoint).
   func killOrder(id : Nat) {
     switch (Map.get(orders, Nat.compare, id)) {
       case null {};
       case (?o) {
-        switch (o.side) {
-          case (#sell) subN(reservedShares, o.owner, o.remaining);
-          case (#buy) subN(reservedCash, o.owner, o.limitPrice * o.remaining);
-        };
+        let isBid = (o.side == #buy);
+        let notional = if (isBid) o.limitPrice * o.remaining else o.remaining;
+        drift("FOK kill of order " # Nat.toText(id), R.closeOrder(resv, o.owner, id, isBid, notional));
         o.status := #Cancelled;
         o.remaining := 0;
         List.add(killLog, "FOK-KILL order " # Nat.toText(id) # " (could not fully fill at clearing price)");
@@ -180,28 +199,31 @@ shared (install) persistent actor class Matching(cfg : {
 
     switch (args.side) {
       case (#sell) {
-        // need `qty` shares; check free balance ∧ free allowance(owner -> core) on the shares ledger
+        // need `qty` shares AND the one fee its escrow costs (the core's escrow pull debits the
+        // seller amount + fee, so an ask funded to exactly `qty` is not fundable); check free
+        // balance ∧ free allowance(owner -> core) on the shares ledger against both.
+        let need = R.askNeed(args.qty, sharesFee);
         let bal = try { await sharesL().icrc1_balance_of({ owner = caller; subaccount = null }) } catch (_) { return #err("shares ledger unreachable") };
         let alw = try { (await sharesL().icrc2_allowance({ account = { owner = caller; subaccount = null }; spender = { owner = dvpCore; subaccount = null } })).allowance } catch (_) { return #err("shares allowance read failed") };
         let reserved = getN(reservedShares, caller);
-        if (bal < reserved + args.qty) return #err("insufficient free shares: balance " # Nat.toText(bal) # " reserved " # Nat.toText(reserved) # " need " # Nat.toText(args.qty));
-        if (alw < reserved + args.qty) return #err("insufficient shares allowance to DvP core: " # Nat.toText(alw) # " (approve the core for >= " # Nat.toText(reserved + args.qty) # ")");
-        addN(reservedShares, caller, args.qty);
+        if (bal < reserved + need) return #err("insufficient free shares: balance " # Nat.toText(bal) # " reserved " # Nat.toText(reserved) # " need " # Nat.toText(need) # " (qty " # Nat.toText(args.qty) # " + one escrow fee " # Nat.toText(sharesFee) # ")");
+        if (alw < reserved + need) return #err("insufficient shares allowance to DvP core: " # Nat.toText(alw) # " (approve the core for >= " # Nat.toText(reserved + need) # ")");
         let o = makeOrder(caller, #sell, args.limitPrice, args.qty, args.allOrNone);
-        #ok({ orderId = o.id; status = o.status; reservedShares = args.qty; reservedCash = 0; note = "ask resting in window " # Nat.toText(currentWindow) });
+        R.openAsk(resv, caller, o.id, args.qty, sharesFee);
+        #ok({ orderId = o.id; status = o.status; reservedShares = need; reservedCash = 0; note = "ask resting in window " # Nat.toText(currentWindow) });
       };
       case (#buy) {
         // need limitPrice*qty cash (+ one escrow fee margin); check free balance ∧ allowance on cash
         let fee = try { await cashL().icrc1_fee() } catch (_) { return #err("cash ledger unreachable") };
         if (args.limitPrice * args.qty <= fee) return #err("order cash value must exceed the cash ledger fee (" # Nat.toText(fee) # ") - every fill of this order would be unsettleable");
-        let need = args.limitPrice * args.qty + fee;
+        let need = R.bidNeed(args.limitPrice, args.qty, fee);
         let bal = try { await cashL().icrc1_balance_of({ owner = caller; subaccount = null }) } catch (_) { return #err("cash ledger unreachable") };
         let alw = try { (await cashL().icrc2_allowance({ account = { owner = caller; subaccount = null }; spender = { owner = dvpCore; subaccount = null } })).allowance } catch (_) { return #err("cash allowance read failed") };
         let reserved = getN(reservedCash, caller);
         if (bal < reserved + need) return #err("insufficient free cash: balance " # Nat.toText(bal) # " reserved " # Nat.toText(reserved) # " need " # Nat.toText(need));
         if (alw < reserved + need) return #err("insufficient cash allowance to DvP core: " # Nat.toText(alw) # " (approve the core for >= " # Nat.toText(reserved + need) # ")");
-        addN(reservedCash, caller, need);
         let o = makeOrder(caller, #buy, args.limitPrice, args.qty, args.allOrNone);
+        R.openBid(resv, caller, o.id, args.limitPrice, args.qty, fee);
         #ok({ orderId = o.id; status = o.status; reservedShares = 0; reservedCash = need; note = "bid resting in window " # Nat.toText(currentWindow) });
       };
     };
@@ -224,14 +246,14 @@ shared (install) persistent actor class Matching(cfg : {
     if (not Principal.equal(o.owner, caller)) return #err("only the owner may cancel");
     if (o.window != currentWindow) return #err("order is in a closed/clearing window - cannot cancel");
     switch (o.status) { case (#Open or #PartiallyFilled) {}; case (_) return #err("order is not cancellable") };
-    // release the remaining reservation
-    switch (o.side) {
-      case (#sell) subN(reservedShares, o.owner, o.remaining);
-      case (#buy) subN(reservedCash, o.owner, o.limitPrice * o.remaining); // fee margin stays negligible/freed on next op
-    };
+    // release the reservation IN FULL: the remaining notional and the fee margin both - a cancelled
+    // order can produce no escrow, so it holds nothing
+    let isBid = (o.side == #buy);
+    let notional = if (isBid) o.limitPrice * o.remaining else o.remaining;
+    drift("cancel of order " # Nat.toText(id), R.closeOrder(resv, o.owner, id, isBid, notional));
     o.status := #Cancelled;
     o.remaining := 0;
-    #ok("cancelled; reservation released");
+    #ok("cancelled; reservation released in full (the remaining notional and the fee margin)");
   };
 
   // ── B+C. Clear the open window: compute p*, then chunked plan-then-apply under the budget ────
@@ -326,16 +348,22 @@ shared (install) persistent actor class Matching(cfg : {
     };
   };
 
-  // Apply one micro-fill: mutate the book, release the consumed reservation, emit the obligation.
+  // Apply one micro-fill: mutate the book, move the reservation from the orders to the obligation the
+  // fill creates, emit the obligation.
   // Synchronous (no await) ⇒ deterministic, no interleaving ⇒ a chunk's slice is all-or-nothing.
+  //
+  // The reservation does not simply fall away at the fill: the cleared match still owes two escrows,
+  // so the obligation takes up their exact cost (notional at the clearing price + one fee a side) and
+  // holds it until it settles or is voided, while the notional the fill consumed leaves each order
+  // and an order left with nothing releases its fee margin. Releasing everything here - as this
+  // engine did before - left a created obligation's funds unreserved between the clear and the
+  // settlement, free for a new order of the same trader to spend out from under it.
   func applyFill(pc : T.PendingClear, fl : T.Fill) {
     let buy = switch (Map.get(orders, Nat.compare, fl.buyId)) { case (?o) o; case null { logInv("applyFill: missing buy " # Nat.toText(fl.buyId)); return } };
     let sell = switch (Map.get(orders, Nat.compare, fl.sellId)) { case (?o) o; case null { logInv("applyFill: missing sell " # Nat.toText(fl.sellId)); return } };
     if (buy.remaining < fl.qty or sell.remaining < fl.qty) { logInv("applyFill: overfill guard buy=" # Nat.toText(fl.buyId) # " sell=" # Nat.toText(fl.sellId)); return };
     buy.remaining -= fl.qty;
     sell.remaining -= fl.qty;
-    subN(reservedCash, buy.owner, buy.limitPrice * fl.qty);   // bid reserved at its LIMIT price
-    subN(reservedShares, sell.owner, fl.qty);
     buy.status := (if (buy.remaining == 0) #Filled else #PartiallyFilled);
     sell.status := (if (sell.remaining == 0) #Filled else #PartiallyFilled);
     let ob : T.Obligation = {
@@ -343,6 +371,10 @@ shared (install) persistent actor class Matching(cfg : {
       buyId = fl.buyId; sellId = fl.sellId; buyer = buy.owner; seller = sell.owner;
       price = pc.clearingPrice; qty = fl.qty; var dvpTradeId = null; var settled = false;
     };
+    drift("fill of obligation " # Nat.toText(ob.seq), R.fill(
+      resv, ob.seq, buy.owner, sell.owner, fl.buyId, fl.sellId,
+      buy.limitPrice, pc.clearingPrice, fl.qty, buy.remaining == 0, sell.remaining == 0,
+    ));
     List.add(obligations, ob);
     nextObligationSeq += 1;
   };
@@ -380,7 +412,7 @@ shared (install) persistent actor class Matching(cfg : {
     requireAuth(caller);
     var found = false;
     for (ob in List.values(obligations)) {
-      if (ob.seq == seq) { ob.dvpTradeId := ?dvpTradeId; ob.settled := true; found := true };
+      if (ob.seq == seq) { ob.dvpTradeId := ?dvpTradeId; ob.settled := true; found := true; releaseHold(ob, "settlement recorded for obligation") };
     };
     if (found) #ok("obligation " # Nat.toText(seq) # " linked to DvP trade " # Nat.toText(dvpTradeId)) else #err("no such obligation");
   };
@@ -391,6 +423,14 @@ shared (install) persistent actor class Matching(cfg : {
   // intake) and pays shares→buyer + cash→seller, both-or-neither, in one block, NO trader action.
   // Idempotent end-to-end: the core keys on the obligation `seq`, so a re-call re-drives the SAME
   // trade and never double-settles; we also short-circuit if the obligation is already linked.
+  // An obligation that has reached a TERMINAL resolution - settled through the core, or voided -
+  // releases the escrow cost it was holding, exactly the amounts recorded when its fill was applied.
+  // Idempotent (the hold is taken, never recomputed), so a re-drive, a void after a refusal or two
+  // callers racing the same seq release it once and only once.
+  func releaseHold(ob : T.Obligation, why : Text) {
+    drift(why # " " # Nat.toText(ob.seq), R.resolveObligation(resv, ob.seq, ob.buyer, ob.seller));
+  };
+
   func settleOneObligation(ob : T.Obligation, deadlineSecs : Nat) : async* Result.Result<Text, Text> {
     if (ob.settled) return #ok("obligation " # Nat.toText(ob.seq) # " already settled (trade " # (switch (ob.dvpTradeId) { case (?t) Nat.toText(t); case null "?" }) # ")");
     let cashAmount = ob.price * ob.qty;
@@ -408,6 +448,7 @@ shared (install) persistent actor class Matching(cfg : {
         ob.dvpTradeId := ?res.tradeId;
         if (res.status == #Settled) {
           ob.settled := true;
+          releaseHold(ob, "settlement of obligation");
           #ok("obligation " # Nat.toText(ob.seq) # " SETTLED via DvP trade " # Nat.toText(res.tradeId) # " (" # res.note # ")");
         } else {
           #err("obligation " # Nat.toText(ob.seq) # " not yet settled - DvP trade " # Nat.toText(res.tradeId) # ": " # res.note);
@@ -449,6 +490,9 @@ shared (install) persistent actor class Matching(cfg : {
         if (ob.settled or ob.dvpTradeId != null) return null;
         if (not isVoided(ob.seq)) {
           Map.add(voidedSeqs, Nat.compare, ob.seq, why);
+          // VOIDED is final, like a FOK kill: nothing ever escrowed for it and nothing ever will, so
+          // the escrow cost it was holding goes back to the two traders' free capacity.
+          releaseHold(ob, "void of obligation");
           List.add(killLog, "VOID obligation " # Nat.toText(ob.seq) # " (permanently unsettleable: " # why # ")");
         };
         ?("obligation " # Nat.toText(ob.seq) # " VOIDED - permanently unsettleable: " # why)
@@ -615,6 +659,50 @@ shared (install) persistent actor class Matching(cfg : {
     };
   };
   public query func reservationOf(p : Principal) : async { shares : Nat; cash : Nat } { { shares = getN(reservedShares, p); cash = getN(reservedCash, p) } };
+  // The reservation `p` HOLDS beside the reservation the accounting PRESCRIBES for it, the latter
+  // recomputed here from this engine's own live book and open obligations: Σ live orders (remaining
+  // notional + the order's fee margin) + Σ open obligations (the exact escrow cost each holds). The
+  // two are equal for every order and obligation this accounting has seen - that equality is the
+  // no-stranding property stated as an observable, and it is checked independently of the
+  // incremental arithmetic that maintains the totals. A difference is residue left by the accounting
+  // that preceded this one (fee margins its fills and cancels never released); this engine never adds
+  // to it, so the difference is a constant of the bed and not a leak.
+  public query func reservationAudit(p : Principal) : async {
+    maintainedShares : Nat; maintainedCash : Nat;
+    prescribedShares : Nat; prescribedCash : Nat;
+    liveOrders : Nat; openObligations : Nat;
+  } {
+    var pShares = 0;
+    var pCash = 0;
+    var live = 0;
+    for ((_, o) in Map.entries(orders)) {
+      if (Principal.equal(o.owner, p) and o.remaining > 0 and (o.status == #Open or o.status == #PartiallyFilled)) {
+        live += 1;
+        switch (o.side) {
+          case (#sell) pShares += o.remaining + R.marginOf(resv, o.id);
+          case (#buy) pCash += o.limitPrice * o.remaining + R.marginOf(resv, o.id);
+        };
+      };
+    };
+    var openObls = 0;
+    for (b in List.values(obligations)) {
+      if (not b.settled and not isVoided(b.seq)) {
+        if (Principal.equal(b.buyer, p) or Principal.equal(b.seller, p)) openObls += 1;
+        switch (R.holdOf(resv, b.seq)) {
+          case (?h) {
+            if (Principal.equal(b.buyer, p)) pCash += h.cash;
+            if (Principal.equal(b.seller, p)) pShares += h.shares;
+          };
+          case null {};
+        };
+      };
+    };
+    {
+      maintainedShares = getN(reservedShares, p); maintainedCash = getN(reservedCash, p);
+      prescribedShares = pShares; prescribedCash = pCash;
+      liveOrders = live; openObligations = openObls;
+    };
+  };
   // chunk-messages used to clear window w (persists after finalize) - proof of K>=2 chunking (M5).
   public query func chunksUsed(w : Nat) : async Nat { cidN(chunkCounts, w) };
   public query func invariantLog() : async [Text] { List.toArray(invLog) };

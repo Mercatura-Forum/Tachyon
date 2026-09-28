@@ -96,8 +96,10 @@ core/src/       DvpTypes, DvpLogic (the pure decision core), DvpCore (the actor)
 core/test/      the interpreter batteries (90,035 and 25,033 checks)
 core/fixtures/  the ledger fixtures: an ICRC-1/2 ledger and its flaky variant for
                 failure injection
-matching/src/   MatchTypes, MatchLogic (pure), Matching (the actor), Guards, ICRC
-matching/test/  the interpreter battery (53,425 checks over 4,000 randomised windows)
+matching/src/   MatchTypes, MatchLogic and Reservations (both pure), Matching (the actor),
+                Guards, ICRC
+matching/test/  the interpreter battery (190,256 checks: 4,000 randomised windows and 900
+                randomised reservation lifecycles)
 listing/src/    ListingRegistry
 custody/        the custody register: src/, test/ (WASI batteries), integration/ (the Python twin), tools/
 vendor/         the Thebes kernel the custody module builds against, named by commit
@@ -143,8 +145,10 @@ chain; `deploy/example.thebes.toml` is the manifest shape.
 
 ## Known limitations
 
-- **Matching and listing on the production binary.** The settlement core has
-  been run there; the matching engine's rows have not yet.
+- **Matching and listing on a geographically distributed subnet.** Both have been
+  run end to end on a localhost chain of the production node binary, the
+  autonomous settlement drain included; the distributed composition the
+  settlement rows were run on remains to be run.
 
 ## Design
 

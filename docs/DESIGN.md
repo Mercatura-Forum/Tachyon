@@ -104,6 +104,11 @@ settlement.
   by price-time priority with pro-rata at the margin.
 - **Reservation, not custody.** Submitting an order reserves the submitter's balance against the
   core (ICRC-2 approval to the core plus an engine-side reservation); the engine never holds funds.
+  The reservation is denominated PER ESCROW, because the escrow the core pulls for a fill debits the
+  funder the amount plus one ledger fee, once per fill: a live order reserves its remaining notional
+  plus one fee, and each cleared obligation reserves its own exact escrow cost until it settles or is
+  voided. Every unit reserved has exactly one release event, so a trader with no live order and no
+  open obligation has reserved exactly nothing.
 - **Each fill becomes a settlement obligation** and settles as a DvP trade through the core, seller
   as maker and buyer as taker, driven by the engine as the core's authorised relayer.
   `settleMatchFor` is idempotent under `matchSeq`: a repeated call re-drives the existing trade.

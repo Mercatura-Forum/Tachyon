@@ -36,7 +36,14 @@ fill behind it, the refused obligation owns a trade and is never voided, and res
 re-drives it to settled); MD the dust discipline (an order whose every fill would be dust is refused
 at intake; a boundary remainder fill at or below the fee still clears exactly as the twin plans it,
 the core refuses it before any trade exists - funds safe - and the drain VOIDS it, recorded with
-its reason, and completes the window past it: the recorded liveness gap closed); L1-L8 the listing gate
+its reason, and completes the window past it: the recorded liveness gap closed); M7 the reservation
+accounting (a reservation is denominated per escrow, since the core's escrow for one fill debits the
+funder amount + one fee: a live order holds its remaining notional + one fee, every created obligation
+holds its own exact escrow cost until it settles or is voided, and every unit has exactly one release
+event - so an ask reserves the fee its escrow costs, a cleared-but-unsettled obligation's escrow cost
+stays reserved, a two-fill order reserves two fees where intake reserved one, a whole lifecycle hands
+every unit back, and what the engine maintains equals what its own book and holds prescribe);
+L1-L8 the listing gate
 (an unlisted market refused at intake, issuer
 authorization admin-only, a zero-supply ledger refused as unfunded by the live cross-canister
 check, the funded pair listed and accepted, delisting flips the gate off, a land collection
@@ -408,23 +415,47 @@ if MATCHING:
 
     # ── the stateful twin of Matching.mo's book, reservations, obligations and settlement ────
     class Twin:
+        # The reservation model is Reservations.mo's, to the unit: the escrow the core pulls for one
+        # fill debits the funder amount + one fee, once PER FILL, so a live order holds its remaining
+        # notional + one fee (the fee of its next escrow), every created obligation holds its own
+        # exact escrow cost until it settles or is voided, and every unit reserved has exactly one
+        # release event - so a trader with no live order and no open obligation holds exactly nothing.
         def __init__(self):
             self.orders = {}; self.window = 0; self.next_id = 1; self.next_seq = 0
             self.obls = []; self.res_shares = {}; self.res_cash = {}; self.delta = {}
+            self.margin = {}    # orderId -> the one-fee margin a live order holds
+            self.hold = {}      # obligation seq -> the exact escrow cost it holds, per side
         def _sub(self, m, k, d):
-            cur = m.get(k, 0); m[k] = 0 if d >= cur else cur - d   # subN clamps at zero
+            cur = m.get(k, 0); m[k] = 0 if d >= cur else cur - d   # the engine's debit clamps at zero
         def _add(self, m, k, d): m[k] = m.get(k, 0) + d
         def submit(self, oid, owner, side, price, qty, aon):
             self.orders[oid] = {'id': oid, 'owner': owner, 'side': side, 'price': price, 'qty': qty,
                                 'rem': qty, 'window': self.window, 'aon': aon, 'status': 'O'}
-            if side == 's': self._add(self.res_shares, owner, qty)                      # an ask reserves qty
-            else: self._add(self.res_cash, owner, price * qty + FEE_C)                  # a bid reserves limit*qty + one fee
+            if side == 's':
+                self._add(self.res_shares, owner, qty + FEE_S)          # an ask: qty + the fee its escrow costs
+                self.margin[oid] = FEE_S
+            else:
+                self._add(self.res_cash, owner, price * qty + FEE_C)    # a bid: limit*qty + the fee its escrow costs
+                self.margin[oid] = FEE_C
             self.next_id = oid + 1
         def release(self, o):
-            if o['side'] == 's': self._sub(self.res_shares, o['owner'], o['rem'])
-            else: self._sub(self.res_cash, o['owner'], o['price'] * o['rem'])           # the fee margin stays (Matching.mo behaviour)
+            # a terminal order (cancel, FOK kill) can produce no escrow: the remaining notional AND
+            # the fee margin both go back
+            fee = self.margin.pop(o['id'], 0)
+            if o['side'] == 's': self._sub(self.res_shares, o['owner'], o['rem'] + fee)
+            else: self._sub(self.res_cash, o['owner'], o['price'] * o['rem'] + fee)
         def cancel(self, oid):
             o = self.orders[oid]; self.release(o); o['status'] = 'C'; o['rem'] = 0
+        def resolve(self, seq):
+            # a settled or voided obligation releases exactly the escrow cost it held - the amounts
+            # recorded when its fill was applied, never a recomputation. Idempotent.
+            h = self.hold.pop(seq, None)
+            if h is None: return
+            ob = next(o for o in self.obls if o['seq'] == seq)
+            self._sub(self.res_cash, self.orders[ob['buyId']]['owner'], h['cash'])
+            self._sub(self.res_shares, self.orders[ob['sellId']]['owner'], h['shares'])
+        def void(self, seq):
+            self.resolve(seq)   # VOIDED is final, like a kill: nothing escrowed, nothing will
         def clear(self):
             w = self.window
             snap = sorted([o for o in self.orders.values() if o['window'] == w and o['rem'] > 0 and o['status'] in 'OP'], key=lambda o: o['id'])
@@ -441,8 +472,21 @@ if MATCHING:
                 for f in sched:
                     b = self.orders[f['buyId']]; s = self.orders[f['sellId']]
                     b['rem'] -= f['qty']; s['rem'] -= f['qty']
-                    self._sub(self.res_cash, b['owner'], b['price'] * f['qty'])         # released at the bid's LIMIT price
+                    bid_fee = self.margin.get(f['buyId'], 0); ask_fee = self.margin.get(f['sellId'], 0)
+                    # the fill moves the reservation from the orders to the obligation it creates: the
+                    # notional the fill consumed leaves each order (the bid's at its LIMIT price, which
+                    # is what intake reserved), and the obligation takes up the two escrows it now owes
+                    self._sub(self.res_cash, b['owner'], b['price'] * f['qty'])
                     self._sub(self.res_shares, s['owner'], f['qty'])
+                    h = {'cash': p * f['qty'] + bid_fee, 'shares': f['qty'] + ask_fee}
+                    self._add(self.res_cash, b['owner'], h['cash'])
+                    self._add(self.res_shares, s['owner'], h['shares'])
+                    self.hold[self.next_seq] = h
+                    # an order left with nothing can produce no further escrow: its margin goes back
+                    if b['rem'] == 0:
+                        self._sub(self.res_cash, b['owner'], bid_fee); self.margin.pop(f['buyId'], None)
+                    if s['rem'] == 0:
+                        self._sub(self.res_shares, s['owner'], ask_fee); self.margin.pop(f['sellId'], None)
                     b['status'] = 'F' if b['rem'] == 0 else 'P'
                     s['status'] = 'F' if s['rem'] == 0 else 'P'
                     self.obls.append({'seq': self.next_seq, 'window': w, 'buyId': f['buyId'], 'sellId': f['sellId'],
@@ -466,6 +510,7 @@ if MATCHING:
             self._add(self.delta, ('cash', buyer), 0); self.delta[('cash', buyer)] -= cash + FEE_C
             self._add(self.delta, ('shares', buyer), ob['qty'] - FEE_S)
             ob['settled'] = True
+            self.resolve(seq)               # the obligation resolved: it releases the escrow cost it held
         def obl_text(self, obls=None):
             return ''.join(f"{o['buyId']}>{o['sellId']}@{o['price']}:{o['qty']};" for o in (self.obls if obls is None else obls))
         def book_seg(self, oid):
@@ -509,6 +554,18 @@ if MATCHING:
         s = field(out, 'shares'); c = field(out, 'cash')
         g = lambda v: int(re.match(r'([0-9_]+)', v or '0').group(1).replace('_', ''))
         return g(s), g(c)
+
+    def audit(p):
+        # The reservation the engine HOLDS beside the one its own live book and open obligations
+        # PRESCRIBE: Σ live orders (remaining notional + margin) + Σ open obligations (their recorded
+        # escrow cost). Equal for everything this accounting has seen; any difference is residue the
+        # accounting that preceded it left behind, which this one never adds to.
+        out = td('query', 'matching', 'reservationAudit', f'(principal "{p}")')
+        g = lambda k: int(re.match(r'([0-9_]+)', field(out, k) or '0').group(1).replace('_', ''))
+        return {k: g(k) for k in ('maintainedShares', 'maintainedCash', 'prescribedShares',
+                                  'prescribedCash', 'liveOrders', 'openObligations')}
+
+    def residue_of(a): return (a['maintainedShares'] - a['prescribedShares'], a['maintainedCash'] - a['prescribedCash'])
 
     # ── M0 wiring: drain the bed, seed the twin, bind the relayer ─────────────────────────────
     log('== M0 wiring: engines, listing, the relayer gate')
@@ -562,10 +619,11 @@ if MATCHING:
             ok = ok and have == want
         return row(name, ok, '; '.join(detail))
 
+    def twres(who): return (TW.res_shares.get(who, 0), TW.res_cash.get(who, 0))
+
     def resv_row(name):
         mm = resv(MAKER); tt = resv(TAKER)
-        want_m = (TW.res_shares.get('tachyon-maker', 0), TW.res_cash.get('tachyon-maker', 0))
-        want_t = (TW.res_shares.get('tachyon-taker', 0), TW.res_cash.get('tachyon-taker', 0))
+        want_m = twres('tachyon-maker'); want_t = twres('tachyon-taker')
         return row(name, mm == want_m and tt == want_t, f'maker {mm} vs {want_m}; taker {tt} vs {want_t}')
 
     def approve_feed(ledger, who, amount, exact=False):
@@ -602,6 +660,30 @@ if MATCHING:
             if len(unsettled_in({window})) == before: break   # no progress -> stuck head, stop looping
         return unsettled_in({window})
 
+    def known_book(tag):
+        # A scenario that names its own fills needs the open window to hold EXACTLY its own orders.
+        # Cancel the twin-known remainders resting there (the M1->M5 rows leave them on purpose and
+        # depend on them), then assert nothing ELSE is resting. An order the twin never saw - one a row
+        # expected to be refused and was not, or one an earlier run left after the seed - would pair
+        # with this scenario's orders, and a fill whose buyer and seller are the same trader is one the
+        # core refuses ("maker and taker must differ") and that can never settle, so every balance and
+        # reservation row downstream drifts. Left unnamed that surfaces as a dozen confusing failures
+        # far from the cause; named here it is one row pointing straight at it.
+        # Live orders are read from bookSummary, not ordersInWindow: the latter also returns the
+        # window's cancelled and filled orders, which are not resting and must not be counted.
+        segs = [s.split(':') for s in book_sum().split(';') if s]
+        live = [int(a) for a, _sd, rem, st in segs if st in ('O', 'P') and int(rem) > 0]
+        unknown = []
+        for i in live:
+            o = TW.orders.get(i)
+            if o is None:
+                unknown.append(i)
+            elif o['status'] in 'OP' and o['rem'] > 0:
+                if is_ok(td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity=o['owner'])): TW.cancel(i)
+        row(f'{tag} the open window holds only orders the twin knows, so this scenario gets the book it describes',
+            not unknown, f'resting orders the twin never saw: {unknown}')
+        return nat_in(td('query', 'matching', 'getCurrentWindow')) or 0
+
     r = td('call', 'core', 'settleMatchFor',
            f'(record {{ matchSeq = 999_999_999 : nat; maker = principal "{MAKER}"; taker = principal "{TAKER}"; assetLedger = principal "{SHARES}"; assetAmount = 100 : nat; cashLedger = principal "{CASH}"; cashAmount = 100 : nat; deadlineSecs = 60 : nat }})')
     row('M0b a caller that is not the bound engine can never settleMatchFor', not is_ok(r), r[-200:])
@@ -633,7 +715,7 @@ if MATCHING:
     bs = book_sum()
     row('M1e the book after the clear: filled, partial and resting exactly as the twin',
         all(TW.book_seg(i) in bs for i in (a1, a2, b1, b2)), bs[-200:])
-    resv_row('M1f reservations equal the twin (fills released at the limit price, fee margins kept)')
+    resv_row('M1f reservations equal the twin (each fill moves the notional it consumed into its obligation\'s own escrow cost)')
     ch = nat_in(td('query', 'matching', 'chunksUsed', f'({wA} : nat)'))
     row('M1g the chunk count equals the twin\'s arithmetic for a 2-fill cap',
         ch == TW.chunks_expected(len(schedA), 2), f'chunks={ch} fills={len(schedA)}')
@@ -732,7 +814,7 @@ if MATCHING:
     bs = book_sum()
     row('M4e the kill is logged, the order Cancelled, its reservation released, the rest of the book intact',
         f'FOK-KILL order {SA}' in kl and TW.book_seg(SA) in bs and all(TW.book_seg(i) in bs for i in (X, Z)), (kl[-160:], bs[-160:]))
-    resv_row('M4f reservations after the kill equal the twin')
+    resv_row('M4f reservations after the kill equal the twin (the kill releases the notional and the fee margin both)')
 
     # ── M5 adversarial refusals and the relayer rotation ─────────────────────────────────────
     log('== M5 adversarial and the rotation')
@@ -744,7 +826,22 @@ if MATCHING:
     row('M5b the owner cancels and the reservation is released to the twin\'s number', is_ok(r) and resv_ok, r[-120:])
     r = td('call', 'matching', 'cancelOrder', f'({a1} : nat)', identity='tachyon-maker')
     row('M5c an order of a closed window cannot be cancelled', not is_ok(r), r[-120:])
-    r = td('call', 'matching', 'submitOrder', '(record { side = variant { buy }; limitPrice = 10 : nat; qty = 20 : nat; allOrNone = false })', identity='tachyon-maker')
+    # The need must exceed any allowance this battery ever grants (500_000) while staying far under the
+    # caller's balance, so the row tests the ALLOWANCE gate and not the balance gate, and so it does
+    # not depend on what an earlier run left on the ledger. An earlier version asked for 200 + a fee,
+    # which is refused only while the maker holds no cash allowance: true on a fresh bed, false on any
+    # bed where a previous run's M6 had granted one - and because a row that expects a refusal does not
+    # mirror its order to the twin, the order it wrongly accepted then rested in the book and
+    # self-matched against the maker's own asks in the windows that followed.
+    # Three conditions, all of them needed for this row to mean what it says:
+    #  (a) qty above the shares fee and notional above the cash fee, or the MD intake floors refuse it
+    #      for dust first and the refusal never reaches the allowance gate at all;
+    #  (b) need above any allowance this battery ever grants (500_000), so the ALLOWANCE gate is what
+    #      refuses it - and so the row does not depend on what an earlier run left on the ledger;
+    #  (c) need far below the caller's balance (~100_000_000), because the balance gate is checked
+    #      first and would otherwise refuse it with a different message.
+    M5D_Q, M5D_P = 10 * FEE_S, 100_000      # need = 10_000_000 + one cash fee
+    r = td('call', 'matching', 'submitOrder', f'(record {{ side = variant {{ buy }}; limitPrice = {M5D_P} : nat; qty = {M5D_Q} : nat; allOrNone = false }})', identity='tachyon-maker')
     row('M5d an order beyond the caller\'s allowance to the core is refused at intake',
         not is_ok(r) and 'allowance' in r, r[-200:])
     r = td('call', 'matching', 'settleObligation', '(999_999 : nat, 600 : nat)')
@@ -783,13 +880,7 @@ if MATCHING:
     # core refuses and can never settle - which is why it runs here, after the M1->M5 windows that
     # depend on the resting remainders this drain would cancel.
     log('== M6 the autonomous drain steps over a transient refusal')
-    w_pre = nat_in(td('query', 'matching', 'getCurrentWindow')) or 0
-    rest = td('query', 'matching', 'ordersInWindow', f'({w_pre} : nat)')
-    for i in [int(x.replace('_', '')) for x in re.findall(r'\b(?:id|' + IDKEY + r') = ([0-9_]+)', rest)]:
-        o = TW.orders.get(i)
-        if o and o['status'] in 'OP' and o['rem'] > 0:
-            out = td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity=o['owner'])
-            if is_ok(out): TW.cancel(i)
+    known_book('M6pre')
     approve_feed('shares', 'tachyon-taker', 100_000)   # the taker sells in this window
     approve_feed('cash', 'tachyon-maker', 100_000)     # the maker buys in this window
     aT, _ = submit('tachyon-maker', 'sell', 10, 100)   # fill 1: seller maker (aT), buyer taker (bT)
@@ -843,13 +934,7 @@ if MATCHING:
     # a KNOWN book for the boundary scenario: the bed persists, so partially filled orders of the
     # M rows still rest in the open window (M4's marginal bid, M1's unfilled ask) and would absorb
     # the boundary fills. Cancel them first, mirroring the twin - the same hygiene as the M0 drain.
-    w_open = nat_in(td('query', 'matching', 'getCurrentWindow')) or 0
-    rest = td('query', 'matching', 'ordersInWindow', f'({w_open} : nat)')
-    for i in [int(x.replace('_', '')) for x in re.findall(r'\b(?:id|' + IDKEY + r') = ([0-9_]+)', rest)]:
-        o = TW.orders.get(i)
-        if o and o['status'] in 'OP' and o['rem'] > 0:
-            out = td('call', 'matching', 'cancelOrder', f'({i} : nat)', identity=o['owner'])
-            if is_ok(out): TW.cancel(i)
+    known_book('MDpre')
     # a floor-passing book whose schedule still holds one boundary remainder fill under the fee:
     # asks 12 and 20, bids 15 and 17, all at one price -> fills 12, 3 (dust, mid-window), 17.
     a1d, _ = submit('tachyon-maker', 'sell', 10, 12)
@@ -873,6 +958,7 @@ if MATCHING:
     drain_window(wF)
     md_secs = time.time() - t0
     for q in good_seqs: TW.settle(q)
+    TW.void(dust_seq)   # the voided fill settles nothing and moves nothing, but it releases its hold
     vq = td('query', 'matching', 'voidedObligations')
     voided_now = [int(x.replace('_', '')) for x in re.findall(r'\b(?:seq|' + SKEY + r') = ([0-9_]+)', vq)]
     tm = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {dust_seq} : nat)')
@@ -885,6 +971,99 @@ if MATCHING:
     tm2 = td('query', 'core', 'tradeIdForMatch', f'(principal "{ENGINE}", {dust_seq} : nat)')
     row('MD4 settleObligation on the voided seq reports the final resolution and creates no trade',
         is_ok(r) and 'voided' in r.lower() and 'null' in tm2, r[-200:])
+
+    # ── M7 the reservation accounting: every unit reserved comes back ─────────────────────────
+    # A reservation is the engine's claim on a trader's FREE capacity (balance ∧ allowance-to-core);
+    # the engine holds no custody. The escrow the core pulls for one fill debits the funder
+    # `amount + one fee`, once PER FILL, so the accounting is denominated per escrow
+    # (Reservations.mo): a live order holds its remaining notional + one fee, every created
+    # obligation holds its OWN exact escrow cost until it settles or is voided, and every unit has
+    # exactly one release event - so a trader with no live order and no open obligation holds
+    # exactly nothing. These rows measure that on the chain, each against the accounting it
+    # replaces: the fee an ask never reserved though its escrow costs one, the escrow cost of a
+    # cleared-but-unsettled obligation that used to be released into thin air between the clear and
+    # the settlement, the SECOND fee a two-fill order needs where intake reserved one, and a whole
+    # lifecycle handing every unit back. `reservationAudit` recomputes the prescription from the
+    # engine's own book and open obligations, independently of the incremental arithmetic that
+    # maintains the totals, so the equality is checked and not merely mirrored by the twin.
+    # Like M6 and MD this needs a known book, so it cancels the open window's remainders first.
+    log('== M7 the reservation accounting: nothing strands')
+    known_book('M7pre')
+    approve_feed('shares', 'tachyon-maker', 100_000)   # the maker sells in the M7 window
+    approve_feed('cash', 'tachyon-taker', 500_000)     # the taker buys
+    audM, audT = audit(MAKER), audit(TAKER)
+    resM0, resT0 = residue_of(audM), residue_of(audT)
+    base_m, base_t = resv(MAKER), resv(TAKER)
+    log(f'  M7 baseline: maker resv={base_m} taker resv={base_t}; residue of the previous accounting maker={resM0} taker={resT0}')
+    row('M7a on an emptied book the audit reconciles: no live order, no open obligation, nothing prescribed - what stands is the previous accounting\'s residue, measured here and not assumed',
+        audM['liveOrders'] == 0 and audT['liveOrders'] == 0
+        and audM['openObligations'] == 0 and audT['openObligations'] == 0
+        and (audM['prescribedShares'], audM['prescribedCash'], audT['prescribedShares'], audT['prescribedCash']) == (0, 0, 0, 0)
+        and min(resM0 + resT0) >= 0
+        and base_m == twres('tachyon-maker') and base_t == twres('tachyon-taker'),
+        (audM, audT))
+
+    ASK_Q = 50
+    aM, _ = submit('tachyon-maker', 'sell', 99, ASK_Q)   # a limit high above the book: it crosses nothing
+    got_m = resv(MAKER)
+    row('M7b an ask reserves its qty AND the one fee its escrow costs - the leg the previous accounting missed, which admitted an ask whose escrow could only be refused',
+        got_m[0] == base_m[0] + ASK_Q + FEE_S and got_m == twres('tachyon-maker'),
+        f'{got_m} vs baseline {base_m} + qty {ASK_Q} + fee {FEE_S}')
+    r = td('call', 'matching', 'cancelOrder', f'({aM} : nat)', identity='tachyon-maker')
+    if is_ok(r): TW.cancel(aM)
+    after_cancel = resv(MAKER)
+    row('M7c cancelling it releases the notional AND the margin: the reservation is the baseline again, to the unit (the margin used to stay for the life of the engine)',
+        is_ok(r) and after_cancel == base_m and after_cancel == twres('tachyon-maker'),
+        f'{after_cancel} vs baseline {base_m}')
+
+    # one bid filled by TWO asks: at intake the bid reserves one escrow fee; the clear discovers that
+    # it owes two, and each obligation carries its own. EVERY qty here must clear the MD intake floor
+    # (qty > the shares fee) or the order is refused and the window is not the one these rows
+    # describe - so the three ids are asserted before a single number is measured.
+    A_Q, B_Q = 3 * FEE_S, 2 * FEE_S
+    BID_Q = A_Q + B_Q
+    s1, _ = submit('tachyon-maker', 'sell', 10, A_Q)
+    s2, _ = submit('tachyon-maker', 'sell', 10, B_Q)
+    bq, _ = submit('tachyon-taker', 'buy', 10, BID_Q)
+    intake_t = resv(TAKER)
+    row('M7d the three orders are accepted, and at intake the bid reserves its notional at its own limit plus exactly ONE escrow fee',
+        None not in (s1, s2, bq)
+        and intake_t[1] == base_t[1] + BID_Q * 10 + FEE_C and intake_t == twres('tachyon-taker'),
+        f'ids {(s1, s2, bq)}; {intake_t} vs baseline {base_t} + {BID_Q * 10} + fee {FEE_C}')
+    w7 = TW.window
+    p7, killed7, sched7 = TW.clear()
+    td('call', 'matching', 'clearWindow')
+    ok7 = wait_clear_gone(w7, 300) and len(sched7) == 2 and obl_sum() == OSUM0 + TW.obl_text()
+    after_t, after_m = resv(TAKER), resv(MAKER)
+    row('M7e the window clears two fills and the bid now reserves TWO escrows - one fee per fill, the second discovered at the clear where intake had reserved one',
+        ok7 and after_t[1] == base_t[1] + (A_Q * 10 + FEE_C) + (B_Q * 10 + FEE_C) and after_t[1] == intake_t[1] + FEE_C
+        and after_t == twres('tachyon-taker'),
+        f'{after_t} vs intake {intake_t} + one more fee {FEE_C}')
+    row('M7f the cleared-but-unsettled obligations hold their escrow costs on both sides: what a cleared match owes is not free for another order to spend (this accounting\'s predecessor released it entirely at the fill)',
+        after_m[0] == base_m[0] + (A_Q + FEE_S) + (B_Q + FEE_S) and after_m == twres('tachyon-maker'),
+        f'{after_m} vs baseline {base_m} + ({A_Q}+{FEE_S}) + ({B_Q}+{FEE_S})')
+    a7m, a7t = audit(MAKER), audit(TAKER)
+    row('M7g the audit reconciles while the obligations are open: the prescription recomputed from the engine\'s own book and holds equals what it maintains, to the same residue',
+        residue_of(a7m) == resM0 and residue_of(a7t) == resT0
+        and a7m['openObligations'] == 2 and a7t['openObligations'] == 2
+        and a7m['liveOrders'] == 0 and a7t['liveOrders'] == 0,
+        (a7m, a7t))
+
+    left7 = drain_window(w7)
+    for o in TW.obls:
+        if o['window'] == w7 and not o['settled']: TW.settle(o['seq'])
+    end_m, end_t = resv(MAKER), resv(TAKER)
+    row('M7h the drain settles both fills and every unit reserved comes back: the reservation is the baseline again on both sides, to the unit',
+        not left7 and end_m == base_m and end_t == base_t
+        and end_m == twres('tachyon-maker') and end_t == twres('tachyon-taker'),
+        f'maker {end_m} vs {base_m}; taker {end_t} vs {base_t}')
+    a8m, a8t = audit(MAKER), audit(TAKER)
+    row('M7i the whole lifecycle left the residue of the previous accounting untouched - the strand is frozen at what it was, and this accounting never adds to it',
+        residue_of(a8m) == resM0 and residue_of(a8t) == resT0
+        and (a8m['prescribedShares'], a8m['prescribedCash'], a8t['prescribedShares'], a8t['prescribedCash']) == (0, 0, 0, 0)
+        and a8m['openObligations'] == 0 and a8t['openObligations'] == 0,
+        (a8m, a8t, resM0, resT0))
+    bal_row('M7j balances after the M7 window exact to the twin')
 
     # ── L rows: the listing registry gates the gated engine's intake ─────────────────────────
     log('== L listing: the issuer gate, the funded check, the land collection')

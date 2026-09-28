@@ -10,15 +10,22 @@
 ///   resumable step() planner, stopped at EVERY possible chunk size k, reproduces the unbounded
 ///   fillSchedule byte-for-byte (same fills, same order) AND the per-trader book/balance deltas
 ///   are identical. PLUS conservation (M4) and price-time priority (M3) on every trial.
+/// PART 3 - all-or-none Kill-before-mutate: the read-only FOK fixpoint over random books.
+/// PART 4 - the RESERVATION accounting (Reservations.mo) over random lifecycles: every release is
+///   exactly covered, the reservation always equals what the model prescribes for the live book and
+///   the open obligations, and once every order is closed and every obligation resolved it is
+///   EXACTLY zero with all four maps empty - nothing strands.
 
 import Debug "mo:core/Debug";
 import Runtime "mo:core/Runtime";
 import Nat "mo:core/Nat";
 import Nat64 "mo:core/Nat64";
+import Principal "mo:core/Principal";
 import List "mo:core/List";
 import Map "mo:core/Map";
 
 import L "../src/MatchLogic";
+import R "../src/Reservations";
 import T "../src/MatchTypes";
 
 var checks : Nat = 0;
@@ -306,6 +313,250 @@ label aonloop while (tt < 1500) {
   };
 };
 Debug.print("aonTrials=" # Nat.toText(aonTrials) # " survivingAON-checks=" # Nat.toText(aonChecked));
+
+Debug.print("PART 4 - the reservation accounting: nothing strands (random lifecycles)");
+// ══ PART 4 - the reservation accounting: nothing strands, over random lifecycles ═══════════════
+//
+// A reservation is the engine's claim on a trader's FREE capacity (balance ∧ allowance-to-core). The
+// escrow the core pulls for one fill debits the funder `amount + one fee`, once PER FILL, so
+// Reservations.mo denominates the reservation per escrow: a live order holds its remaining notional
+// plus one fee, every created obligation holds its own exact escrow cost until it resolves, and every
+// unit reserved has exactly one release event.
+//
+// This part drives those PRODUCTION functions - the same ones the actor calls - over random
+// lifecycles: intakes, fills at a clearing price at or below the bid's limit (whole and partial, so a
+// K-fill order's K fees are exercised), cancels and all-or-none kills, settlements, voids, and
+// repeated resolutions of the same seq. After EVERY step it checks
+//   (a) EXACT      - no release exceeded what was reserved (every transition returns an exact Drift);
+//   (b) PRESCRIBED - reserved(p) equals Σ live orders (remaining notional + margin) + Σ open
+//                    obligations (their escrow cost), each term computed independently here;
+//   (c) COVERED    - reserved(p) is never below the escrow cost of p's own open obligations;
+// and once every order is closed and every obligation resolved,
+//   (d) ZERO       - reserved(p) is EXACTLY zero for every trader and all four maps are EMPTY: not one
+//                    key, not one unit left behind. That is the no-stranding property, and the defect
+//                    this accounting closes (a filled bid's fee margin used to stay reserved forever).
+
+func checkExact(name : Text, d : R.Drift) {
+  checks += 1;
+  if (not R.isExact(d)) {
+    failures += 1;
+    Debug.print("  FAIL: " # name # " released beyond the reservation by cash=" # Nat.toText(d.cash) # " shares=" # Nat.toText(d.shares));
+  };
+};
+
+// The arithmetic of the two intake floors, stated.
+checkEqNat("askNeed: an ask needs its qty AND the one fee its escrow costs", R.askNeed(100, 3), 103);
+checkEqNat("bidNeed: a bid needs its notional at its own limit plus one escrow fee", R.bidNeed(10, 20, 7), 207);
+
+// The three faces of the defect, each as a closed case.
+do {
+  // (i) a filled bid strands nothing: the margin goes back when the order is done, the hold when the
+  //     obligation resolves. The accounting this replaces left one cash fee reserved for ever.
+  let l = R.empty();
+  let p = Principal.fromText("rwlgt-iiaaa-aaaaa-aaaaa-cai");
+  let q = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
+  R.openBid(l, p, 1, 100, 10, 10);
+  R.openAsk(l, q, 2, 10, 4);
+  checkEqNat("a bid reserves its notional plus one fee", R.reservedCash(l, p), 1010);
+  checkEqNat("an ask reserves its qty plus one fee (the leg the old accounting missed)", R.reservedShares(l, q), 14);
+  checkExact("fill the pair whole", R.fill(l, 0, p, q, 1, 2, 100, 100, 10, true, true));
+  checkEqNat("the filled bid holds only its obligation's escrow cost", R.reservedCash(l, p), 1010);
+  checkEqNat("the filled ask holds only its obligation's escrow cost", R.reservedShares(l, q), 14);
+  checkExact("settle it", R.resolveObligation(l, 0, p, q));
+  checkEqNat("a settled lifecycle leaves the buyer nothing reserved", R.reservedCash(l, p), 0);
+  checkEqNat("a settled lifecycle leaves the seller nothing reserved", R.reservedShares(l, q), 0);
+  checkEqNat("and no margin key", Map.size(l.margin), 0);
+  checkEqNat("and no hold key", Map.size(l.hold), 0);
+};
+do {
+  // (ii) a K-fill order pays K fees, and the account discovers them as the fills are applied: one fee
+  //      at intake is a floor, not an estimate of the whole order's cost.
+  let l = R.empty();
+  let p = Principal.fromText("rwlgt-iiaaa-aaaaa-aaaaa-cai");
+  let q = Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai");
+  R.openBid(l, p, 1, 100, 10, 10);
+  var k = 0;
+  while (k < 5) {
+    R.openAsk(l, q, 10 + k, 2, 4);
+    let done = (k == 4);
+    checkExact("K-fill: fill " # Nat.toText(k), R.fill(l, k, p, q, 1, 10 + k, 100, 100, 2, done, true));
+    k += 1;
+  };
+  checkEqNat("five fills reserve five escrows, each with its own fee", R.reservedCash(l, p), 5 * (200 + 10));
+  checkEqNat("the seller's five escrows likewise", R.reservedShares(l, q), 5 * (2 + 4));
+  k := 0;
+  while (k < 5) { checkExact("K-fill: resolve " # Nat.toText(k), R.resolveObligation(l, k, p, q)); k += 1 };
+  checkEqNat("all five resolved: the buyer reserves nothing", R.reservedCash(l, p), 0);
+  checkEqNat("all five resolved: the seller reserves nothing", R.reservedShares(l, q), 0);
+};
+do {
+  // (iii) a cancel and an all-or-none kill release the margin too, and a resolution is idempotent.
+  let l = R.empty();
+  let p = Principal.fromText("rwlgt-iiaaa-aaaaa-aaaaa-cai");
+  R.openBid(l, p, 1, 50, 4, 9);
+  checkExact("cancel releases the notional and the margin", R.closeOrder(l, p, 1, true, 50 * 4));
+  checkEqNat("a cancelled order leaves nothing reserved", R.reservedCash(l, p), 0);
+  R.openAsk(l, p, 2, 7, 3);
+  checkExact("an all-or-none kill releases the notional and the margin", R.closeOrder(l, p, 2, false, 7));
+  checkEqNat("a killed order leaves nothing reserved", R.reservedShares(l, p), 0);
+  checkExact("resolving an unknown seq releases nothing", R.resolveObligation(l, 77, p, p));
+  checkEqNat("and moves nothing", R.reservedCash(l, p) + R.reservedShares(l, p), 0);
+};
+
+type SimOrder = { id : Nat; owner : Principal; isBid : Bool; limit : Nat; fee : Nat; var remaining : Nat; var live : Bool };
+type SimObl = { seq : Nat; buyer : Principal; seller : Principal; cash : Nat; shares : Nat; var isOpen : Bool };
+
+let TRADERS : [Principal] = [
+  Principal.fromText("rwlgt-iiaaa-aaaaa-aaaaa-cai"),
+  Principal.fromText("rrkah-fqaaa-aaaaa-aaaaq-cai"),
+  Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai"),
+];
+
+let RESV_TRIALS = 900;
+var resvTrials = 0;
+var resvFills = 0;
+var resvSteps = 0;
+var rt = 0;
+while (rt < RESV_TRIALS) {
+  rt += 1;
+  let l = R.empty();
+  let cashFee = rndRange(0, 6);
+  let sharesFee = rndRange(0, 6);
+  let sOrders = List.empty<SimOrder>();
+  let sObls = List.empty<SimObl>();
+  var nextId = 1;
+  var nextSeq = 0;
+
+  // (b) + (c): the model equation and the coverage bound, both computed here from the simulated book
+  // rather than from the module's totals.
+  func verify(tag : Text) {
+    for (p in TRADERS.vals()) {
+      var wantShares = 0;
+      var wantCash = 0;
+      var oblShares = 0;
+      var oblCash = 0;
+      for (o in List.values(sOrders)) {
+        if (o.live and Principal.equal(o.owner, p)) {
+          if (o.isBid) wantCash += o.limit * o.remaining + o.fee else wantShares += o.remaining + o.fee;
+        };
+      };
+      for (b in List.values(sObls)) {
+        if (b.isOpen) {
+          if (Principal.equal(b.buyer, p)) oblCash += b.cash;
+          if (Principal.equal(b.seller, p)) oblShares += b.shares;
+        };
+      };
+      wantCash += oblCash;
+      wantShares += oblShares;
+      checkEqNat("prescribed cash " # tag, R.reservedCash(l, p), wantCash);
+      checkEqNat("prescribed shares " # tag, R.reservedShares(l, p), wantShares);
+      check("reserved cash covers the open obligations " # tag, R.reservedCash(l, p) >= oblCash);
+      check("reserved shares covers the open obligations " # tag, R.reservedShares(l, p) >= oblShares);
+    };
+  };
+
+  func liveSide(isBid : Bool) : ?SimOrder {
+    let cands = List.empty<SimOrder>();
+    for (o in List.values(sOrders)) { if (o.live and o.isBid == isBid and o.remaining > 0) List.add(cands, o) };
+    let n = List.size(cands);
+    if (n == 0) null else List.get(cands, rndRange(0, n - 1));
+  };
+
+  let steps = rndRange(6, 16);
+  var st = 0;
+  while (st < steps) {
+    st += 1;
+    resvSteps += 1;
+    let op = rndRange(0, 9);
+    if (op <= 3) {
+      // intake
+      let owner = TRADERS[rndRange(0, TRADERS.size() - 1)];
+      let isBid = (rndRange(0, 1) == 0);
+      let limit = rndRange(1, 40);
+      let qty = rndRange(1, 12);
+      let id = nextId;
+      nextId += 1;
+      if (isBid) R.openBid(l, owner, id, limit, qty, cashFee) else R.openAsk(l, owner, id, qty, sharesFee);
+      List.add(sOrders, { id; owner; isBid; limit; fee = (if (isBid) cashFee else sharesFee); var remaining = qty; var live = true });
+    } else if (op <= 6) {
+      // a fill between a live bid and a live ask, at a price at or below the bid's limit
+      switch (liveSide(true), liveSide(false)) {
+        case (?bid, ?ask) {
+          let q = rndRange(1, Nat.min(bid.remaining, ask.remaining));
+          let price = rndRange(1, bid.limit);
+          bid.remaining -= q;
+          ask.remaining -= q;
+          let bDone = bid.remaining == 0;
+          let aDone = ask.remaining == 0;
+          checkExact("fill", R.fill(l, nextSeq, bid.owner, ask.owner, bid.id, ask.id, bid.limit, price, q, bDone, aDone));
+          // the hold the obligation must now carry: the notional at the CLEARING price plus one fee a side
+          let wantCash = price * q + bid.fee;
+          let wantShares = q + ask.fee;
+          let got : R.Amounts = switch (R.holdOf(l, nextSeq)) { case (?h) h; case null ({ cash = 0; shares = 0 }) };
+          checkEqNat("the obligation holds the cash escrow exactly", got.cash, wantCash);
+          checkEqNat("the obligation holds the shares escrow exactly", got.shares, wantShares);
+          List.add(sObls, { seq = nextSeq; buyer = bid.owner; seller = ask.owner; cash = wantCash; shares = wantShares; var isOpen = true });
+          if (bDone) bid.live := false;
+          if (aDone) ask.live := false;
+          nextSeq += 1;
+          resvFills += 1;
+        };
+        case (_, _) {};
+      };
+    } else if (op <= 7) {
+      // a cancel or an all-or-none kill: the same transition
+      switch (liveSide(rndRange(0, 1) == 0)) {
+        case (?o) {
+          checkExact("close", R.closeOrder(l, o.owner, o.id, o.isBid, (if (o.isBid) o.limit * o.remaining else o.remaining)));
+          o.live := false;
+          o.remaining := 0;
+        };
+        case null {};
+      };
+    } else {
+      // resolve an obligation - settled or voided, the same transition - then resolve it AGAIN: a
+      // re-drive, a second void or two racing callers must release it once and only once
+      let open_ = List.empty<SimObl>();
+      for (b in List.values(sObls)) { if (b.isOpen) List.add(open_, b) };
+      if (List.size(open_) > 0) {
+        switch (List.get(open_, rndRange(0, List.size(open_) - 1))) {
+          case (?b) {
+            checkExact("resolve", R.resolveObligation(l, b.seq, b.buyer, b.seller));
+            b.isOpen := false;
+            checkExact("resolve again (idempotent)", R.resolveObligation(l, b.seq, b.buyer, b.seller));
+          };
+          case null {};
+        };
+      };
+    };
+    verify("after step " # Nat.toText(st) # " of trial " # Nat.toText(rt));
+  };
+
+  // (d) wind the whole book down and demand EXACT zero - no unit and no key left anywhere
+  for (o in List.values(sOrders)) {
+    if (o.live) {
+      checkExact("wind-down close", R.closeOrder(l, o.owner, o.id, o.isBid, (if (o.isBid) o.limit * o.remaining else o.remaining)));
+      o.live := false;
+      o.remaining := 0;
+    };
+  };
+  for (b in List.values(sObls)) {
+    if (b.isOpen) {
+      checkExact("wind-down resolve", R.resolveObligation(l, b.seq, b.buyer, b.seller));
+      b.isOpen := false;
+    };
+  };
+  for (p in TRADERS.vals()) {
+    checkEqNat("quiescence: reserved cash is exactly zero", R.reservedCash(l, p), 0);
+    checkEqNat("quiescence: reserved shares is exactly zero", R.reservedShares(l, p), 0);
+  };
+  checkEqNat("quiescence: not one reserved-cash key left", Map.size(l.cash), 0);
+  checkEqNat("quiescence: not one reserved-shares key left", Map.size(l.shares), 0);
+  checkEqNat("quiescence: not one order margin left", Map.size(l.margin), 0);
+  checkEqNat("quiescence: not one obligation hold left", Map.size(l.hold), 0);
+  resvTrials += 1;
+};
+Debug.print("reservationTrials=" # Nat.toText(resvTrials) # " steps=" # Nat.toText(resvSteps) # " fills=" # Nat.toText(resvFills));
 
 Debug.print("trials=" # Nat.toText(TRIALS) # " crossed=" # Nat.toText(crossed));
 Debug.print("checks=" # Nat.toText(checks) # " failures=" # Nat.toText(failures));

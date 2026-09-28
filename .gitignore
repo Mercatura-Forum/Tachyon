@@ -4,4 +4,5 @@ build/
 .thebes/
 test/chain/out/
 test/chain/pocket.thebes.toml
+test/chain/dev/
 __pycache__/

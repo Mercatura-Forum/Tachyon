@@ -9,7 +9,7 @@ What has been established, on what, and what has not.
 | `core/test/run_tests.mo` | 90,035 (unit cases and a 10,000-trial property simulation over fund, settle, abort, retry and reorder sequences; conservation and no-stranding on every trial) | green |
 | `core/test/run_tests_icrc7.mo` | 25,033 (the unique-asset leg, including redundant same-collection replays) | green |
 | `core/test/run_tests_delivery.mo` | 72,129 (the delivery gates; a 10,000-trial property simulation over deliveries accepted, reclaimed and never escrowed, with injected ledger failures; conservation, exactly-once payout or refund and no-stranding on every trial; no payout without the acceptance) | green |
-| `matching/test/run_tests_matching.mo` | 53,425 (4,000 randomised windows, 3,898 crossed; clearing price, volume, priority, conservation of every fill schedule; chunked clearing equal to unbounded clearing) | green |
+| `matching/test/run_tests_matching.mo` | 190,256 (4,000 randomised windows, 3,898 crossed; clearing price, volume, priority, conservation of every fill schedule; chunked clearing equal to unbounded clearing; and 900 randomised reservation lifecycles over 9,970 intakes, fills, cancels, kills, settlements and voids: every release exactly covered, the reservation equal at every step to what the model prescribes for the live book and the open obligations, and exactly zero with every map empty once all of them resolve) | green |
 
 ## 2. On a throwaway subnet of geographically distributed validators running the Thebes node binary (June 2026)
 
@@ -114,6 +114,8 @@ The run recorded three defects, each pinned by a battery row that must flip with
 - **Reservation fee margins strand** (M1f, M4f). A filled bid's one-fee margin stays in
   `reservedCash` (intake reserves `limit·qty + fee`; a fill releases `limit·qty`), and a
   sell reserves no fee though its escrow costs one; the twin models both exactly.
+  *Resolved in section 3e, where the accounting is replaced by a model rather than patched - and
+  where the defect turns out to have had a third face this entry did not name.*
 
 ## 3c. The dust-fill liveness defect of 3b fixed and verified in place (2026-09-24)
 
@@ -211,6 +213,123 @@ is empty.
 | M6d | The allowance restored, the next sweep re-drives the same trade to SETTLED through the core's idempotent re-drive - nothing left unsettled |
 | M6e, M6f | Balances exact to the twin, the interrupted escrow landing exactly once; the core holds no residual |
 | MD1-MD4 | The dust window drains under the looped sweep - settle, void the permanent dust refusal in stride, settle - the 3c void discipline exercised inside the bounded inline drain |
+
+## 3e. The reservation accounting made exact, and the last defect of section 3b closed (2026-09-28)
+
+The third defect of section 3b is resolved. Reading the engine against the core's own escrow first
+showed that the entry had understated it: what stranded was one face of a single miscount, and there
+were three.
+
+The escrow the core pulls for a fill is an `icrc2_transfer_from` carrying the ledger's fee, so it
+debits the FUNDER the amount plus one fee, and the payout pays the escrow minus one fee, so the
+recipient bears that one. Per fill a buyer therefore needs `price·qty + one cash fee` of balance AND
+allowance, and a seller `qty + one shares fee`. Against that the engine (a) reserved `qty` for an ask
+and no fee at all, so an ask approved for exactly its qty was ADMITTED and its escrow could then only
+be refused - the engine told a trader an order was fundable that never was; (b) released a filled
+bid's notional but never its one-fee margin, which is the strand the record named; and (c) released
+the WHOLE notional at the fill, leaving the two escrows a created obligation still owes reserved
+nowhere at all, so between the clear and the settlement the same trader could submit a new order
+against the very funds the cleared match needed. (c) is not in the earlier record.
+
+The size of (b) is not an inference. The bed of sections 3b-3d is still running the binary those
+sections report, and in a state where the correct reservation for every trader is unambiguously
+zero - no order resting, no obligation unsettled - it reserves 10 cash for the maker and 80 for the
+taker: ninety units held against nothing, nine stranded fees, read from it by query.
+
+The fix decides the accounting rather than releasing the margin. A reservation is denominated PER
+ESCROW, in three terms and one rule. A live order reserves its remaining notional plus ONE fee, the
+fee of the next escrow it can produce. Every created-but-unresolved obligation reserves its OWN EXACT
+escrow cost - the notional at the clearing price plus one fee, on each side - from the moment its fill
+is applied until it settles or is voided. And every unit reserved has exactly ONE release event: an
+order's notional as a fill consumes it or at cancel and kill, an order's margin when the order goes
+terminal, an obligation's hold when it resolves. So `reserved(p)` is the sum over that trader's live
+orders of remaining notional plus one fee, plus the sum over its open obligations of their exact
+escrow cost, and a trader with no live order and no open obligation has reserved EXACTLY ZERO. A
+K-fill order's K fees are discovered as its fills are applied, each obligation bringing its own, which
+is why one fee at intake is a floor and not an estimate: intake cannot know how many escrows an order
+will produce, and under this model it does not have to.
+
+The arithmetic and the five transitions are a new PURE module, `matching/src/Reservations.mo`, over
+the engine's own maps - the actor and the interpreter battery call the same functions, so the property
+battery exercises production code. Every release replays an amount that module itself recorded
+(`orderMargin` per live order, `obligationHold` per obligation, both TAKEN rather than recomputed), so
+a ledger that moves its fee between intake and escrow cannot make a release differ from its
+reservation, and a resolution is idempotent under an idempotent re-drive, a second void, or two
+callers racing one seq. A release that ever exceeded its reservation is returned as a drift and
+written to the no-stranding invariant log instead of vanishing into a clamped subtraction: unreachable
+by construction, and asserted so. Nothing was added to any await path and no Timer moved - the fee a
+margin is denominated in is the one intake already reads for the dust floor, recorded on the order, so
+`clearWindow` and `continueClear` gained no await and the chunk-resume Timer of section 3b stays armed
+in an await-free message, which the M1 and M3 rows continue to prove.
+
+The interpreter battery for the matching engine goes from 53,425 checks to 190,256: a new part drives
+those production functions over 900 randomised lifecycles and 9,970 intakes, fills (whole and partial),
+cancels, kills, settlements, voids and repeated resolutions, checking after EVERY step that no release
+exceeded what was reserved and that the reservation equals what the model prescribes for the live book
+and the open obligations, and after every trial - once each order is closed and each obligation
+resolved - that it is exactly zero with all four maps empty: not one key, not one unit.
+
+The verification bed is a SECOND localhost chain, deliberately not the one the 118-of-118 run was made
+on: four validators on 127.0.0.1:18490-18493 with its own boundary and chain id 31338, so that bed and
+the binaries it runs were never touched (its engine still answers that it has no `reservationAudit`
+method, and the ninety units above were read from it read-only). The nine contracts were installed
+there on a bit-identical copy of the binary that bed runs (`e523835b…`, the module hash both chains
+report), and driven under the OLD accounting until they held the state a fix has to carry: two
+obligations settled, one left unsettled, one ask resting live on 77 shares, and three stranded fees -
+the taker's reserved cash at exactly 30, predicted before the calls were made and read back equal.
+Both engines were then UPGRADED IN PLACE (`thebes-deploy upgrade`, "stable types: compatible with what
+is installed", module hash `0b56f142…`), the ungated engine's cid included - the cid whose
+`InstallCommit(upgrade)` failed four times on the retired 3b/3c chain - with no zero-length argument
+and no validator halt, on two independent attempts. Across the upgrade the window, the book and the
+obligation schedule came back byte for byte and the reservations unchanged; the new `reservationAudit`
+then attributed them exactly, the maker's 77 shares fully prescribed by its live ask and the taker's
+30 cash prescribed by nothing at all - the previous accounting's residue, isolated by the new query on
+state the previous accounting created.
+
+Log: `docs/chain-battery-2026-09-28.log`. **131 of 131 rows pass.** Against section 3d's 118: a
+ten-row M7 section, and one precondition row for each scenario that needs a known book.
+
+| Row | What was shown |
+|---|---|
+| M7a | On an emptied book the audit reconciles: no live order, no open obligation, nothing prescribed - what stands is the previous accounting's residue, measured and not assumed |
+| M7b | An ask reserves its qty AND the one fee its escrow costs - the leg the previous accounting missed, which admitted an ask whose escrow could only be refused |
+| M7c | Cancelling it releases the notional AND the margin: the reservation is the baseline again, to the unit (the margin used to stay for the life of the engine) |
+| M7d | At intake a bid reserves its notional at its own limit plus exactly ONE escrow fee |
+| M7e | The window clears two fills and the bid then reserves TWO escrows - one fee per fill, the second discovered at the clear where intake had reserved one |
+| M7f | The cleared-but-unsettled obligations hold their escrow costs on both sides: what a cleared match owes is not free for another order to spend |
+| M7g | The audit reconciles while the obligations are open: the prescription recomputed from the engine's own book and holds equals what it maintains, to the same residue |
+| M7h | The drain settles both fills and every unit reserved comes back: the baseline again on both sides, to the unit |
+| M7i | The whole lifecycle left the residue untouched - the strand is frozen at what it was and this accounting never adds to it |
+| M7j | Balances after the M7 window exact to the twin |
+| M6pre, MDpre, M7pre | The open window holds only orders the twin knows, so each of the three scenarios that names its own fills gets the book it describes |
+
+The run also corrected two defects in the battery itself, both of which had been latent rather than
+absent. **M5d was not idempotent across runs**: it asserts that a maker's bid is refused for want of a
+cash allowance, which holds only while the maker has none - true on a fresh bed, false on any bed where
+an earlier run's M6 had granted one, and allowances persist on the ledger. Section 3d was a single run
+on a fresh chain, so it never surfaced. Because a row that expects a refusal does not mirror its order
+to the twin, the order it wrongly accepted then rested in the book and self-matched against the maker's
+own asks in the windows that followed: three obligations whose buyer and seller are the same trader,
+which the core refuses and which can never settle. The row now asks for a notional above any allowance
+this battery grants and far below the caller's balance, so what refuses it is the allowance gate
+whatever an earlier run left behind. **And the three scenario preambles absorbed that pollution
+silently**, cancelling only the resting orders the twin knew; they are now one helper that cancels
+those and then ASSERTS nothing else is resting, so an unmirrored order is one row naming the cause
+rather than a dozen failures downstream. The engine was not implicated in any of it: through every
+polluted window the invariant log stayed empty, the audit's maintained-minus-prescribed held at the
+residue on both sides, and the balance rows stayed exact to the twin - a self-match is a refusal, not
+an accounting drift, and the drift oracle correctly did not fire. The claim that the bed persists and
+re-runs are safe now holds for the whole battery, and is itself established by a second full run on
+the persisted bed.
+
+Two limits are worth stating. The fee a margin and a hold are denominated in is the one read live at
+the order's intake, the fee the order was admitted under; a ledger that RAISES its fee between intake
+and escrow leaves that hold short by the difference, the escrow then refuses transiently and the drain
+retries it, and the accounting stays exact regardless because a release is always the amount recorded
+when it was reserved. And the residue of the previous accounting does not disappear: a margin the old
+code never recorded cannot honestly be released by the new one, so on a bed carried across the upgrade
+the strand stays at what it was - 30 on this bed, measured by M7a and asserted frozen by M7i - and only
+a contract installed fresh starts at zero.
 
 ## 4. On local replicas (September 2026)
 
