@@ -1,0 +1,92 @@
+[
+ {
+  "id": "M01",
+  "property": "a ratio applied to a position floors the whole units and keeps the fraction exactly",
+  "file": "custody/src/CustodyMath.mo",
+  "old": "    { whole = product / denominator; fractionNumerator = product % denominator }\n",
+  "new": "    { whole = (product + denominator - 1) / denominator; fractionNumerator = product % denominator }\n",
+  "mutant": "the fraction rounded up into a whole unit",
+  "test": "Custody"
+ },
+ {
+  "id": "M02",
+  "property": "cash in lieu of a fraction is the fraction times the price, floored",
+  "file": "custody/src/CustodyMath.mo",
+  "old": "  public func cashInLieu(fractionNumerator : Nat, denominator : Nat, priceMicro : Nat) : Nat { fractionNumerator * priceMicro / denominator };",
+  "new": "  public func cashInLieu(fractionNumerator : Nat, denominator : Nat, priceMicro : Nat) : Nat { fractionNumerator * priceMicro };",
+  "mutant": "the whole price paid for a fraction",
+  "test": "Custody"
+ },
+ {
+  "id": "M03",
+  "property": "a receipt is recorded once",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        if (receipt(s, x.receipt.kind, x.receipt.id) != null) return ?#ReceiptRecorded({ kind = x.receipt.kind; id = x.receipt.id });\n",
+  "new": "",
+  "mutant": "the same receipt folded twice",
+  "test": "Custody"
+ },
+ {
+  "id": "M04",
+  "property": "a settlement never moves more than the holder has",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        if (held < x.units) return ?#PositionShort({ asset = x.asset; holder = x.from; held; wanted = x.units });\n",
+  "new": "",
+  "mutant": "positions may go short",
+  "test": "Custody"
+ },
+ {
+  "id": "M05",
+  "property": "no settlement while a struck action awaits its payment",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        switch (openActionOf(s, x.asset)) { case (?aid) { switch (action(s, aid)) { case (?a) { if (a.state == #struck and x.day <= a.paymentDate) return ?#ActionOpenOnAsset({ asset = x.asset; action = aid }) }; case null {} } }; case null {} };\n",
+  "new": "",
+  "mutant": "the record-date positions moved before the payment",
+  "test": "Custody"
+ },
+ {
+  "id": "M06",
+  "property": "a holder subscribes within its rights",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        if (e.rightsTaken + x.rights > e.rights) return ?#ExceedsRights({ action = x.action; holder = x.holder; rights = e.rights; taken = e.rightsTaken; wanted = x.rights });\n",
+  "new": "",
+  "mutant": "the rights bound removed",
+  "test": "Custody"
+ },
+ {
+  "id": "M07",
+  "property": "a subscription closes at the deadline",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        if (x.day > rg.subscriptionDeadline) return ?#SubscriptionClosed({ action = x.action; deadline = rg.subscriptionDeadline; day = x.day });\n",
+  "new": "",
+  "mutant": "the deadline ignored",
+  "test": "Custody"
+ },
+ {
+  "id": "M08",
+  "property": "the issued supply follows the units a paid action created or took back",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "            case (#redemption(_)) as.issuedSupply - a.unitsTotal;\n",
+  "new": "            case (#redemption(_)) as.issuedSupply;\n",
+  "mutant": "the supply kept after a redemption",
+  "test": "Custody"
+ },
+ {
+  "id": "M09",
+  "property": "an action opens only when the asset has none open",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        switch (openActionOf(s, x.asset)) { case (?aid) return ?#ActionOpenOnAsset({ asset = x.asset; action = aid }); case null {} };\n        if (x.source.size() != 32)",
+  "new": "        if (x.source.size() != 32)",
+  "mutant": "two actions open on one asset",
+  "test": "Custody"
+ },
+ {
+  "id": "M10",
+  "property": "a reconciliation compares every attested balance with the register's position",
+  "file": "custody/src/CustodyCore.mo",
+  "old": "        for ((h, bal) in sorted.vals()) { let p = position(s, x.asset, h); if (p == bal) matched += 1 else breaks += 1; List.add(rows, (h, p, bal)) };\n",
+  "new": "        for ((h, bal) in sorted.vals()) { let p = position(s, x.asset, h); matched += 1; List.add(rows, (h, p, bal)) };\n",
+  "mutant": "every balance counted as matched",
+  "test": "Custody"
+ }
+]

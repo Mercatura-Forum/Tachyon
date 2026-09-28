@@ -86,6 +86,7 @@ custody is:
 | **`core/`: the settlement core** | Two-phase escrow (fund, settle, abort); both-or-neither settlement gated on both legs confirmed in escrow; reclaim in full after the deadline; idempotent retry of a failed payout with a fixed `created_at_time` so the ledger deduplicates; a ledger `Duplicate` verified against the named escrow before it is trusted; five invariants checked on every transition; a Merkle mountain range receipt for every event; the ICRC-7 leg for unique assets; a delivery free of payment (one leg, moved by the taker's acceptance, reclaimed past the deadline) under the same receipts and invariants. |
 | **`matching/`: the batch matching engine** | Orders staged into windows and cleared at one uniform price that maximises executed volume; price-time priority with pro-rata at the margin; reservation against the core rather than custody; each fill a settlement obligation driven through the core as a matched trade; clearing metered against an instruction budget and resumed across rounds, so batch size is unbounded without a partially applied chunk. |
 | **`listing/`: the listing registry** | The issuer-gated record of what is tradeable: fungible shares and unique-asset collections, funded-check at listing time; consulted by the matching engine when configured. |
+| **`custody/`: custody beside the venue** | A register of holders and their settled positions as the fold of the venue's receipts (each recorded once by its id and hash, never more than a holder has); reconciliation of the register to the ledgers' attested balances, sealed by a hash; corporate actions (a cash dividend, a split and a bonus with cash in lieu of fractions, rights within the entitlement and by the deadline, a redemption) struck at the record date and paid on the payment date in slices, the entitlement file certified by its hash. A pure core on the Thebes kernel that a venue contract composes; see `custody/README.md`. |
 
 ## Layout
 
@@ -98,6 +99,8 @@ core/fixtures/  the ledger fixtures: an ICRC-1/2 ledger and its flaky variant fo
 matching/src/   MatchTypes, MatchLogic (pure), Matching (the actor), Guards, ICRC
 matching/test/  the interpreter battery (53,425 checks over 4,000 randomised windows)
 listing/src/    ListingRegistry
+custody/        the custody register: src/, test/ (WASI batteries), integration/ (the Python twin), tools/
+vendor/         the Thebes kernel the custody module builds against, named by commit
 test/chain/    battery.py: the settlement battery on a Thebes chain
 deploy/         an example thebes-deploy manifest
 docs/           DESIGN.md, VERIFICATION.md, the run of record
@@ -119,6 +122,16 @@ moc -r $S core/test/run_tests.mo
 moc -r $S core/test/run_tests_icrc7.mo
 moc -r $S core/test/run_tests_delivery.mo
 moc -r $S matching/test/run_tests_matching.mo
+```
+
+The custody module builds against the Thebes kernel, which is not part of this repository:
+`vendor/thebes-kernel/README.md` names the commit, and a checkout of the kernel at that commit is
+placed in `vendor/thebes-kernel` before its batteries run (WASI under `wasmtime`, Python 3 for the twin):
+
+```
+./custody/tools/check.sh
+./custody/test/run.sh
+python3 custody/tools/mutation_test.py
 ```
 
 The contracts are built with legacy (classical) persistence so that an in-place
