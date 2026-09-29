@@ -3,6 +3,8 @@ build/
 .dfx/
 .thebes/
 test/chain/out/
+test/chain/out-wan/
 test/chain/pocket.thebes.toml
+test/chain/wan.thebes.toml
 test/chain/dev/
 __pycache__/

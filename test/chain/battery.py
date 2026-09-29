@@ -9,8 +9,9 @@ identity new`), and each must hold an initial balance on the cash and asset ledg
 
 Rows: T1 happy path, T3 abort and reclaim, T4 idempotent retry under an injected ledger
 failure, T5 adversarial refusals, D1 a delivery free of payment accepted, D2 one reclaimed, D3 one the
-taker does not accept, D4 the invariant log, T2 no fork (state root identical across validators at the
-same height). Every row states its own pass condition before the calls are made.
+taker does not accept, D4 the invariant log, T2 no fork (one finalized height's block fetched from
+every validator's own store: block hash and state root identical on all of them). Every row states
+its own pass condition before the calls are made.
 
 When the manifest also installs the matching engine and the listing registry ([canisters.matching],
 [canisters.matching_gated], [canisters.listing], [canisters.land], [canisters.shares_empty]), the
@@ -1119,16 +1120,32 @@ if MATCHING:
     inv = td('query', 'core', 'invariantLog')
     row('MF4 the core\'s invariant log records no violation across the matched settlements', 'fail' not in inv.lower(), inv[-200:])
 
-# T2 no fork: every validator reports the same state root at the same height.
+# T2 no fork: one finalized height, read from every validator's own block store - the block
+# hash and the state root must be byte-identical on all of them. The height is fixed first
+# (the smallest finalized height any validator reports, backed off by a margin every
+# validator has executed), then the block at that height is fetched from each validator by
+# height. Racing /api/status snapshots instead would never agree on a chain that finalizes
+# many heights per second, as the distributed subnet does; a block fetched by height is
+# deterministic on any bed.
 log('== T2 no fork')
-vals = re.findall(r'"(http://[^"]+)"', open(A.manifest).read())
-roots = {}
-for v in vals:
-    try:
-        d = json.loads(urllib.request.urlopen(v + '/api/status', timeout=10).read())
-        roots.setdefault(d.get('finalized_height'), set()).add(d.get('state_root') or d.get('finalized_state_root'))
-    except Exception as e: roots.setdefault('err', set()).add(str(e)[:60])
-same = [h for h, s in roots.items() if h != 'err' and len(s) == 1]
-row('T2 validators agree on the state root at a common height', len(same) >= 1 and 'err' not in roots, roots)
+m = re.search(r'validators\s*=\s*\[([^\]]*)\]', open(A.manifest).read())
+vals = re.findall(r'"(https?://[^"]+)"', m.group(1) if m else '')
+def v_json(url):
+    for attempt in range(3):
+        try: return json.loads(urllib.request.urlopen(url, timeout=15).read())
+        except Exception as e:
+            if attempt == 2: return {'err': str(e)[:80]}
+            time.sleep(2)
+try:
+    heights = [v_json(v + '/api/status').get('finalized_height') for v in vals]
+    H = min(h for h in heights if h is not None) - 100
+    blocks = {v: v_json(v + f'/api/block/{H}') for v in vals}
+    pairs = {v: (b.get('block_hash'), b.get('state_root')) for v, b in blocks.items()}
+    hashes = set(h for h, _ in pairs.values()); sroots = set(s for _, s in pairs.values())
+    ok = (len(vals) >= 2 and len(hashes) == 1 and len(sroots) == 1
+          and None not in hashes and None not in sroots and '' not in sroots)
+    row(f'T2 every validator serves the same block hash and state root at height {H}', ok, pairs)
+except Exception as e:
+    row('T2 every validator serves the same block hash and state root at a common height', False, str(e)[:200])
 log(f'\n{passed} passed, {failed} failed')
 sys.exit(0 if failed == 0 else 1)

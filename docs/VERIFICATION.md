@@ -331,6 +331,50 @@ code never recorded cannot honestly be released by the new one, so on a bed carr
 the strand stays at what it was - 30 on this bed, measured by M7a and asserted frozen by M7i - and only
 a contract installed fresh starts at zero.
 
+## 3f. The matching engine and the listing registry on the geographically distributed subnet under the production environment (2026-09-29)
+
+The last entry of section 5 is closed. The bed is a live subnet of four validators in diverse
+locations behind one public boundary, running the production node binary under the production
+environment — the distributed composition of section 3's bed, carrying the contracts of
+sections 3b–3e. Each validator is individually addressable through the boundary's
+per-validator routes, which is how the no-fork row reads each one's own block store rather
+than an aggregate.
+
+The nine contracts of `deploy/example.thebes.toml` were installed fresh with `thebes-deploy`
+(`moc --legacy-persistence`, locally signed installs committed through the chain's Motoko
+legacy-ABI gate), the module hash of every install equal to this checkout's build of the same
+source — both engines at the hash section 3e's upgrade recorded. The full battery was then
+driven by `test/chain/battery.py` against the stateful Python twin, over WAN round trips to
+every validator call. Log: `docs/chain-battery-2026-09-29.log`. **131 of 131 rows pass** —
+the same 131 rows as section 3e, on the distributed composition.
+
+What the distributed bed itself witnesses, beyond reproducing sections 3b–3e:
+
+- **The engine's own liveness primitives hold across the WAN.** The chunk-resume Timer,
+  armed in an await-free message, fired and completed the capped clears unaided (M1c, M3b) —
+  on this bed as on localhost, the primitive the drain avoids (a message the caller never
+  awaits) was never needed, and the one it uses works. The bounded inline sweep drained every
+  window (M3e), stepped over the transient refusal and settled the fill behind it (M6b–M6d),
+  and voided the permanent dust refusal in stride (MD2–MD3), each attempt one inter-canister
+  round trip on a distributed chain.
+- **A fresh install's reservation residue is exactly zero.** Section 3e stated that only a
+  contract installed fresh starts at zero; this is the first fresh bed of the new accounting,
+  and M7's baseline measured zero on both sides, both terms, before the lifecycle rows ran —
+  and M7i held it there after them.
+- **The no-fork row is deterministic and stronger.** This chain finalizes many heights per
+  second, so the sampled form of T2 — racing `/api/status` snapshots — could never witness
+  two validators at a common height. T2 now fixes one finalized height (the smallest any
+  validator reports, backed off by a margin every validator has executed) and fetches that
+  block from every validator by height: the block hash AND the state root must be
+  byte-identical on all of them. On this run all four validators served the same block hash
+  and state root at height 86531386. The re-formed row is deterministic on any bed and passes
+  unchanged on the localhost beds.
+
+The harness absorbed the substrate behaviours the earlier sections recorded — a
+`REPLAY_REJECTED` nonce retried, a read-after-write query served by a validator that has not
+applied the update yet — without a row-level exception: the retries are the harness's, the
+rows' pass conditions unchanged.
+
 ## 4. On local replicas (September 2026)
 
 The core as a consumer of journal-backed ledgers: reservation escrow on such ledgers, and the rule
@@ -338,8 +382,5 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
 
 ## 5. Not established
 
-- **The matching engine and the listing registry on a geographically distributed subnet
-  under the production environment.** Sections 3b-3d establish them on the production node
-  binary on one machine, with `test/chain/battery.py` covering them end to end - the
-  autonomous drain rows included; the distributed composition of section 3's bed remains to
-  be run.
+Nothing, at this date. The last entry here — the matching engine and the listing registry on
+a geographically distributed subnet under the production environment — closed in section 3f.
