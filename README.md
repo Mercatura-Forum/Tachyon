@@ -26,8 +26,8 @@ in Motoko. Apache 2.0.
 | Legs | ICRC-1/ICRC-2 (cash, fungible assets), ICRC-7 (unique assets) |
 | Matching | frequent batch auction, uniform clearing price, price-time priority, bounded clearing |
 | Proofs | Merkle mountain range receipts with a certified root |
-| Verification | 240,622 interpreter checks; 25 of 25 rows on a geographically distributed subnet running the production node binary; 116 of 116 rows (settlement, matching, listing) on a localhost chain of the production node binary against a Python twin of the clearing logic |
-| Status | settlement core verified on the production node binary under the production environment; matching engine and listing registry verified in the interpreter, on a Thebes subnet, and on a localhost chain of the production node binary |
+| Verification | 377,453 interpreter checks; 25 of 25 settlement rows on a geographically distributed subnet running the production node binary; 131 of 131 rows (settlement, matching, listing) against a Python twin of the clearing logic, on a localhost chain of the production node binary and on a geographically distributed subnet under the production environment |
+| Status | settlement core, matching engine and listing registry verified in the interpreter, on a localhost chain of the production node binary, and on a geographically distributed subnet under the production environment |
 
 Tachyon implements BIS DvP Model 1 (gross, simultaneous, both-or-neither) over
 any ICRC-1/ICRC-2 ledger for cash and fungible assets and any ICRC-7 ledger for
@@ -93,7 +93,7 @@ custody is:
 ```
 core/src/       DvpTypes, DvpLogic (the pure decision core), DvpCore (the actor),
                 Guards, the ICRC-1/2 and ICRC-7 interfaces, MerkleMMR, the land ledger
-core/test/      the interpreter batteries (90,035 and 25,033 checks)
+core/test/      the interpreter batteries (90,035, 25,033 and 72,129 checks)
 core/fixtures/  the ledger fixtures: an ICRC-1/2 ledger and its flaky variant for
                 failure injection
 matching/src/   MatchTypes, MatchLogic and Reservations (both pure), Matching (the actor),
@@ -145,10 +145,9 @@ chain; `deploy/example.thebes.toml` is the manifest shape.
 
 ## Known limitations
 
-- **Matching and listing on a geographically distributed subnet.** Both have been
-  run end to end on a localhost chain of the production node binary, the
-  autonomous settlement drain included; the distributed composition the
-  settlement rows were run on remains to be run.
+- None open. The last one — the matching engine and the listing registry on a
+  geographically distributed subnet under the production environment — closed on
+  2026-09-29; `docs/VERIFICATION.md` §3f is the record.
 
 ## Design
 
