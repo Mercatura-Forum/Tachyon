@@ -59,7 +59,7 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle", "book.bond.valuedate", "book.derivatives.settle"];
   let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
     "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
-    "book.certificate.retire", "book.right.exercise", "book.bridge.redeem"];
+    "book.certificate.retire", "book.right.exercise", "book.bridge.redeem", "book.order.replace"];
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
     "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
     "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
@@ -346,6 +346,10 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   /// A redemption, to a trader of its account's member, the regulator and the directors; refused to anyone else.
   public shared (msg) func redemption(id : Nat) : async { #ok : B.Redemption; #err : Text } {
     switch (B.redemptionOf(bs, id)) { case (?r) { if (overseer(msg.caller) or ownsAccount(msg.caller, r.account)) #ok(r) else #err("NotYours") }; case null #err("NotYours") }
+  };
+  /// A cancel/replace (SPEC §37): the trader's own live order amended and named by its new client reference.
+  public shared (msg) func replace(order : Nat, qty : Nat, price : Nat, clientRef : Text) : async Text {
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #replaceOrder({ order; qty; price; clientRef }), null, ""))
   };
   /// A member's redemption of claims from its account (SPEC §36); the member and the trader are the caller's.
   public shared (msg) func redeem(account : Nat, ledger : Principal, amount : Nat) : async Text {
