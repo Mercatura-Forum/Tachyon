@@ -86,7 +86,8 @@ persistent actor class VenueJudge(init : {
     let r = C.Reader(Blob.toArray(command));
     switch (domain) {
       case "offering" { let ?c = E.readAt(OK.registry, version, r) else return "e=Undecodable"; TC.oOut(Of.submit(os, auth, now, role, c, null, justification)) };
-      case "custody" { let ?c = E.readAt(CK.registry, version, r) else return "e=Undecodable"; TC.cOut(Cu.submit(cs, auth, now, role, c, null, justification)) };
+      // the register composed with the book: a leg is admitted against the book's settlement root (SPEC §19)
+      case "custody" { let ?c = E.readAt(CK.registry, version, r) else return "e=Undecodable"; TC.cOut(Cu.submitWith(cs, auth, func(n : Nat) : ?Blob { Bk.settlementRootAt(bs, n) }, now, role, c, null, justification)) };
       case "exchange" { let ?c = E.readAt(XK.registry, version, r) else return "e=Undecodable"; XTC.xOut(X.submit(xs, auth, now, role, c, null, justification)) };
       case "book" { let ?c = E.readAt(BK.registry, version, r) else return "e=Undecodable"; BTC.bOut(Bk.submit(bs, xs, auth, now, role, c, null, justification)) };
       case "surveillance" { let ?c = E.readAt(SvK.registry, version, r) else return "e=Undecodable"; SvT.sOut(Sv.submit(ss, bs, xs, auth, now, role, c, null, justification)) };
