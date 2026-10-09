@@ -17,12 +17,14 @@ import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Principal "mo:core/Principal";
 import Text "mo:core/Text";
+import Runtime "mo:core/Runtime";
 import C "mo:kernel/codec/Canonical";
 import E "mo:kernel/domain/Encoding";
 import DL "mo:kernel/domain/DomainLog";
 import Perm "mo:kernel/auth/Permissions";
 import Auth "mo:kernel/auth/AuthTypes";
 import CivilDate "mo:kernel/num/CivilDate";
+import Cal "mo:kernel/time/Calendar";
 import RS "mo:kernel/rows/RowStore";
 import Page "mo:kernel/rows/Page";
 import Sha256 "mo:sha2/Sha256";
@@ -62,6 +64,16 @@ module {
     public let sharesB = Principal.fromText("rno2w-sqaaa-aaaaa-aaacq-cai");
     public let sharesC = Principal.fromText("qoctq-giaaa-aaaaa-aaaea-cai");
     public let cash = Principal.fromText("rkp4c-7iaaa-aaaaa-aaaca-cai");
+    /// The ledgers of the instrument classes (SPEC §28 to §32, made by `openClasses`): a bond, a fund's units, a graded
+    /// commodity's receipts, a carbon certificate, rights on instrument 1.
+    func classLedger(k : Nat8) : Principal { Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x70 + k, 0x01, 0x01])) };
+    public let bondL = classLedger(1);
+    public let fundL = classLedger(2);
+    public let wheatL = classLedger(3);
+    public let carbonL = classLedger(4);
+    public let rightL = classLedger(5);
+    public let bond2L = classLedger(6);
+    public let bond3L = classLedger(7);
     /// The trader of the venue's central counterparty (member 3, made by `openClearing`).
     public let t5 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x01, 0x01]));
     /// The trader of a third clearing firm (member 4, made by `openClearing`).
@@ -70,17 +82,22 @@ module {
     public let roles : [(Text, Principal)] = [("operator", operator), ("director1", director1), ("director2", director2), ("stranger", stranger), ("scheduler", scheduler),
       ("t1", t1), ("t2", t2), ("t3", t3), ("t4", t4), ("depository", depository), ("clearer", clearer), ("t5", t5), ("t6", t6)];
     public func roleName(p : Principal) : Text { for ((n, q) in roles.vals()) { if (peq(p, q)) return n }; Principal.toText(p) };
-    public func ledgerName(p : Principal) : Text { if (peq(p, cash)) "cash" else if (peq(p, sharesA)) "sharesA" else if (peq(p, sharesB)) "sharesB" else if (peq(p, sharesC)) "sharesC" else if (Principal.toText(p) == "qjdve-lqaaa-aaaaa-aaaeq-cai") "sharesD" else Principal.toText(p) };
+    public func ledgerName(p : Principal) : Text {
+      if (peq(p, cash)) "cash" else if (peq(p, sharesA)) "sharesA" else if (peq(p, sharesB)) "sharesB" else if (peq(p, sharesC)) "sharesC" else if (Principal.toText(p) == "qjdve-lqaaa-aaaaa-aaaeq-cai") "sharesD"
+      else if (peq(p, bondL)) "bond" else if (peq(p, fundL)) "fund" else if (peq(p, wheatL)) "wheat" else if (peq(p, carbonL)) "carbon" else if (peq(p, rightL)) "rights" else if (peq(p, bond2L)) "bond2" else if (peq(p, bond3L)) "bond3" else Principal.toText(p)
+    };
     public func isTrader(p : Principal) : Bool { peq(p, t1) or peq(p, t2) or peq(p, t3) or peq(p, t4) or peq(p, t5) or peq(p, t6) };
 
     public let schedulerActs = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire",
       "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call",
-      "book.statements.seal", "book.maker.settle"];
+      "book.statements.seal", "book.maker.settle", "book.bond.valuedate"];
     public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
-      "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote"];
+      "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
+      "book.certificate.retire", "book.right.exercise"];
     public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift",
       "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
-      "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply"];
+      "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply",
+      "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel"];
     public func among(xs : [Text], x : Text) : Bool { Array.find<Text>(xs, func(y) { y == x }) != null };
     public func hasGrant(p : Principal, perm : Text) : Bool {
       if (peq(p, operator)) return (Text.startsWith(perm, #text "exchange.") and perm != "exchange.segment.advance" and perm != "exchange.instrument.reference") or among(operatorBookActs, perm);
@@ -121,6 +138,33 @@ module {
     /// The levies' accounts (SPEC §22): the exchange's (21), the depository's (22) and the regulator's (23), accounts of
     /// the venue's member 3, opened after `openClearing`; their facts printed for the reference.
     public var leviesOpen = false;
+    /// The instrument classes' instruments (SPEC §28 to §32): listed by the exchange once (instruments 5 to 11, each on a
+    /// ledger of its own) and opened in run `r` under four eyes, closed, without terms. 5, 10 and 11 bonds quoted in
+    /// thousandths of a percent of face, 6 a fund's units, 7 graded wheat's receipts (lot 1 tonne), 8 carbon certificates,
+    /// 9 rights on instrument 1.
+    var classesListed = false;
+    public let classList : [(Nat, Text, Principal, Nat, Nat)] = [(5, "XS0TESTE0051", bondL, 1, 98_500), (6, "XS0TESTF0068", fundL, 1, 10_250),
+      (7, "XS0TESTG0075", wheatL, 1, 15_000), (8, "XS0TESTH0082", carbonL, 1, 2_500), (9, "XS0TESTI0099", rightL, 1, 1_200),
+      (10, "XS0TESTJ0106", bond2L, 1, 99_000), (11, "XS0TESTK0111", bond3L, 1, 101_250)];
+    public func openClasses(r : Run) {
+      if (not classesListed) {
+        classesListed := true;
+        for ((i, isin, l, lot, ref) in classList.vals()) {
+          xgovern(#listInstrument({ isin; name = "Test class instrument " # Nat.toText(i); segment = 1; currency = "EGP"; assetLedger = l; cashLedger = cash; tickTable = 1; lot; referencePrice = ref; day = today() }), "instrument " # Nat.toText(i));
+          Debug.print("H|ledger|" # ledgerName(l) # "|" # TR.hex(Principal.toBlob(l)));
+          switch (X.instrument(xs, i)) { case (?x) Debug.print("H|xinstrument|" # Nat.toText(i) # "|1|" # ledgerName(x.assetLedger) # "|" # ledgerName(x.cashLedger) # "|" # Nat.toText(x.lot) # "|" # Nat.toText(x.referencePrice)); case null check(false, "a class instrument listed") };
+          for ((nm, p) in roles.vals()) Debug.print("H|may|" # nm # "|" # Nat.toText(i) # "|" # (switch (X.mayTrade(xs, p, i)) { case (?e) Nat.toText(XText.code(e)); case null "0" }));
+        };
+      };
+      for ((i, _, l, lot, ref) in classList.vals()) {
+        ignore tick();
+        switch (govern(r, #openInstrument({ instrument = i; assetLedger = l; cashLedger = cash; lot; referencePrice = ref; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }))) {
+          case (#ok(#executed(x))) check(x.effects == [1, i], "class instrument " # Nat.toText(i) # " opened");
+          case (o) check(false, "class instrument " # Nat.toText(i) # ": " # debug_show(o));
+        };
+        Map.add(r.track, Nat.compare, i, { var ref = ref; var last = 0; var close = 0; var phase = #closed : T.Phase });
+      };
+    };
     public func openLevies() {
       openClearing();
       if (leviesOpen) return;
@@ -290,9 +334,25 @@ module {
         case (#reviewIndex(x)) "k=reviewIndex;index=" # n(x.index) # ";constituents=" # constituentsText(x.constituents);
         case (#corporateAction(x)) "k=corporateAction;instrument=" # n(x.instrument) # (switch (x.action) { case (#split(a)) ";kind=split;num=" # n(a.num) # ";den=" # n(a.den); case (#dividend(a)) ";kind=dividend;amount=" # n(a.amount) }) # ";reference=" # TR.hex(x.reference);
         case (#tripBreaker(x)) "k=tripBreaker;index=" # n(x.index);
+        case (#setTerms(x)) "k=setTerms;instrument=" # n(x.instrument) # ";" # termsText(x.terms);
+        case (#defineNav(x)) "k=defineNav;instrument=" # n(x.instrument) # ";units=" # n(x.units) # ";cash=" # n(x.cash) # ";constituents=" # constituentsText(x.basket);
+        case (#issueReceipt(x)) "k=issueReceipt;warehouse=" # n(x.warehouse) # ";instrument=" # n(x.instrument) # ";account=" # n(x.account) # ";member=" # n(x.member) # ";qty=" # n(x.qty) # ";reference=" # TR.hex(x.reference);
+        case (#cancelReceipt(x)) "k=cancelReceipt;receipt=" # n(x.receipt) # ";account=" # n(x.account) # ";member=" # n(x.member);
+        case (#retire(x)) "k=retire;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";instrument=" # n(x.instrument) # ";qty=" # n(x.qty) # ";beneficiary=" # TR.hex(x.beneficiary);
+        case (#exercise(x)) "k=exercise;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";instrument=" # n(x.instrument) # ";qty=" # n(x.qty);
+        case (#valueDate(x)) "k=valueDate;instrument=" # n(x.instrument) # ";day=" # n(x.day);
       }
     };
     public func joinText(xs : [Text]) : Text { var o = ""; for (x in xs.vals()) o := o # (if (o == "") "" else ",") # x; o };
+    /// An instrument's terms as the reference reads them (SPEC §28).
+    public func termsText(t : T.Terms) : Text {
+      switch (t) {
+        case (#bond(b)) "cls=bond;coupon=" # n(b.couponBps) # ";perYear=" # n(b.perYear) # ";basis=" # n(Nat8.toNat(K.basisCode(b.basis))) # ";maturity=" # n(b.maturity) # ";settleDays=" # n(b.settleDays);
+        case (#receipt(r)) "cls=receipt;warehouses=" # joinText(Array.map<Nat, Text>(r.warehouses, n));
+        case (#certificate(c)) "cls=certificate;registry=" # TR.hex(c.registry);
+        case (#right(r)) "cls=right;underlying=" # n(r.underlying) # ";price=" # n(r.price) # ";num=" # n(r.num) # ";den=" # n(r.den) # ";deadline=" # n(r.deadline) # ";issuer=" # n(r.issuer) # ";issuerMember=" # n(r.issuerMember);
+      }
+    };
     public func constituentsText(cs : [T.Constituent]) : Text { joinText(Array.map<T.Constituent, Text>(cs, func(c) { n(c.instrument) # ":" # n(c.shares) })) };
     public func quoteText(q : T.QuoteSide) : Text { n(q.instrument) # ":" # n(q.bidPrice) # ":" # n(q.askPrice) # ":" # n(q.qty) # ":" # q.ref };
     public func outText(r : B.Result<B.Outcome>) : Text {
@@ -359,7 +419,27 @@ module {
     public func saw(what : Text) { Map.add(seen, Text.compare, what, (switch (Map.get(seen, Text.compare, what)) { case (?k) k; case null 0 }) + 1) };
     public func seenCount(what : Text) : Nat { switch (Map.get(seen, Text.compare, what)) { case (?k) k; case null 0 } };
 
-    public func ledgerOf(i : Nat, side : T.Side) : Principal { switch (side) { case (#buy) cash; case (#sell) (if (i == 1) sharesA else sharesB) } };
+    public func ledgerOf(i : Nat, side : T.Side) : Principal {
+      switch (side) {
+        case (#buy) cash;
+        case (#sell) {
+          if (i == 1) return sharesA;
+          if (i == 2) return sharesB;
+          for ((k, _, l, _, _) in classList.vals()) { if (k == i) return l };
+          Runtime.trap("ledgerOf: an instrument the battery does not open")
+        };
+      }
+    };
+    /// The units the classes bring into the book and take out of it (SPEC §28 to §32): a receipt issued or cancelled, a
+    /// certificate retired, rights exercised.
+    func classTotals(r : Run, c : T.Command) {
+      switch (c) {
+        case (#issueReceipt(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, x.qty); case null {} } };
+        case (#cancelReceipt(x)) { switch (B.receiptOf(r.st, x.receipt)) { case (?rc) { switch (B.instrument(r.st, rc.instrument)) { case (?i) addTotal(r, i.assetLedger, -rc.qty); case null {} } }; case null {} } };
+        case (#retire(x) or #exercise(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, -x.qty); case null {} } };
+        case (_) {};
+      }
+    };
     public func addTotal(r : Run, l : Principal, d : Int) { let k = ledgerName(l); Map.add(r.totals, Text.compare, k, (switch (Map.get(r.totals, Text.compare, k)) { case (?v) v; case null 0 }) + d) };
 
     /// The clears recorded since the last look, examined: no pair of one account; every pair at the clear's price, within
@@ -536,7 +616,7 @@ module {
     /// (`integration/feed_book.py`) computes the same from the feed alone.
     public func visibleDigest(r : Run) : Blob {
       let w = C.Writer(); w.text("thebes.book.visible.v1");
-      for (i in Nat.range(1, 9)) {
+      for (i in r.st.instrumentList.vals()) {
         switch (B.instrument(r.st, i)) {
           case (?x) {
             let live = Map.empty<Nat, T.Order>();
@@ -586,6 +666,7 @@ module {
             case (#borrow(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, x.qty); case null {} } };
             case (#returnBorrow(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, -x.qty); case null {} } };
             case (#placeOrder(_)) { if (x.effects.size() > 5) saw("own orders cancelled at entry"); if (x.effects[2] == 4) saw("incoming orders cancelled with the resting") };
+            case (#retire(_) or #exercise(_)) classTotals(r, c);
             case (#settleCycle(_)) {
               let e = x.effects; let nOut = e[2];
               for (j in Nat.range(0, nOut)) { if (e[4 + 3 * j] == 2) saw("cycle fails") };
@@ -622,7 +703,7 @@ module {
         case (#ok(#proposed(p))) {
           let a = bapp(r, director1, p.proposal);
           line("A|" # Nat64.toText(now) # "|director1|" # n(p.proposal) # "|" # outText(a));
-          switch (a) { case (#ok(#executed(_))) saw("executed " # K.familyOf(c)); case (#err(_)) saw("refused at approval " # TR.errName(debug_show(a))); case (_) {} };
+          switch (a) { case (#ok(#executed(_))) { saw("executed " # K.familyOf(c)); classTotals(r, c) }; case (#err(_)) saw("refused at approval " # TR.errName(debug_show(a))); case (_) {} };
           feedOut(r);
           scanClears(r);
           a
@@ -686,12 +767,12 @@ module {
           case (?o) {
             if ((o.status == #live or o.status == #waiting) and id < firstOpen) firstOpen := id;
             Debug.print("O|" # n(id) # "|" # n(Nat8.toNat(K.statusCode(o.status))) # "|" # n(o.remaining) # "|" # n(o.filled) # "|" # n(o.held) # "|" # Nat64.toText(o.prio) # "|" # n(o.price) # "|" # n(o.stopPrice) # "|" # n(Nat8.toNat(K.capacityCode(o.capacity))) # "|" # (if (o.shortSale) "1" else "0") # "|" # n(o.trail) # "|" # n(o.member) # "|" # n(o.trader));
-            if (o.status == #live or o.status == #waiting) Map.add(useByMember, Nat.compare, o.member, (switch (Map.get(useByMember, Nat.compare, o.member)) { case (?v) v; case null 0 }) + o.price * o.remaining);
+            if (o.status == #live or o.status == #waiting) Map.add(useByMember, Nat.compare, o.member, (switch (Map.get(useByMember, Nat.compare, o.member)) { case (?v) v; case null 0 }) + B.openValueOf(r.st, o));
             if (o.status == #live or o.status == #waiting) {
               // a clearing order holds nothing on its account: a buy's margin is its member's, a sale's shares the custody's
               switch (B.clearingOf(r.st, o.account)) {
                 case (?m) {
-                  if (o.side == #buy) { addTo(imByMember, n(m), o.held); addTo(committedBy, "all", o.price * o.remaining) }
+                  if (o.side == #buy) { addTo(imByMember, n(m), o.held); addTo(committedBy, "all", B.openValueOf(r.st, o)) }
                   else addTo(custodyHeld, n(m) # "/" # n(o.instrument), o.held);
                 };
                 case null {
@@ -798,6 +879,23 @@ module {
       };
       k := 1;
       while (k < r.st.nextPath) { switch (B.pathOf(r.st, k)) { case (?x) Debug.print("IP|" # n(x.index) # "|" # n(x.block) # "|" # n(x.level)); case null {} }; k += 1 };
+      // instrument classes (SPEC §28 to §32): terms, iNAVs and their path, value dates, receipts, retirements,
+      // entitlements, and every ledger's units in the book
+      for (i in r.st.instrumentList.vals()) {
+        switch (B.termsOf(r.st, i)) { case (?t) Debug.print("TM|" # n(i) # "|" # termsText(t)); case null {} };
+        switch (B.navOf(r.st, i)) { case (?v) Debug.print("NV|" # n(i) # "|" # n(v.units) # "|" # n(v.cash) # "|" # n(v.inav)); case null {} };
+        let vd = B.valueDateOf(r.st, i); if (vd != 0) Debug.print("VD|" # n(i) # "|" # n(vd));
+      };
+      k := 1;
+      while (k < r.st.nextNavPath) { switch (B.navPathOf(r.st, k)) { case (?x) Debug.print("NP|" # n(x.index) # "|" # n(x.block) # "|" # n(x.level)); case null {} }; k += 1 };
+      k := 1;
+      while (k < r.st.nextReceipt) { switch (B.receiptOf(r.st, k)) { case (?x) Debug.print("RC|" # n(k) # "|" # n(x.warehouse) # "|" # n(x.instrument) # "|" # n(x.account) # "|" # n(x.qty) # "|" # (if (x.live) "1" else "0") # "|" # TR.hex(x.reference)); case null {} }; k += 1 };
+      k := 1;
+      while (k < r.st.nextRetire) { switch (B.retirementOf(r.st, k)) { case (?x) Debug.print("RT|" # n(k) # "|" # n(x.account) # "|" # n(x.instrument) # "|" # n(x.qty) # "|" # TR.hex(x.beneficiary)); case null {} }; k += 1 };
+      k := 1;
+      while (k < r.st.nextEntitlement) { switch (B.entitlementOf(r.st, k)) { case (?x) Debug.print("EN|" # n(k) # "|" # n(x.account) # "|" # n(x.instrument) # "|" # n(x.rights) # "|" # n(x.shares) # "|" # n(x.paid)); case null {} }; k += 1 };
+      k := 1;
+      while (k < r.st.nextSupply) { switch (RS.get(r.st.supplyStore, B.supplyRows, k)) { case (?x) Debug.print("SU|" # ledgerName(x.ledger) # "|" # n(x.units)); case null {} }; k += 1 };
       let (legs, root) = B.settlementRoot(r.st);
       Debug.print("M|" # n(legs) # "|" # TR.hex(root));
       // inclusion proofs of the range's first and last legs verify against the root; a proof against another leg does not
@@ -912,7 +1010,8 @@ module {
       // (the clearing's four-eyes acts are listed with the book's)
       switch (c) {
         case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #setClearing(_) or #setMargin(_) or #admitClearing(_)
-          or #designateClearing(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_) or #setFeeSchedule(_) or #registerMaker(_) or #defineIndex(_) or #reviewIndex(_) or #corporateAction(_)) true;
+          or #designateClearing(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_) or #setFeeSchedule(_) or #registerMaker(_) or #defineIndex(_) or #reviewIndex(_) or #corporateAction(_)
+          or #setTerms(_) or #defineNav(_) or #issueReceipt(_) or #cancelReceipt(_)) true;
         case (_) false
       }
     };
@@ -924,6 +1023,8 @@ module {
       if (B.clearingTerms(r.st) != null and rnd(5) == 0) return randomClearing(r);
       // the makers' quotes, statements and reconciliations (SPEC §22 to §25), on a run with makers, one in four
       if (r.st.nextMaker > 1 and rnd(4) == 0) return randomMarkets(r);
+      // the classes' acts (SPEC §28 to §32), on a run with them, one in three
+      if (B.termsOf(r.st, 5) != null and rnd(3) == 0) return randomClasses(r);
       // the indices' acts (SPEC §26, §27), on a run with an index, one in six
       if (B.indexRowOf(r.st, 1) != null and rnd(6) == 0) return randomIndex(r);
       // securities loans and insider blackouts (SPEC §16, §17), now and then
@@ -1131,6 +1232,89 @@ module {
         constituents = if (rnd(5) == 0) [{ instrument = 1 + rnd(4); shares = rnd(100) }] else [{ instrument = 1; shares = 1 + rnd(3_000) }, { instrument = 2; shares = 1 + rnd(5_000_000) }] }));
       if (x < 85) return (scheduler, #tripBreaker({ index = 1 }));
       (operator, #resume({ instrument = inst }))
+    };
+    /// The market day `days` business days after today by the exchange's calendar: a bond's value date (SPEC §28).
+    public func valueDay(days : Nat) : Nat {
+      var d = today(); var k = 0;
+      while (k < days) { d += 1; while (not Cal.isBusinessDay(X.calendarFor(xs, d), d)) d += 1; k += 1 };
+      d
+    };
+    /// A run with the instrument classes (SPEC §28 to §32): the three bonds' terms, value dates and margins, the fund's
+    /// iNAV, wheat receipts issued, carbon certificates and rights deposited, every class instrument trading.
+    public func classesRun(r : Run) {
+      openClasses(r);
+      let today_ = today();
+      ignore govern(r, #setTerms({ instrument = 5; terms = #bond({ couponBps = 500 + rnd(2_000); perYear = 2; basis = #act365; maturity = today_ + 400 + rnd(3_000); settleDays = 1 }) }));
+      ignore govern(r, #setTerms({ instrument = 10; terms = #bond({ couponBps = 500 + rnd(2_000); perYear = 1; basis = #thirty360; maturity = today_ + 400 + rnd(3_000); settleDays = rnd(3) }) }));
+      ignore govern(r, #setTerms({ instrument = 11; terms = #bond({ couponBps = 500 + rnd(2_000); perYear = 4; basis = #actActIcma; maturity = today_ + 400 + rnd(3_000); settleDays = 1 }) }));
+      ignore govern(r, #defineNav({ instrument = 6; units = 100 + rnd(2_000); cash = rnd(1_000_000); basket = [{ instrument = 1; shares = 1 + rnd(200) }, { instrument = 2; shares = 1 + rnd(3_000) }, { instrument = 5; shares = 1 + rnd(50) }] }));
+      ignore govern(r, #setTerms({ instrument = 7; terms = #receipt({ warehouses = [3, 7] }) }));
+      ignore govern(r, #setTerms({ instrument = 8; terms = #certificate({ registry = bytes(0x20, 32) }) }));
+      ignore govern(r, #setTerms({ instrument = 9; terms = #right({ underlying = 1; price = 70_000; num = 1; den = 5; deadline = today_ + 2 + rnd(3); issuer = 9; issuerMember = 2 }) }));
+      if (B.clearingTerms(r.st) != null) { for (i in [5, 10, 11, 6, 7, 8, 9].vals()) ignore govern(r, #setMargin({ instrument = i; imBps = 500 + rnd(2_000) })) };
+      for (i in [5, 10, 11].vals()) { switch (B.termsOf(r.st, i)) { case (?#bond(b)) ignore act(r, scheduler, #valueDate({ instrument = i; day = valueDay(b.settleDays) })); case (_) {} } };
+      for (a in [2, 3, 5, 6, 10, 11, 13, 14].vals()) {
+        ignore tick();
+        for (l in [bondL, bond2L, bond3L, fundL, carbonL, rightL].vals()) deposit(r, a, l, 20 + rnd(200));
+        r.depSeq += 1;
+        ignore govern(r, #issueReceipt({ warehouse = if (rnd(2) == 0) 3 else 7; instrument = 7; account = a; member = memberOf(a); qty = 10 + rnd(200); reference = depRef(r.depSeq + streams * 1_000_000) }));
+      };
+      ignore tick();
+      for (i in [5, 6, 7, 8, 9, 10, 11].vals()) ignore act(r, scheduler, #setTrading({ instrument = i; open = true }));
+    };
+    /// A random act of the classes: orders on their instruments, the bonds' value dates (now and then a wrong one), receipts
+    /// issued (now and then by a warehouse not licensed) and cancelled out of a random account, certificates retired, rights
+    /// exercised (now and then for a part of a share, or past the deadline).
+    public func randomClasses(r : Run) : (Principal, T.Command) {
+      let x = rnd(100);
+      let inst = classList[rnd(classList.size())].0;
+      if (x < 55) {
+        let who = pickTrader(); let account = accountFor(who);
+        let ref = refOf(r, inst);
+        let tick_ = if (ref >= 2_000) 10 else 1;
+        let price = (if (rnd(2) == 0) ref + tick_ * rnd(20) else ref - tick_ * rnd(20)) / tick_ * tick_;
+        r.refSeq += 1;
+        return (who, lim(account, inst, if (rnd(2) == 0) #buy else #sell, 1 + rnd(30), price, "k" # n(r.refSeq) # "-" # n(streams)));
+      };
+      if (x < 70) {
+        let b = [5, 10, 11][rnd(3)];
+        let d = switch (B.termsOf(r.st, b)) { case (?#bond(t)) valueDay(t.settleDays); case (_) today() };
+        return (scheduler, #valueDate({ instrument = b; day = if (rnd(10) == 0) d + 1 else d }));
+      };
+      if (x < 78) {
+        let a = [2, 3, 5, 6, 10, 11, 13, 14][rnd(8)];
+        r.depSeq += 1;
+        return (operator, #issueReceipt({ warehouse = [3, 7, 5][rnd(3)]; instrument = 7; account = a; member = memberOf(a); qty = 1 + rnd(100); reference = depRef(r.depSeq + streams * 1_000_000) }));
+      };
+      if (x < 86) {
+        let a = [2, 3, 5, 6, 10, 11, 13, 14][rnd(8)];
+        return (operator, #cancelReceipt({ receipt = 1 + rnd(Nat.max(1, r.st.nextReceipt)); account = a; member = memberOf(a) }));
+      };
+      if (x < 93) {
+        let who = pickTrader(); let account = accountFor(who);
+        return (who, #retire({ account; member = memberOf(account); trader = traderIdOf(who); instrument = if (rnd(8) == 0) 5 else 8; qty = 1 + rnd(40); beneficiary = bytes(0x21, 32) }));
+      };
+      let who = pickTrader(); let account = accountFor(who);
+      (who, #exercise({ account; member = memberOf(account); trader = traderIdOf(who); instrument = 9; qty = 5 * (1 + rnd(10)) + (if (rnd(6) == 0) 1 else 0) }))
+    };
+    /// `count` random streams on books with the instrument classes, clearing half of them: the classes' acts among every
+    /// other command of the book, the bonds settling accrued interest under every day count, pre-funded and novated.
+    public func classesStreams(first : Nat, count : Nat, steps : Nat) : (Nat, Nat) {
+      var commands = 0; var replays = 0;
+      for (k in Nat.range(first, first + count)) {
+        seed := seed ^ Nat64.fromNat(0xC5_0000 + k);
+        let r = newRun(false);
+        let clearing = k % 2 == 0;
+        clearingBias := clearing;
+        for (a in [2, 3, 5, 6, 10 + rnd(2), 13, 14].vals()) { ignore tick(); deposit(r, a, cash, 50_000_000 + rnd(200_000_000)); deposit(r, a, sharesA, 100 * (1 + rnd(30))); deposit(r, a, sharesB, 10 * (1 + rnd(400))) };
+        if (clearing) clearingRun(r);
+        classesRun(r);
+        ignore tick(); ignore act(r, scheduler, #setTrading({ instrument = 1; open = true })); ignore act(r, scheduler, #setTrading({ instrument = 2; open = true }));
+        randomStream(r, steps, 250, true); commands += steps;
+        clearingBias := false;
+        if (replayed(r)) replays += 1 else check(false, "classes stream " # n(k) # " replay");
+      };
+      (commands, replays)
     };
     /// `count` random streams on books with indices: the breaker trips on the stream's own prices, halts every book, and
     /// the stream's recovery resumes them (a suspension only after the day's seal).

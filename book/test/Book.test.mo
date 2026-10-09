@@ -64,7 +64,7 @@ check(not Perm.clean(Perm.validate(missingOne, B.commandNames, B.methodNames)), 
 for ((id, reason) in B.singleActs().vals()) { switch (Perm.byId(cat, id)) { case (?p) check(not p.dualByDefault and reason.size() > 40, "single act " # id # " has its reason"); case null check(false, "single act " # id # " exists") } };
 for (p in cat.vals()) { if (not p.dualByDefault and Text.startsWith(p.id, #text "book.")) check(Array.find<(Text, Text)>(B.singleActs(), func(x) { x.0 == p.id }) != null, "single permission " # p.id # " has its reason recorded") };
 check(B.checkSums(), "row widths hold their fields");
-check(K.families.size() == 51, "fifty-one command families");
+check(K.families.size() == 58, "fifty-eight command families");
 Debug.print("count: catalogue rows validated in both directions = " # Nat.toText(report.checked));
 
 let sampleCommands : [T.Command] = [
@@ -100,6 +100,16 @@ let sampleCommands : [T.Command] = [
   #reviewIndex({ index = 1; constituents = [{ instrument = 2; shares = 25_000_000 }] }),
   #corporateAction({ instrument = 2; action = #split({ num = 3; den = 2 }); reference = bytes(0x43, 32) }), #corporateAction({ instrument = 1; action = #dividend({ amount = 5_000 }); reference = bytes(0x44, 32) }),
   #tripBreaker({ index = 1 }),
+  // the instrument classes (SPEC §28 to §32)
+  #setTerms({ instrument = 5; terms = #bond({ couponBps = 1_850; perYear = 2; basis = #act365; maturity = 21_564; settleDays = 1 }) }),
+  #setTerms({ instrument = 7; terms = #receipt({ warehouses = [3, 7] }) }), #setTerms({ instrument = 8; terms = #certificate({ registry = bytes(0x20, 32) }) }),
+  #setTerms({ instrument = 9; terms = #right({ underlying = 1; price = 70_000; num = 1; den = 5; deadline = 20_516; issuer = 9; issuerMember = 2 }) }),
+  #setTerms({ instrument = 10; terms = #bond({ couponBps = 1_175; perYear = 1; basis = #thirty360; maturity = 22_157; settleDays = 1 }) }),
+  #setTerms({ instrument = 11; terms = #bond({ couponBps = 2_000; perYear = 4; basis = #actActIcma; maturity = 21_335; settleDays = 0 }) }),
+  #defineNav({ instrument = 6; units = 1_000; cash = 500_500; basket = [{ instrument = 1; shares = 100 }, { instrument = 2; shares = 2_000 }] }),
+  #issueReceipt({ warehouse = 3; instrument = 7; account = 10; member = 2; qty = 50; reference = bytes(0x10, 32) }), #cancelReceipt({ receipt = 1; account = 2; member = 1 }),
+  #retire({ account = 10; member = 2; trader = 3; instrument = 8; qty = 40; beneficiary = bytes(0x21, 32) }),
+  #exercise({ account = 2; member = 1; trader = 1; instrument = 9; qty = 120 }), #valueDate({ instrument = 5; day = 20_515 }),
 ];
 var roundTrips = 0;
 for (c in sampleCommands.vals()) {
@@ -580,7 +590,7 @@ Debug.print("count: icebergs that traded on the main book = " # n(icebergsFilled
 printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "own orders cancelled at entry", "incoming orders cancelled with the resting",
   "amendments keeping priority", "amendments taking a new priority", "uncrossed books checked", "checkpoints", "call-phase reads checked", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "uncrosses outside the static band, the auction continuing", "feed digests printed", "icebergs shown after a clear", "days sealed"]);
 // the clearing's families (SPEC §18 to §21, tags 27 to 40) are the clearing battery's, §22 to §25's (41 to 47) the markets
-// battery's, and §26 to §27's (48 to 51) the index battery's
+// battery's, §26 to §27's (48 to 51) the index battery's, and §28 to §32's (52 to 58) the instruments battery's
 for (f in Array.sliceToArray<Text>(K.families, 0, 26).vals()) { if (f != "openInstrument" and f != "clear") Debug.print("count: executed " # f # " = " # n(seenCount("executed " # f))) };
 var refusalNames = 0;
 for ((k, _) in Map.entries(seen)) { if (Text.startsWith(k, #text "refused ")) refusalNames += 1 };
