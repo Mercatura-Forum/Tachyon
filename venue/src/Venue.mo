@@ -56,7 +56,7 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   S.setPolicies(ss, duals(S.catalogue()));
 
   let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "surv.scan", "surv.report.seal",
-    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle", "book.bond.valuedate"];
+    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle", "book.bond.valuedate", "book.derivatives.settle"];
   let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
     "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
     "book.certificate.retire", "book.right.exercise"];
@@ -64,7 +64,7 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
     "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
     "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply",
-    "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel"];
+    "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel", "book.attestors.set"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -74,6 +74,8 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     if (Principal.equal(p, init.operator)) return (Text.startsWith(perm, #text "exchange.") and not among(schedulerActs, perm)) or among(operatorBookActs, perm);
     if (Principal.equal(p, Principal.fromActor(this))) return perm == "book.auction.uncross";
     if (Principal.equal(p, init.scheduler)) return among(schedulerActs, perm);
+    // the price attestors are the three principals the book registered under four eyes (SPEC §33)
+    for (k in [1, 2, 3].vals()) { switch (B.attestorOf(bs, k)) { case (?a) { if (Principal.equal(a, p)) return perm == "book.price.attest" }; case null {} } };
     if (isDirector(p)) return perm == "command.approve" or perm == "command.reject";
     if (Principal.equal(p, init.depository)) return perm == "book.funds.deposit" or perm == "book.borrow.record";
     if (Principal.equal(p, init.analyst)) return perm == "surv.case.open" or perm == "surv.case.note";
@@ -317,6 +319,18 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
       };
       case null #err("NotYours");
     }
+  };
+  // ─── derivatives (SPEC §33 to §35) ──────────────────────────────────────────────────────────
+  /// A derivative's settlement state and the attested price for a market day (0 until all three attested): public, the
+  /// prices the venue settles at.
+  public query func derivative(instrument : Nat, day : Nat) : async ?{ state : B.Deriv; attested : Nat } {
+    switch (B.derivOf(bs, instrument)) { case (?d) ?{ state = d; attested = switch (B.attestedPrice(bs, instrument, day)) { case (?p) p; case null 0 } }; case null null }
+  };
+  /// An account's position in a derivative, to a trader of the account's member; nothing to anyone else. An update: a
+  /// query's caller is not authenticated.
+  public shared (msg) func myPosition(account : Nat, instrument : Nat) : async ?B.Position {
+    if (not ownsAccount(msg.caller, account)) return null;
+    switch (B.positionOf(bs, account, instrument)) { case (?(_, p)) ?p; case null null }
   };
   /// The settlement range's leaf count and root (SPEC §19): public, a hash that names nothing.
   public query func settlementRoot() : async { legs : Nat; root : Blob } { let (legs, root) = B.settlementRoot(bs); { legs; root } };
