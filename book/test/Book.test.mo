@@ -64,7 +64,7 @@ check(not Perm.clean(Perm.validate(missingOne, B.commandNames, B.methodNames)), 
 for ((id, reason) in B.singleActs().vals()) { switch (Perm.byId(cat, id)) { case (?p) check(not p.dualByDefault and reason.size() > 40, "single act " # id # " has its reason"); case null check(false, "single act " # id # " exists") } };
 for (p in cat.vals()) { if (not p.dualByDefault and Text.startsWith(p.id, #text "book.")) check(Array.find<(Text, Text)>(B.singleActs(), func(x) { x.0 == p.id }) != null, "single permission " # p.id # " has its reason recorded") };
 check(B.checkSums(), "row widths hold their fields");
-check(K.families.size() == 22, "twenty-two command families");
+check(K.families.size() == 26, "twenty-six command families");
 Debug.print("count: catalogue rows validated in both directions = " # Nat.toText(report.checked));
 
 let sampleCommands : [T.Command] = [
@@ -79,6 +79,8 @@ let sampleCommands : [T.Command] = [
   #setPhase({ instrument = 1; phase = #auction; endFrom = 1_772_445_600_000_000_000; endTo = 1_772_446_200_000_000_000 }), #setPhase({ instrument = 2; phase = #tradeAtClose; endFrom = 0; endTo = 0 }),
   #uncross({ instrument = 1; next = #continuous }), #halt({ instrument = 1; reason = "pending disclosure" }), #resume({ instrument = 1 }),
   #kill({ member = 2; trader = 0; reason = "the member's risk desk" }), #kill({ member = 2; trader = 3; reason = "a runaway algorithm" }), #killSweep({ kill = 1; limit = 500 }), #sealDay({ day = 20_514 }),
+  #setBlackout({ instrument = 1; client = bytes(0x42, 32); until = 0; reason = "a director of the issuer" }), #liftBlackout({ blackout = 1 }),
+  #borrow({ account = 4; member = 1; instrument = 1; qty = 100; reference = bytes(9, 32) }), #returnBorrow({ account = 4; member = 1; instrument = 1; qty = 100 }),
   #revive({ kill = 1 }), #setLimits({ member = 1; maxOrderQty = 1_000; maxOrderValue = 90_000_000; creditLimit = 2_000_000_000 }),
 ];
 var roundTrips = 0;
@@ -159,7 +161,8 @@ refusedAs(m, t1, order(1, 1, #buy, #limit, 10, 85_000, 0, 0, #gtd, today() - 1, 
 refusedAs(m, t1, order(1, 1, #buy, #limit, 10, 85_000, 0, 0, #gtc, today(), #cancelResting, "x", 0), "e:InvalidTerms", "a date on an order not good till a date");
 refusedAs(m, t1, order(1, 1, #buy, #limit, 10, 85_000, 0, 0, #gtc, 0, #cancelResting, "x", 999), "e:InvalidOco", "a link to no order");
 refusedAs(m, t1, lim(1, 1, #buy, 10_000, 85_000, "x"), "e:InsufficientFunds", "a buy beyond the cash");
-refusedAs(m, t1, lim(1, 1, #sell, 5_010, 85_000, "x"), "e:InsufficientFunds", "a sell beyond the shares");
+refusedAs(m, t1, lim(1, 1, #sell, 5_010, 85_000, "x"), "e:ShortSaleNotFlagged", "a sell beyond the shares, not flagged short (SPEC §17)");
+refusedAs(m, t1, switch (lim(1, 1, #sell, 5_010, 86_000, "x")) { case (#placeOrder(o)) #placeOrder({ o with shortSale = true }); case (c) c }, "e:InsufficientFunds", "a short sale with no shares to deliver");
 ignore tick();
 let r1 = placed(m, lim(1, 1, #buy, 100, 84_000, "r1"));
 let r2 = placed(m, lim(2, 1, #sell, 100, 86_000, "r2"));
@@ -487,6 +490,44 @@ let byHand = Array.map<Nat8, Nat>(Blob.toArray(Sha256.fromArray(#sha256, fw.toAr
 scenario(seal2 == Array.concat<Nat>([22, day2, 2], byHand) and B.dayFile(m.st, day2) == ?fw.toBlob(), "the day's file is the one written by hand, its hash the seal's");
 scenario(B.dayFile(m.st, day2 + 1) == null and (switch (B.dayFile(m.st, day1)) { case (?f) Sha256.fromBlob(#sha256, f) == Blob.fromArray(Array.map<Nat, Nat8>(Array.sliceToArray<Nat>(seal1, 3, 35), Nat8.fromNat)); case null false }), "an earlier day's file kept, its hash its seal's; no file for a day not sealed");
 for (d in [day1, day2].vals()) { switch (B.dayFile(m.st, d)) { case (?f) w.line("Y|" # n(d) # "|" # TR.hex(f)); case null {} } };
+// insider blackouts (SPEC §16): account 2's client blacked out for instrument 1 until lifted, under four eyes
+ignore tick();
+let boId = switch (govern(m, #setBlackout({ instrument = 1; client = w.clientOf(2); until = 0; reason = "a director of the issuer" }))) { case (#ok(#executed(x))) x.effects[1]; case (_) 0 };
+scenario(boId > 0, "the blackout recorded under four eyes");
+refusedAs(m, t1, lim(2, 1, #buy, 10, 85_000, "s22a"), "e:InsiderBlackout", "an order of a blacked-out client");
+let bo3 = placed(m, lim(3, 1, #buy, 10, 85_000, "s22b"));
+let bo2 = placed(m, lim(2, 2, #buy, 1, 1_990, "s22c"));
+scenario(bo3 > 0 and bo2 > 0, "another client of the member, and the same client in another instrument, trade");
+refusedAs(m, operator, #setBlackout({ instrument = 1; client = w.clientOf(2); until = 0; reason = "again" }), "e:InvalidTerms", "a client blacked out twice");
+refusedAs(m, operator, #setBlackout({ instrument = 1; client = bytes(1, 31); until = 0; reason = "a short code" }), "e:InvalidTerms", "a client code not of 32 bytes");
+ignore tick();
+scenario(govern(m, #liftBlackout({ blackout = boId })) == #ok(#executed({ block = DL.length(m.st.log) - 1; effects = [24, boId] })), "lifted under four eyes");
+refusedAs(m, operator, #liftBlackout({ blackout = boId }), "e:UnknownBlackout", "a blackout lifted twice");
+let bo4 = placed(m, lim(2, 1, #buy, 10, 85_000, "s22d"));
+scenario(bo4 > 0, "lifted, the client trades");
+cancel(m, bo3); cancel(m, bo2); cancel(m, bo4);
+// short sales (SPEC §17): account 4 sells beyond the shares it owns only flagged short, at or above the last price, and
+// only with borrowed shares to deliver
+func shortSell(account : Nat, qty : Nat, price : Nat, ref : Text) : T.Command {
+  switch (lim(account, 1, #sell, qty, price, ref)) { case (#placeOrder(x)) #placeOrder({ x with shortSale = true }); case (c) c }
+};
+ignore tick();
+let free4 = avail(m, 4, sharesA);
+let over = (free4 / 10 + 1) * 10;
+refusedAs(m, t1, lim(4, 1, #sell, over, 86_000, "s23a"), "e:ShortSaleNotFlagged", "a sale beyond the shares owned, not flagged");
+ignore executes(m, depository, #borrow({ account = 4; member = 1; instrument = 1; qty = 100; reference = depRef(900_100) }), "borrow");
+scenario(B.owedOf(m.st, 4, 1) == 100 and avail(m, 4, sharesA) == free4 + 100, "100 borrowed: credited and owed");
+refusedAs(m, t1, lim(4, 1, #sell, over, 86_000, "s23b"), "e:ShortSaleNotFlagged", "borrowed shares are not owned: not flagged, still refused");
+let floor = switch (B.instrument(m.st, 1)) { case (?x) (if (x.lastPrice != 0) x.lastPrice else x.referencePrice); case null 0 };
+refusedAs(m, t1, shortSell(4, over, floor - 10, "s23c"), "e:ShortSalePrice", "a short sale below the last price");
+refusedAs(m, t1, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #market; qty = over; price = 0; stopPrice = 0; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = true; clientRef = "s23m"; oco = 0; trail = 0; member = 1; trader = 1 }), "e:ShortSalePrice", "a short sale with no limit");
+refusedAs(m, t1, #placeOrder({ account = 4; instrument = 1; side = #buy; kind = #limit; qty = 10; price = 80_000; stopPrice = 0; peak = 0; validity = #gtc; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = true; clientRef = "s23n"; oco = 0; trail = 0; member = 1; trader = 1 }), "e:InvalidTerms", "a buy flagged short");
+let sh = placed(m, shortSell(4, over, floor, "s23d"));
+scenario(sh > 0 and status(m, sh) == ?#live, "a short sale at the last price, delivered from the borrowed shares");
+refusedAs(m, t1, #amendOrder({ order = sh; qty = over; price = floor - 10 }), "e:ShortSalePrice", "an amendment of a short sale below the floor");
+cancel(m, sh);
+refusedAs(m, t1, #returnBorrow({ account = 4; member = 1; instrument = 1; qty = 110 }), "e:InvalidTerms", "a return beyond what is owed");
+scenario(executes(m, t1, #returnBorrow({ account = 4; member = 1; instrument = 1; qty = 100 }), "return") == [26, 4, 100] and B.owedOf(m.st, 4, 1) == 0 and avail(m, 4, sharesA) == free4, "returned: nothing owed, the account's own shares as before");
 checkpoint(m);
 Debug.print("count: scenarios whose every effect matched the hand computation = " # n(scenarios));
 

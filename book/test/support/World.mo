@@ -70,14 +70,14 @@ module {
 
     public let schedulerActs = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire",
       "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal"];
-    public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set"];
-    public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits"];
+    public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return"];
+    public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift"];
     public func among(xs : [Text], x : Text) : Bool { Array.find<Text>(xs, func(y) { y == x }) != null };
     public func hasGrant(p : Principal, perm : Text) : Bool {
       if (peq(p, operator)) return (Text.startsWith(perm, #text "exchange.") and perm != "exchange.segment.advance" and perm != "exchange.instrument.reference") or among(operatorBookActs, perm);
       if (peq(p, scheduler)) return among(schedulerActs, perm);
       if (peq(p, director1) or peq(p, director2)) return perm == "command.approve" or perm == "command.reject";
-      if (peq(p, depository)) return perm == "book.funds.deposit";
+      if (peq(p, depository)) return perm == "book.funds.deposit" or perm == "book.borrow.record";
       // the clear is granted to no principal in the product; this role holds it to show the grant alone admits nothing
       if (peq(p, clearer)) return perm == "book.batch.clear";
       if (isTrader(p)) return among(traderActs, perm);
@@ -141,9 +141,9 @@ module {
 
     // the facts the reference reads: who owns which account, who may trade what, the grants, the instruments
     Debug.print("H|offset|120");
-    for (a in Nat.range(1, 19)) { switch (X.account(xs, a)) { case (?r) Debug.print("H|account|" # Nat.toText(a) # "|" # (if (r.status == #open) "1" else "0") # "|" # Nat.toText(r.member)); case null {} } };
+    for (a in Nat.range(1, 19)) { switch (X.account(xs, a)) { case (?r) Debug.print("H|account|" # Nat.toText(a) # "|" # (if (r.status == #open) "1" else "0") # "|" # Nat.toText(r.member) # "|" # TR.hex(r.client)); case null {} } };
     for (m in Nat.range(1, 6)) { if (X.member(xs, m) != null) Debug.print("H|member|" # Nat.toText(m)) };
-    for (t in Nat.range(1, 9)) { switch (X.trader(xs, t)) { case (?row) Debug.print("H|trader|" # Nat.toText(t) # "|" # Nat.toText(row.member) # "|" # (if (row.status == #active) "1" else "0") # "|" # roleName(row.principal)); case null {} } };
+    for (t in Nat.range(1, 9)) { switch (X.trader(xs, t)) { case (?row) Debug.print("H|trader|" # Nat.toText(t) # "|" # Nat.toText(row.member) # "|" # (if (row.status == #active) "1" else "0") # "|" # roleName(row.principal) # "|" # Principal.toText(row.principal)); case null {} } };
     for ((n, p) in roles.vals()) {
       for (a in Nat.range(1, 19)) {
         let owns = switch (X.account(xs, a), X.traderByPrincipal(xs, p)) { case (?acc, ?(_, t)) t.status == #active and t.member == acc.member; case (_) false };
@@ -195,6 +195,10 @@ module {
         case (#resume(x)) "k=resume;instrument=" # n(x.instrument);
         case (#kill(x)) "k=kill;member=" # n(x.member) # ";trader=" # n(x.trader) # ";reason=" # x.reason;
         case (#sealDay(x)) "k=sealDay;day=" # n(x.day);
+        case (#setBlackout(x)) "k=setBlackout;instrument=" # n(x.instrument) # ";client=" # TR.hex(x.client) # ";until=" # n(x.until) # ";reason=" # x.reason;
+        case (#liftBlackout(x)) "k=liftBlackout;blackout=" # n(x.blackout);
+        case (#borrow(x)) "k=borrow;account=" # n(x.account) # ";member=" # n(x.member) # ";instrument=" # n(x.instrument) # ";qty=" # n(x.qty) # ";reference=" # TR.hex(x.reference);
+        case (#returnBorrow(x)) "k=returnBorrow;account=" # n(x.account) # ";member=" # n(x.member) # ";instrument=" # n(x.instrument) # ";qty=" # n(x.qty);
         case (#killSweep(x)) "k=killSweep;kill=" # n(x.kill) # ";limit=" # n(x.limit);
         case (#revive(x)) "k=revive;kill=" # n(x.kill);
         case (#setLimits(x)) "k=setLimits;member=" # n(x.member) # ";qty=" # n(x.maxOrderQty) # ";value=" # n(x.maxOrderValue) # ";credit=" # n(x.creditLimit);
@@ -474,6 +478,9 @@ module {
           switch (c) {
             case (#deposit(d)) addTotal(r, d.ledger, d.amount);
             case (#withdraw(w)) addTotal(r, w.ledger, -w.amount);
+            // a securities loan brings shares in and its return takes them out (SPEC §17)
+            case (#borrow(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, x.qty); case null {} } };
+            case (#returnBorrow(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, -x.qty); case null {} } };
             case (#placeOrder(_)) { if (x.effects.size() > 5) saw("own orders cancelled at entry"); if (x.effects[2] == 4) saw("incoming orders cancelled with the resting") };
             case (#amendOrder(_)) saw(if (x.effects[2] == 1) "amendments keeping priority" else "amendments taking a new priority");
             case (#uncross(_)) {
@@ -699,9 +706,23 @@ module {
         member = memberOf(account) + (if (rnd(60) == 0) 1 else 0); trader = traderIdOf(who) + (if (rnd(60) == 0) 1 else 0) })
     };
     /// The acts under four eyes a stream may give: the operator proposes, a director approves (`govern`).
-    public func underFourEyes(c : T.Command) : Bool { switch (c) { case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_)) true; case (_) false } };
+    public func underFourEyes(c : T.Command) : Bool { switch (c) { case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_)) true; case (_) false } };
     public func randomPhase() : T.Phase { let x = rnd(100); if (x < 55) #continuous else if (x < 75) #auction else if (x < 85) #closingAuction else if (x < 93) #tradeAtClose else #closed };
+    /// An account's client code in the exchange's rows ("" for a house account or none).
+    public func clientOf(account : Nat) : Blob { switch (X.account(xs, account)) { case (?a) a.client; case null "" } };
     public func randomCommand(r : Run) : (Principal, T.Command) {
+      // securities loans and insider blackouts (SPEC §16, §17), now and then
+      if (rnd(60) == 0) {
+        let account = 1 + rnd(18); let inst = 1 + rnd(2);
+        r.depSeq += 1;
+        return (depository, #borrow({ account; member = memberOf(account); instrument = inst; qty = if (inst == 1) 10 * (1 + rnd(20)) else 1 + rnd(20); reference = depRef(r.depSeq + streams * 1_000_000) }));
+      };
+      if (rnd(60) == 0) { let who = pickTrader(); let account = accountFor(who); let inst = 1 + rnd(2); return (who, #returnBorrow({ account; member = memberOf(account); instrument = inst; qty = if (inst == 1) 10 * (1 + rnd(5)) else 1 + rnd(5) })) };
+      if (rnd(200) == 0) { let account = 2 + rnd(7); return (operator, #setBlackout({ instrument = 1 + rnd(2); client = clientOf(account); until = if (rnd(2) == 0) 0 else today() + rnd(3); reason = "on the insider list" })) };
+      if (rnd(8) == 0) {
+        var bid = r.st.nextBlackout;
+        while (bid > 1) { bid -= 1; switch (RS.get(r.st.blackoutStore, B.blackoutRows, bid)) { case (?b) { if (b.active) return (operator, #liftBlackout({ blackout = bid })) }; case null {} } };
+      };
       // the day's seal, now and then; one time in four for a day other than the market day (refused)
       if (rnd(150) == 0) return (scheduler, #sealDay({ day = if (rnd(4) == 0) today() + 1 else today() }));
       // recovery first, now and then: an active kill swept until its target holds nothing open, then revived; a halted
@@ -1022,6 +1043,8 @@ module {
           };
           kid += 1;
         };
+        var bid = 1;
+        while (bid < r.st.nextBlackout) { switch (RS.get(r.st.blackoutStore, B.blackoutRows, bid)) { case (?b) { if (b.active) ignore govern(r, #liftBlackout({ blackout = bid })) }; case null {} }; bid += 1 };
         var lid = 1;
         while (lid < r.st.nextLimit) {
           switch (RS.get(r.st.limitStore, B.limitRows, lid)) {
