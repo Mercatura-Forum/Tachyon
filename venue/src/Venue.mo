@@ -56,12 +56,13 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   S.setPolicies(ss, duals(S.catalogue()));
 
   let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "surv.scan", "surv.report.seal",
-    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call"];
+    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle"];
   let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
-    "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute"];
+    "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote"];
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
     "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
-    "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close"];
+    "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
+    "book.fees.schedule", "book.maker.register"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -146,6 +147,21 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   public shared (msg) func withdrawCollateral(amount : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #withdrawCollateral({ member = callerMember(msg.caller); amount }), null, "")) };
   public shared (msg) func contributeFund(amount : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #contributeFund({ member = callerMember(msg.caller); amount }), null, "")) };
 
+  /// A market maker's quotes (SPEC §25), typed: one quote, or several at once, on one of the caller's member's accounts;
+  /// each replaces the maker's live quote on its instrument, all or nothing.
+  public shared (msg) func quote(account : Nat, side : T.QuoteSide) : async Text {
+    let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #quote({ account; member = callerMember(msg.caller); trader; side }), null, ""))
+  };
+  public shared (msg) func massQuote(account : Nat, sides : [T.QuoteSide]) : async Text {
+    let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #massQuote({ account; member = callerMember(msg.caller); trader; sides }), null, ""))
+  };
+  /// A member's attestation of its accounts' balances as of a market day (SPEC §24); the member is the caller's.
+  public shared (msg) func reconcile(day : Nat, balances : [T.Attested]) : async Text {
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #reconcileMember({ member = callerMember(msg.caller); day; balances }), null, ""))
+  };
+
   // ─── the random end of call auctions ───────────────────────────────────────────────────────
   transient let ic : actor { raw_rand : () -> async Blob } = actor "aaaaa-aa";
   transient var ending = false;
@@ -214,6 +230,26 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     let ?m = activeTrader(msg.caller) else return null;
     switch (B.clearingMember(bs, m)) { case (?(_, r)) ?{ member = r; custody = B.custodyRowsOf(bs, m) }; case null null }
   };
+  /// The caller's member's open statement and its sealed one for a market day (SPEC §23); nothing for a caller of no
+  /// member.
+  public shared (msg) func myStatement(day : Nat) : async ?{ open : B.Statement; sealed : ?B.StatementSeal } {
+    let ?m = activeTrader(msg.caller) else return null;
+    ?{ open = B.statementOf(bs, m); sealed = B.statementSealOf(bs, m, day) }
+  };
+  /// A reconciliation, to a trader of the member that made it, the regulator and the directors.
+  public shared (msg) func reconciliation(id : Nat) : async { #ok : ?B.Recon; #err : Text } {
+    switch (B.reconOf(bs, id)) {
+      case (?r) { if (Principal.equal(msg.caller, init.regulator) or isDirector(msg.caller) or activeTrader(msg.caller) == ?r.member) #ok(?r) else #err("NotYours") };
+      case null { if (Principal.equal(msg.caller, init.regulator) or isDirector(msg.caller)) #ok(null) else #err("NotYours") };
+    }
+  };
+  /// The caller's member's registration as a maker for an instrument, with its period's presence so far (SPEC §25).
+  public shared (msg) func myMaker(instrument : Nat) : async ?B.Maker {
+    let ?m = activeTrader(msg.caller) else return null;
+    switch (B.makerOf(bs, m, instrument)) { case (?(_, r)) ?r; case null null }
+  };
+  /// An instrument's fee schedule (SPEC §22): public, the rates the venue charges.
+  public query func feeSchedule(instrument : Nat) : async [T.Levy] { B.feeSchedule(bs, instrument) };
   /// The settlement range's leaf count and root (SPEC §19): public, a hash that names nothing.
   public query func settlementRoot() : async { legs : Nat; root : Blob } { let (legs, root) = B.settlementRoot(bs); { legs; root } };
   /// Leg `index` and its inclusion proof against the root at `legs` legs (0 for the present one): to the regulator and the
