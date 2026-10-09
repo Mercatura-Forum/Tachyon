@@ -189,6 +189,31 @@ def read_command(data):
         c = {"k": "borrow", "account": r.nat(), "member": r.nat(), "instrument": r.nat(), "qty": r.nat(), "reference": r.blob()}
     elif tag == 26:
         c = {"k": "returnBorrow", "account": r.nat(), "member": r.nat(), "instrument": r.nat(), "qty": r.nat()}
+    elif tag == 27:
+        c = {"k": "setClearing", "ccp": r.nat(), "ccpMember": r.nat(), "cash": principal_text(r.principal()), "secs": r.nat(), "days": r.nat(), "penalty": r.nat(),
+             "deadline": r.nat(), "fundBps": r.nat(), "floor": r.nat()}
+    elif tag == 28:
+        c = {"k": "setMargin", "instrument": r.nat(), "bps": r.nat()}
+    elif tag == 29:
+        c = {"k": "admitClearing", "member": r.nat(), "settle": r.nat(), "credit": r.nat()}
+    elif tag == 30:
+        c = {"k": "designateClearing", "account": r.nat(), "member": r.nat()}
+    elif tag in (31, 32, 37):
+        c = {"k": {31: "postCollateral", 32: "withdrawCollateral", 37: "contributeFund"}[tag], "member": r.nat(), "amount": r.nat()}
+    elif tag == 33:
+        c = {"k": "cutCycle", "cycle": r.nat(), "settleDay": r.nat()}
+    elif tag == 34:
+        c = {"k": "settleCycle", "cycle": r.nat()}
+    elif tag == 35:
+        c = {"k": "closeOut", "member": r.nat(), "instrument": r.nat()}
+    elif tag == 36:
+        c = {"k": "callFund"}
+    elif tag == 38:
+        c = {"k": "fundSkin", "account": r.nat(), "amount": r.nat()}
+    elif tag == 39:
+        c = {"k": "declareDefault", "member": r.nat(), "reason": r.text()}
+    elif tag == 40:
+        c = {"k": "closeDefault", "member": r.nat()}
     else:
         raise ValueError(f"family tag {tag}")
     assert r.p == len(data), "bytes after the command"
@@ -307,8 +332,25 @@ def concerned(block, order_member, kill_member):
         m = order_member.get(oid)
         if m is not None and m not in out:
             out[m] = False
-    if k in ("placeOrder", "deposit", "withdraw", "massCancel", "kill", "setLimits", "borrow", "returnBorrow"):
+    def mentioned(m):
+        if m and m not in out:
+            out[m] = False
+    if k in ("placeOrder", "deposit", "withdraw", "massCancel", "kill", "setLimits", "borrow", "returnBorrow", "admitClearing", "designateClearing",
+             "postCollateral", "withdrawCollateral", "contributeFund", "declareDefault", "closeOut"):
         own(c["member"])
+    elif k == "closeDefault":
+        own(c["member"])
+        for j in range(e[7]):
+            mentioned(e[8 + 2 * j])
+    elif k == "callFund":
+        for j in range(e[1]):
+            mentioned(e[2 + 2 * j])
+    elif k == "settleCycle":
+        n = e[2]
+        for j in range(n):
+            mentioned(e[3 + 3 * j])
+        for j in range(e[3 + 3 * n]):
+            mentioned(e[4 + 3 * n + 3 * j])
     elif k in ("cancelOrder", "amendOrder"):
         own(order_member.get(c["order"], 0))
     elif k in ("revive", "killSweep"):
@@ -395,8 +437,70 @@ def fingerprint(book, proposals, n_blocks, tip, feed_next, feed_head, drops):
     w.text("borrows"); w.nat(len(book.borrows) + 1)
     for n, ((account, inst), owed) in enumerate(book.borrows.items(), start=1):
         w.nat(n); w.blob(be(account, 8) + be(inst, 8) + be(owed, 8))
+    clearing_sections(w, book)
     w.text("log"); w.nat(n_blocks); w.opt_blob(tip)
     return hash_with_domain(FOLD_DOMAIN, bytes(w.b))
+
+
+def mmr_nodes(leaves):
+    """The settlement range's nodes in post-order, built by appending each leaf and the parents it completes."""
+    nodes, peaks = [], []   # peaks: (height, hash), the lowest last
+    for leaf in leaves:
+        h, height = leaf, 0
+        nodes.append(h)
+        while peaks and peaks[-1][0] == height:
+            _, left = peaks.pop()
+            h = hashlib.sha256(b"\x01" + left + h).digest(); height += 1
+            nodes.append(h)
+        peaks.append((height, h))
+    return nodes
+
+
+def clearing_sections(w, book):
+    """SPEC §18 to §21: the clearing's rows as the book stores them."""
+    t = book.clearing
+    w.text("clearing")
+    if t:
+        terms = (be(t["ccp"], 8) + be(t["ccpMember"], 8) + principal_field(t["cash"])
+                 + b"".join(be(t[x], 8) for x in ("secs", "days", "penalty", "deadline", "fundBps", "floor")))
+        w.opt_blob(terms)
+    else:
+        w.opt_blob(None)
+    w.nat(book.cycle_no); w.nat(book.settled); w.nat64(book.last_cut); w.nat(book.committed()); w.nat(book.skin)
+    w.text("clearingmembers"); w.nat(len(book.cm) + 1)
+    for n, (m, r) in enumerate(book.cm.items(), start=1):
+        w.nat(n); w.blob(b"".join(be(x, 8) for x in (m, r["settle"], r["credit"], r["coll"], r["fund"], r["req"], book.im_orders(m), r["to"], r["by"],
+                                                       r["debt"], r["fails"], r["peak"])) + bytes([r["status"]]))
+    w.text("designations"); w.nat(len(book.desig) + 1)
+    for n, (a, m) in enumerate(book.desig.items(), start=1):
+        w.nat(n); w.blob(be(a, 8) + be(m, 8))
+    w.text("ccpcustody"); w.nat(len(book.custody) + 1)
+    for n, ((m, i), q) in enumerate(book.custody.items(), start=1):
+        w.nat(n); w.blob(be(m, 8) + be(i, 8) + be(q, 8) + be(book.custody_held(m, i), 8))
+    w.text("margins")
+    for i in sorted(book.margin):
+        w.nat(i); w.nat(book.margin[i])
+    w.text("closeouts"); w.nat(len(book.closeouts) + 1)
+    for n, (o, m) in enumerate(book.closeouts.items(), start=1):
+        w.nat(n); w.blob(be(o, 8) + be(m, 8))
+    w.text("obligations"); w.nat(len(book.oblig) + 1)
+    for n, ((m, cy), (to, by)) in enumerate(book.oblig.items(), start=1):
+        w.nat(n); w.blob(be(m, 8) + be(cy, 8) + be(to, 8) + be(by, 8))
+    w.text("bought"); w.nat(len(book.bought) + 1)
+    for n, ((m, i, cy), q) in enumerate(book.bought.items(), start=1):
+        w.nat(n); w.blob(be(m, 8) + be(i, 8) + be(cy, 8) + be(q, 8))
+    w.text("cycles"); w.nat(book.cycle_no)
+    for cy in sorted(book.cycles):
+        cut, sd, done = book.cycles[cy]
+        w.nat(cy); w.blob(be(cut, 8) + be(sd, 8) + bytes([1 if done else 0]))
+    legs = [bytes([lg[0]]) + principal_field(lg[1]) + be(lg[2], 8) + be(lg[3], 8) + be(lg[4], 8) + be(lg[5] - 1, 8) for lg in book.legs]
+    w.text("settlementlegs"); w.nat(len(legs) + 1)
+    for n, lb in enumerate(legs, start=1):
+        w.nat(n); w.blob(lb)
+    nodes = mmr_nodes([hashlib.sha256(b"\x00" + lb).digest() for lb in legs])
+    w.text("settlementnodes"); w.nat(len(nodes) + 1)
+    for n, x in enumerate(nodes, start=1):
+        w.nat(n); w.blob(x)
 
 
 def main():
@@ -472,6 +576,10 @@ def main():
                 order_member[ev["effects"][1]] = c["member"]
             if c["k"] == "kill":
                 kill_member[ev["effects"][1]] = c["member"]
+            if c["k"] == "closeOut":
+                order_member[ev["effects"][1]] = book.clearing["ccpMember"]
+            if c["k"] == "declareDefault" and ev["effects"][2]:
+                kill_member[ev["effects"][2]] = c["member"]
         # the drop copy (SPEC §14): the members this block concerns, and what each is given
         for member, own_ in concerned(b, order_member, kill_member):
             drops.append((member, i, own_))

@@ -23,7 +23,8 @@ STATUS = {"waiting": 1, "live": 2, "filled": 3, "cancelled": 4}
 DAY_DOMAIN = "thebes.book.day.v1"   # the day's file (§15)
 PHASE = {"closed": 1, "continuous": 2, "auction": 3, "closingAuction": 4, "tradeAtClose": 5, "halted": 6}
 CALL = ("auction", "closingAuction")
-DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout"}
+DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout",
+        "setClearing", "setMargin", "admitClearing", "designateClearing", "fundSkin", "declareDefault", "closeDefault"}
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
 MAX_TRAILING = 64
@@ -44,6 +45,46 @@ def text(t):
 def order_key(account, side, price, qty, ref):
     payload = nat(account) + bytes([1 if side == "buy" else 2]) + nat(price) + nat(qty) + text(ref)
     return hashlib.sha256(text("tachyon.book.order-key.v1") + payload).digest()
+
+
+def ceil_div(a, b):
+    return -(-a // b)
+
+
+# ── the settlement range (SPEC §19), written from the hashing rules of the kernel's MmrProof: a leaf is
+# SHA-256(0x00 || leaf bytes), a node SHA-256(0x01 || left || right); the root bags the peaks from the highest. The
+# range is computed here as perfect subtrees over the leaves, not by the book's incremental appends.
+def h_leaf(b):
+    return hashlib.sha256(b"\x00" + b).digest()
+
+
+def h_node(l, r):
+    return hashlib.sha256(b"\x01" + l + r).digest()
+
+
+def subtree(leaves):
+    if len(leaves) == 1:
+        return leaves[0]
+    half = len(leaves) // 2
+    return h_node(subtree(leaves[:half]), subtree(leaves[half:]))
+
+
+def mmr_root(leaves):
+    peaks, off, n = [], 0, len(leaves)
+    for h in range(63, -1, -1):
+        if n >> h & 1:
+            peaks.append(subtree(leaves[off:off + 2 ** h])); off += 2 ** h
+    if not peaks:
+        return bytes(32)
+    acc = peaks[0]
+    for p in peaks[1:]:
+        acc = h_node(p, acc)
+    return acc
+
+
+def leg_bytes(kind, ledger_hex, frm, to, units, block):
+    lb = bytes.fromhex(ledger_hex)
+    return bytes([kind]) + bytes([len(lb)]) + lb + bytes(29 - len(lb)) + b"".join(x.to_bytes(8, "big") for x in (frm, to, units, block))
 
 
 def tick_at(bands, p):
@@ -109,6 +150,20 @@ class Ref:
         self.opens = {}
         self.refs_used = set()
         self.deposited = {}   # ledger -> deposits and loans in, less withdrawals and returns
+        self.external = {}    # (account, ledger) -> deposits and loans in, less withdrawals and returns (§19: the rest is legs)
+        # the central counterparty (SPEC §18 to §21). Initial margin, the CCP's commitment and the custody's held shares
+        # are not kept here: they are recounted from the open orders whenever they are needed.
+        self.clearing = None  # the terms
+        self.cm = {}          # member -> its clearing row
+        self.desig = {}       # account -> its clearing member
+        self.custody = {}     # (member, instrument) -> shares the CCP holds for it
+        self.margin = {}      # instrument -> initial margin in basis points
+        self.closeouts = {}   # close-out order -> the member it is for
+        self.oblig = {}       # (member, cycle) -> [owed to it, owed by it]
+        self.bought = {}      # (member, instrument, cycle) -> shares bought
+        self.cycles = {}      # cycle -> [cut at, settle day, settled]
+        self.cycle_no, self.settled, self.last_cut, self.skin = 1, 0, 0, 0
+        self.legs = []        # [kind, ledger, from, to, units, the log entry that settled it]
 
     # ── funds ──
     def b(self, a, l):
@@ -129,8 +184,135 @@ class Ref:
 
     def close(self, oid, status):
         o = self.orders[oid]
-        self.release(o["account"], self.ledger(o["instrument"], o["side"]), o["held"])
+        if o["account"] not in self.desig:
+            self.release(o["account"], self.ledger(o["instrument"], o["side"]), o["held"])
         o["held"] = 0; o["status"] = status
+
+    # ── the central counterparty (SPEC §18 to §21) ──
+    def is_ccp(self, a):
+        return self.clearing is not None and self.clearing["ccp"] == a
+
+    def ccp_cash(self):
+        return self.b(self.clearing["ccp"], self.clearing["cash"])[0] if self.clearing else 0
+
+    def committed(self):
+        """The open clearing buys' value."""
+        return sum(o["price"] * o["remaining"] for o in (self.orders[x] for x in self.open_ids("all"))
+                   if o["side"] == "buy" and o["account"] in self.desig)
+
+    def ccp_free(self):
+        return max(0, self.ccp_cash() - self.committed())
+
+    def im_orders(self, m):
+        return sum(self.orders[x]["held"] for x in self.open_ids("member", m)
+                   if self.orders[x]["side"] == "buy" and self.desig.get(self.orders[x]["account"]) == m)
+
+    def custody_held(self, m, inst):
+        held = 0
+        for x in self.open_ids("inst", inst):
+            o = self.orders[x]
+            if o["side"] == "sell" and (self.desig.get(o["account"]) == m or (self.is_ccp(o["account"]) and self.closeouts.get(x) == m)):
+                held += o["held"]
+        return held
+
+    def mark(self, inst):
+        i = self.inst[inst]
+        return i["last"] or i["ref"]
+
+    def variation(self, m):
+        r = self.cm[m]
+        owes = r["by"] + r["debt"]
+        has = r["to"] + sum(q * self.mark(i) for (mm, i), q in self.custody.items() if mm == m and q > 0)
+        return max(0, owes - has)
+
+    def margin_refusal(self, m, add, drop, release, fund=True):
+        r = self.cm[m]
+        if fund and r["fund"] < r["req"]:
+            return "FundShort"
+        if self.im_orders(m) + add - drop + self.variation(m) > r["coll"] + r["credit"] - release:
+            return "MarginShort"
+        return None
+
+    def sellable(self, m, inst, flagged):
+        r = self.cm[m]
+        free = self.custody.get((m, inst), 0) - self.custody_held(m, inst)
+        return free + (self.b(r["settle"], self.inst[inst]["asset"])[0] if flagged else self.owned_free(r["settle"], inst))
+
+    def sellable_free(self, account, inst):
+        m = self.desig.get(account)
+        return self.owned_free(account, inst) if m is None else self.sellable(m, inst, False)
+
+    def clearing_refusal(self, m, inst, side, flagged, price, qty, held_before, value_before):
+        r = self.cm[m]
+        if r["status"] != 1:
+            return "NotClearing"
+        if self.inst[inst]["cash"] != self.clearing["cash"]:
+            return "InvalidTerms"
+        if side == "buy":
+            if inst not in self.margin:
+                return "InvalidTerms"
+            value = price * qty
+            im = ceil_div(self.margin[inst] * value, 10_000)
+            if im > held_before:
+                e = self.margin_refusal(m, im, held_before, 0)
+                if e:
+                    return e
+            if value > value_before and self.ccp_free() < value - value_before:
+                return "LiquidityShort"
+            return None
+        if qty > held_before and qty - held_before > self.sellable(m, inst, flagged):
+            return "InsufficientFunds"
+        return None
+
+    def mv(self, frm, to, led, x):
+        a = self.b(frm, led)
+        assert a[0] >= x, "a move beyond available"
+        a[0] -= x; self.b(to, led)[0] += x
+
+    def leg(self, kind, led, frm, to, units):
+        if units:
+            self.legs.append([kind, led, frm, to, units, len(self.log)])
+
+    def pledge(self, m, inst, qty):
+        free = self.custody.get((m, inst), 0) - self.custody_held(m, inst)
+        if free >= qty:
+            return
+        self.mv(self.cm[m]["settle"], self.clearing["ccp"], self.inst[inst]["asset"], qty - free)
+        self.leg(3, self.inst[inst]["asset"], self.cm[m]["settle"], self.clearing["ccp"], qty - free)
+        self.custody[(m, inst)] = self.custody.get((m, inst), 0) + qty - free
+
+    def owe(self, m, cycle, to, by):
+        x = self.oblig.setdefault((m, cycle), [0, 0])
+        x[0] += to; x[1] += by
+        self.cm[m]["to"] += to; self.cm[m]["by"] += by
+
+    def own_clearing(self, role, m):
+        if m not in self.cm:
+            return "NotClearing"
+        me = self.trader_id(role)
+        if not me or not self.f["traders"][me]["active"] or self.f["traders"][me]["member"] != m:
+            return "NotYourAccount"
+        return None
+
+    def business(self, d):
+        return (d + 3) % 7 not in self.f["restdays"] and d not in self.f["holidays"]
+
+    def settlement_day(self, today, days):
+        d = today
+        for _ in range(days):
+            d += 1
+            while not self.business(d):
+                d += 1
+        return d
+
+    def active(self):
+        return [m for m in sorted(self.cm) if self.cm[m]["status"] == 1]
+
+    def has_live(self, account):
+        return bool(self.open_ids("acct", account))
+
+    def account_empty(self, account):
+        return all(v == [0, 0] for (a, _), v in self.bal.items() if a == account)
 
     def liveish(self, o):
         return o["status"] in ("live", "waiting")
@@ -278,6 +460,8 @@ class Ref:
                 return "UnknownAccount"
             if self.f["accounts"][c["account"]]["member"] != c["member"]:
                 return "InvalidTerms"
+            if self.is_ccp(c["account"]):
+                return "InvalidTerms"
             if c["amount"] == 0:
                 return "InvalidTerms"
             if len(c["reference"]) != 64:   # hex of the 32 bytes
@@ -293,6 +477,8 @@ class Ref:
                 return "InvalidTerms"
             if c["amount"] == 0:
                 return "InvalidTerms"
+            if self.is_ccp(c["account"]):
+                return "InvalidTerms"
             if self.b(c["account"], c["ledger"])[0] < c["amount"]:
                 return "InsufficientFunds"
             return None
@@ -302,6 +488,8 @@ class Ref:
                 return e
             if self.f["accounts"][c["account"]]["member"] != c["member"] or self.trader_id(role) != c["trader"]:
                 return "NotYourAccount"
+            if self.is_ccp(c["account"]):
+                return "InvalidTerms"
             if self.f["may"][(role, c["instrument"])] != 0:
                 return "MayNotTrade"
             i = self.inst.get(c["instrument"])
@@ -376,7 +564,7 @@ class Ref:
                 if c["short"]:
                     if kind not in ("limit", "ioc", "fok", "stopLimit") or c["price"] < self.short_floor(i):
                         return "ShortSalePrice"
-                elif c["qty"] > self.owned_free(c["account"], c["instrument"]):
+                elif c["qty"] > self.sellable_free(c["account"], c["instrument"]):
                     return "ShortSaleNotFlagged"
             price = collar(c["side"], i["ref"], i["collar"], i["bands"]) if kind in ("market", "stop", "trailingStop") else c["price"]
             e = self.risk(c["member"], c["qty"], price * c["qty"], 0)
@@ -387,8 +575,13 @@ class Ref:
             if crossing and c["smp"] == "cancelIncoming":
                 return "SelfTradePrevented"
             cancelled_in = bool(crossing) and c["smp"] == "cancelBoth"
-            if not cancelled_in and self.b(c["account"], self.ledger(c["instrument"], c["side"]))[0] < need:
-                return "InsufficientFunds"
+            if not cancelled_in:
+                m = self.desig.get(c["account"])
+                if m is None:
+                    if self.b(c["account"], self.ledger(c["instrument"], c["side"]))[0] < need:
+                        return "InsufficientFunds"
+                else:
+                    return self.clearing_refusal(m, c["instrument"], c["side"], c["short"], price, c["qty"], 0, 0)
             return None
         if k in ("cancelOrder", "amendOrder"):
             o = self.orders.get(c["order"])
@@ -423,14 +616,20 @@ class Ref:
                 if o["short"]:
                     if c["price"] < self.short_floor(i):
                         return "ShortSalePrice"
-                elif c["qty"] > o["remaining"] and c["qty"] - o["remaining"] > self.owned_free(o["account"], o["instrument"]):
+                elif c["qty"] > o["remaining"] and c["qty"] - o["remaining"] > self.sellable_free(o["account"], o["instrument"]):
                     return "ShortSaleNotFlagged"
             e = self.risk(o["member"], c["qty"], c["price"] * c["qty"], o["price"] * o["remaining"])
             if e:
                 return e
             need = c["price"] * c["qty"] if o["side"] == "buy" else c["qty"]
-            if need > o["held"] and self.b(o["account"], self.ledger(o["instrument"], o["side"]))[0] < need - o["held"]:
-                return "InsufficientFunds"
+            m = self.desig.get(o["account"])
+            if m is None:
+                if need > o["held"] and self.b(o["account"], self.ledger(o["instrument"], o["side"]))[0] < need - o["held"]:
+                    return "InsufficientFunds"
+            else:
+                e = self.clearing_refusal(m, o["instrument"], o["side"], o["short"], c["price"], c["qty"], o["held"], o["price"] * o["remaining"])
+                if e:
+                    return e
             if self.crossing_own(o["account"], o["instrument"], o["side"], c["price"]):
                 return "SelfTradePrevented"
             return None
@@ -502,6 +701,8 @@ class Ref:
                 still = self.open_ids("trader", kl["trader"]) if kl["trader"] else self.open_ids("member", kl["member"])
                 if still:
                     return "OrdersStillOpen"
+                if not kl["trader"] and kl["member"] in self.cm and self.cm[kl["member"]]["status"] == 2:
+                    return "InvalidTerms"
             return None
         if k == "setLimits":
             return None if c["member"] in self.f["members"] else "InvalidTerms"
@@ -524,6 +725,8 @@ class Ref:
             if c["account"] not in self.f["accounts"]:
                 return "UnknownAccount"
             if self.f["accounts"][c["account"]]["member"] != c["member"]:
+                return "InvalidTerms"
+            if self.is_ccp(c["account"]):
                 return "InvalidTerms"
             if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
                 return "UnknownInstrument"
@@ -550,6 +753,133 @@ class Ref:
             if c["day"] != self.today(now) or c["day"] <= (self.seals[-1][0] if self.seals else 0):
                 return "InvalidTerms"
             return None
+        return self.validate_clearing(now, role, c)
+
+    def validate_clearing(self, now, role, c):
+        """SPEC §18 to §21, in the Motoko book's order of checks."""
+        k, t, accts = c["k"], self.clearing, self.f["accounts"]
+        if k == "setClearing":
+            a = accts.get(c["ccp"])
+            if a is None:
+                return "UnknownAccount"
+            if a["member"] != c["ccpMember"]:
+                return "InvalidTerms"
+            if not a["open"]:
+                return "AccountClosed"
+            if c["days"] == 0 and c["secs"] == 0:
+                return "InvalidTerms"
+            if c["days"] > 10 or c["penalty"] > 10_000 or c["fundBps"] > 10_000 or c["deadline"] == 0:
+                return "InvalidTerms"
+            if t is not None:
+                if (t["ccp"], t["ccpMember"], t["cash"]) != (c["ccp"], c["ccpMember"], c["cash"]):
+                    return "InvalidTerms"
+            elif c["ccp"] in self.desig or self.has_live(c["ccp"]) or not self.account_empty(c["ccp"]):
+                return "InvalidTerms"
+            return None
+        if k == "setMargin":
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            return "InvalidTerms" if c["bps"] == 0 or c["bps"] > 10_000 else None
+        if k == "admitClearing":
+            if t is None or c["member"] not in self.f["members"] or c["member"] == t["ccpMember"] or c["member"] in self.cm or len(self.cm) >= 64:
+                return "InvalidTerms"
+            a = accts.get(c["settle"])
+            if a is None:
+                return "UnknownAccount"
+            if a["member"] != c["member"]:
+                return "InvalidTerms"
+            return None if a["open"] else "AccountClosed"
+        if k == "designateClearing":
+            if c["member"] not in self.cm or self.cm[c["member"]]["status"] != 1:
+                return "NotClearing"
+            a = accts.get(c["account"])
+            if a is None:
+                return "UnknownAccount"
+            if a["member"] != c["member"] or c["account"] in self.desig or self.has_live(c["account"]):
+                return "InvalidTerms"
+            return None
+        if k in ("postCollateral", "withdrawCollateral", "contributeFund"):
+            e = self.own_clearing(role, c["member"])
+            if e:
+                return e
+            r = self.cm[c["member"]]
+            if k == "contributeFund":
+                if r["status"] != 1:
+                    return "NotClearing"
+                if c["amount"] == 0 or r["fund"] + c["amount"] > r["req"]:
+                    return "InvalidTerms"
+            else:
+                if r["status"] == 2:
+                    return "InvalidTerms"
+                if k == "postCollateral" and c["amount"] == 0:
+                    return "InvalidTerms"
+            if k == "withdrawCollateral":
+                if c["amount"] == 0 or c["amount"] > r["coll"]:
+                    return "InvalidTerms"
+                e = self.margin_refusal(c["member"], 0, 0, c["amount"], fund=False)
+                if e:
+                    return e
+                return "LiquidityShort" if self.ccp_free() < c["amount"] else None
+            return "InsufficientFunds" if self.b(r["settle"], t["cash"])[0] < c["amount"] else None
+        if k == "cutCycle":
+            if t is None or c["cycle"] != self.cycle_no:
+                return "InvalidTerms"
+            if t["days"] == 0:
+                if c["settleDay"] != 0 or self.settled + 1 != self.cycle_no:
+                    return "InvalidTerms"
+                if self.last_cut and now < self.last_cut + t["secs"] * 1_000_000_000:
+                    return "CycleNotDue"
+            else:
+                day = self.settlement_day(self.today(now), t["days"])
+                if c["settleDay"] != day:
+                    return "InvalidTerms"
+                if self.cycle_no > 1 and self.cycles[self.cycle_no - 1][1] >= day:
+                    return "InvalidTerms"
+            return None
+        if k == "settleCycle":
+            if t is None or c["cycle"] != self.settled + 1 or c["cycle"] >= self.cycle_no:
+                return "InvalidTerms"
+            sd = self.cycles[c["cycle"]][1]
+            return "CycleNotDue" if sd and self.today(now) < sd else None
+        if k == "closeOut":
+            if t is None:
+                return "InvalidTerms"
+            if c["member"] not in self.cm:
+                return "NotClearing"
+            r = self.cm[c["member"]]
+            if r["status"] != 2 and (r["debt"] == 0 or r["fails"] < t["deadline"]):
+                return "InvalidTerms"
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            i = self.inst[c["instrument"]]
+            if i["phase"] != "continuous":
+                return "InvalidTerms"
+            free = self.custody.get((c["member"], c["instrument"]), 0) - self.custody_held(c["member"], c["instrument"])
+            return "InvalidTerms" if free // i["lot"] == 0 else None
+        if k == "callFund":
+            return "InvalidTerms" if t is None or not self.active() else None
+        if k == "fundSkin":
+            if t is None:
+                return "InvalidTerms"
+            a = accts.get(c["account"])
+            if a is None:
+                return "UnknownAccount"
+            if a["member"] != t["ccpMember"] or c["account"] == t["ccp"] or c["amount"] == 0:
+                return "InvalidTerms"
+            return "InsufficientFunds" if self.b(c["account"], t["cash"])[0] < c["amount"] else None
+        if k == "declareDefault":
+            if c["member"] not in self.cm or self.cm[c["member"]]["status"] != 1:
+                return "NotClearing"
+            return None if 1 <= len(c["reason"].encode()) <= 256 else "InvalidTerms"
+        if k == "closeDefault":
+            if c["member"] not in self.cm:
+                return "NotClearing"
+            r = self.cm[c["member"]]
+            if r["status"] != 2 or self.open_ids("member", c["member"]):
+                return "InvalidTerms"
+            if any(q > 0 for (mm, _), q in self.custody.items() if mm == c["member"]):
+                return "InvalidTerms"
+            return "InvalidTerms" if r["to"] or r["by"] else None
         raise ValueError(k)
 
     # ── apply ──
@@ -606,11 +936,13 @@ class Ref:
             self.refs.add(c["reference"])
             self.b(c["account"], self.inst[c["instrument"]]["asset"])[0] += c["qty"]
             led = self.inst[c["instrument"]]["asset"]; self.deposited[led] = self.deposited.get(led, 0) + c["qty"]
+            self.external[(c["account"], led)] = self.external.get((c["account"], led), 0) + c["qty"]
             self.borrows[(c["account"], c["instrument"])] = self.borrows.get((c["account"], c["instrument"]), 0) + c["qty"]
             return [25, c["account"], c["qty"]]
         if k == "returnBorrow":
             self.b(c["account"], self.inst[c["instrument"]]["asset"])[0] -= c["qty"]
             self.deposited[self.inst[c["instrument"]]["asset"]] -= c["qty"]
+            self.external[(c["account"], self.inst[c["instrument"]]["asset"])] = self.external.get((c["account"], self.inst[c["instrument"]]["asset"]), 0) - c["qty"]
             self.borrows[(c["account"], c["instrument"])] -= c["qty"]
             return [26, c["account"], c["qty"]]
         if k == "sealDay":
@@ -623,10 +955,12 @@ class Ref:
             self.refs.add(c["reference"])
             self.b(c["account"], c["ledger"])[0] += c["amount"]
             self.deposited[c["ledger"]] = self.deposited.get(c["ledger"], 0) + c["amount"]
+            self.external[(c["account"], c["ledger"])] = self.external.get((c["account"], c["ledger"]), 0) + c["amount"]
             return [4, c["account"], c["amount"]]
         if k == "withdraw":
             self.b(c["account"], c["ledger"])[0] -= c["amount"]
             self.deposited[c["ledger"]] -= c["amount"]
+            self.external[(c["account"], c["ledger"])] = self.external.get((c["account"], c["ledger"]), 0) - c["amount"]
             return [5, c["account"], c["amount"]]
         if k == "placeOrder":
             i = self.inst[c["instrument"]]
@@ -644,12 +978,19 @@ class Ref:
                     cancelled_in = True
             need = price * c["qty"] if c["side"] == "buy" else c["qty"]
             status = "cancelled" if cancelled_in else ("waiting" if stop else "live")
+            held = 0
             if not cancelled_in:
-                self.hold(c["account"], self.ledger(c["instrument"], c["side"]), need)
+                m = self.desig.get(c["account"])
+                if m is None:
+                    self.hold(c["account"], self.ledger(c["instrument"], c["side"]), need); held = need
+                elif c["side"] == "buy":
+                    held = ceil_div(self.margin.get(c["instrument"], 0) * need, 10_000)
+                else:
+                    self.pledge(m, c["instrument"], c["qty"]); held = c["qty"]
             self.orders[oid] = dict(account=c["account"], instrument=c["instrument"], side=c["side"], kind=kind, qty=c["qty"], remaining=c["qty"],
                                     price=price, stop=c["stop"], peak=c["peak"], validity=c["validity"], gtd=c["gtd"], ref=c["ref"], oco=c["oco"],
                                     smp=c["smp"], trail=c["trail"], capacity=c["capacity"], short=c["short"], member=c["member"], trader=c["trader"], prio=now, key=order_key(c["account"], c["side"], price, c["qty"], c["ref"]), status=status,
-                                    held=0 if cancelled_in else need, filled=0)
+                                    held=held, filled=0)
             self.refs_used.add((c["account"], c["ref"]))
             if status in ("live", "waiting"):
                 self.track(oid, self.orders[oid])
@@ -673,11 +1014,20 @@ class Ref:
             keeps = c["price"] == o["price"] and c["qty"] <= o["remaining"]
             led = self.ledger(o["instrument"], o["side"])
             need = c["price"] * c["qty"] if o["side"] == "buy" else c["qty"]
-            if need > o["held"]:
-                self.hold(o["account"], led, need - o["held"])
+            m = self.desig.get(o["account"])
+            if m is None:
+                if need > o["held"]:
+                    self.hold(o["account"], led, need - o["held"])
+                else:
+                    self.release(o["account"], led, o["held"] - need)
+                held = need
+            elif o["side"] == "buy":
+                held = ceil_div(self.margin.get(o["instrument"], 0) * need, 10_000)
             else:
-                self.release(o["account"], led, o["held"] - need)
-            o["qty"] = o["filled"] + c["qty"]; o["remaining"] = c["qty"]; o["price"] = c["price"]; o["held"] = need
+                if c["qty"] > o["held"]:
+                    self.pledge(m, o["instrument"], c["qty"] - o["held"])
+                held = c["qty"]
+            o["qty"] = o["filled"] + c["qty"]; o["remaining"] = c["qty"]; o["price"] = c["price"]; o["held"] = held
             if not keeps:
                 o["prio"] = now
                 o["key"] = order_key(o["account"], o["side"], c["price"], c["qty"], o["ref"])
@@ -707,7 +1057,162 @@ class Ref:
             for oid in g:
                 self.close(oid, "cancelled")
             return [12, len(g)] + g
+        return self.apply_clearing(now, c)
+
+    def apply_clearing(self, now, c):
+        k, t = c["k"], self.clearing
+        if k == "setClearing":
+            self.clearing = {x: c[x] for x in ("ccp", "ccpMember", "cash", "secs", "days", "penalty", "deadline", "fundBps", "floor")}
+            return [27, c["ccp"]]
+        if k == "setMargin":
+            self.margin[c["instrument"]] = c["bps"]
+            return [28, c["instrument"], c["bps"]]
+        if k == "admitClearing":
+            self.cm[c["member"]] = dict(settle=c["settle"], credit=c["credit"], coll=0, fund=0, req=0, to=0, by=0, debt=0, fails=0, peak=0, status=1)
+            return [29, c["member"]]
+        if k == "designateClearing":
+            self.desig[c["account"]] = c["member"]
+            return [30, c["account"], c["member"]]
+        if k == "postCollateral":
+            self.mv(self.cm[c["member"]]["settle"], t["ccp"], t["cash"], c["amount"]); self.cm[c["member"]]["coll"] += c["amount"]
+            self.leg(3, t["cash"], self.cm[c["member"]]["settle"], t["ccp"], c["amount"])
+            return [31, c["member"], c["amount"]]
+        if k == "withdrawCollateral":
+            self.mv(t["ccp"], self.cm[c["member"]]["settle"], t["cash"], c["amount"]); self.cm[c["member"]]["coll"] -= c["amount"]
+            self.leg(3, t["cash"], t["ccp"], self.cm[c["member"]]["settle"], c["amount"])
+            return [32, c["member"], c["amount"]]
+        if k == "cutCycle":
+            self.cycles[c["cycle"]] = [now, c["settleDay"], False]
+            self.cycle_no += 1; self.last_cut = now
+            return [33, c["cycle"], c["settleDay"]]
+        if k == "settleCycle":
+            return self.settle_cycle(c["cycle"])
+        if k == "closeOut":
+            i = self.inst[c["instrument"]]
+            m = c["member"]
+            q = (self.custody.get((m, c["instrument"]), 0) - self.custody_held(m, c["instrument"])) // i["lot"] * i["lot"]
+            oid = self.next; self.next += 1
+            price = collar("sell", i["ref"], i["collar"], i["bands"])
+            ref = "closeout " + str(oid)
+            self.closeouts[oid] = m
+            self.hold(t["ccp"], i["asset"], q)
+            self.orders[oid] = dict(account=t["ccp"], instrument=c["instrument"], side="sell", kind="market", qty=q, remaining=q, price=price, stop=0, peak=0,
+                                    validity="day", gtd=0, ref=ref, oco=0, smp="cancelResting", trail=0, capacity="principal", short=0,
+                                    member=t["ccpMember"], trader=0, prio=now, key=order_key(t["ccp"], "sell", price, q, ref), status="live", held=q, filled=0)
+            self.refs_used.add((t["ccp"], ref))
+            self.track(oid, self.orders[oid])
+            self.limits.setdefault(t["ccpMember"], [0, 0, 0])
+            self.due.add(c["instrument"])
+            if self.batch == 0:
+                self.batch = now
+            return [35, oid, STATUS["live"], price, q, m]
+        if k == "callFund":
+            act = self.active()
+            share = ceil_div(t["floor"], len(act))
+            fx = [36, len(act)]
+            for m in act:
+                req = max(share, ceil_div(t["fundBps"] * self.cm[m]["peak"], 10_000))
+                self.cm[m]["req"] = req
+                fx += [m, req]
+            return fx
+        if k == "contributeFund":
+            self.mv(self.cm[c["member"]]["settle"], t["ccp"], t["cash"], c["amount"]); self.cm[c["member"]]["fund"] += c["amount"]
+            self.leg(3, t["cash"], self.cm[c["member"]]["settle"], t["ccp"], c["amount"])
+            return [37, c["member"], c["amount"]]
+        if k == "fundSkin":
+            self.mv(c["account"], t["ccp"], t["cash"], c["amount"]); self.skin += c["amount"]
+            self.leg(3, t["cash"], c["account"], t["ccp"], c["amount"])
+            return [38, c["account"], c["amount"]]
+        if k == "declareDefault":
+            self.cm[c["member"]]["status"] = 2
+            kid = 0
+            if not self.active_kill(member=c["member"]):
+                kid = len(self.kills) + 1
+                self.kills[kid] = {"member": c["member"], "trader": 0, "active": True}
+            return [39, c["member"], kid]
+        if k == "closeDefault":
+            return self.close_default(c["member"])
         raise ValueError(k)
+
+    def deliver(self, m, k, out):
+        """§19: delivery against payment: the shares held for a member free of its sales, less its later purchases."""
+        r, t = self.cm[m], self.clearing
+        if r["debt"] or r["status"] != 1:
+            return
+        for (mm, inst) in sorted(x for x in self.custody if x[0] == m):
+            later = sum(self.bought.get((m, inst, j), 0) for j in range(k + 1, self.cycle_no + 1))
+            free = self.custody[(m, inst)] - self.custody_held(m, inst)
+            if free > later:
+                d = free - later
+                self.mv(t["ccp"], r["settle"], self.inst[inst]["asset"], d)
+                self.custody[(m, inst)] -= d
+                self.leg(2, self.inst[inst]["asset"], t["ccp"], r["settle"], d)
+                out.append((m, inst, d))
+
+    def settle_cycle(self, k):
+        """§19, written from the text: payers first, each all or nothing; then receivers within the CCP's free cash."""
+        t = self.clearing
+        outcomes, deliveries = [], []
+        # each member's side as the cycle was cut, fixed before anything moves
+        plan = [(m, *self.oblig.get((m, k), [0, 0]), self.oblig.get((m, k), [0, 0])[1] + self.cm[m]["debt"]) for m in sorted(self.cm)]
+        for payers in (True, False):
+            for (m, to, by, pay) in plan:
+                r = self.cm[m]
+                if r["status"] == 3 or (pay > to) != payers:
+                    continue
+                r["to"] -= to; r["by"] -= by; r["peak"] = max(r["peak"], by)
+                if payers:
+                    a = pay - to
+                    if self.b(r["settle"], t["cash"])[0] >= a:
+                        self.mv(r["settle"], t["ccp"], t["cash"], a)
+                        self.leg(2, t["cash"], r["settle"], t["ccp"], a)
+                        r["debt"] = 0; r["fails"] = 0
+                        outcomes.append((m, 1, a))
+                    else:
+                        pen = ceil_div(a * t["penalty"], 10_000)
+                        self.skin += pen
+                        r["debt"] = a + pen; r["fails"] += 1
+                        outcomes.append((m, 2, a + pen))
+                else:
+                    a = to - pay
+                    r["debt"] = 0; r["fails"] = 0
+                    if a > 0:
+                        if self.ccp_free() >= a:
+                            self.mv(t["ccp"], r["settle"], t["cash"], a)
+                            self.leg(2, t["cash"], t["ccp"], r["settle"], a)
+                            outcomes.append((m, 3, a))
+                        else:
+                            self.owe(m, k + 1, a, 0)
+                            outcomes.append((m, 4, a))
+                    elif to or by:
+                        outcomes.append((m, 3, 0))
+                self.deliver(m, k, deliveries)
+        self.cycles[k][2] = True
+        self.settled = k
+        return [34, k, len(outcomes)] + [x for o in outcomes for x in o] + [len(deliveries)] + [x for d in deliveries for x in d]
+
+    def close_default(self, m):
+        """§21: the waterfall in its fixed order; the others' share by the largest remainder, ties in member order."""
+        r = self.cm[m]
+        rest = r["debt"]
+        fc = min(rest, r["coll"]); rest -= fc
+        ff = min(rest, r["fund"]); rest -= ff
+        fs = min(rest, self.skin); rest -= fs; self.skin -= fs
+        others = [x for x in self.active() if x != m and self.cm[x]["fund"] > 0]
+        total = sum(self.cm[x]["fund"] for x in others)
+        take = min(rest, total)
+        exact = [(take * self.cm[x]["fund"], x) for x in others]
+        shares = {x: (v // total if total else 0) for v, x in exact}
+        left = take - sum(shares.values())
+        for v, x in sorted(exact, key=lambda e: -(e[0] % total))[:left]:
+            shares[x] += 1
+        rest -= take
+        fx = [40, m, fc, ff, fs, take, rest, len(others)]
+        for x in others:
+            self.cm[x]["fund"] -= shares[x]
+            fx += [x, shares[x]]
+        r["coll"] = r["coll"] - fc + (r["fund"] - ff); r["fund"] = 0; r["req"] = 0; r["debt"] = rest; r["fails"] = 0; r["status"] = 3
+        return fx
 
     # ── the auction (§3), written from the text ──
     # ── the pricing rules ──
@@ -873,13 +1378,10 @@ class Ref:
             return 0, 0
         for (b, a, q) in prs:
             bo, ao = self.orders[b], self.orders[a]
-            # the buyer pays p x q from what it holds at its price; the rest returns to it
-            self.b(bo["account"], i["cash"])[1] -= bo["price"] * q
-            self.b(bo["account"], i["cash"])[0] += (bo["price"] - p) * q
-            self.b(ao["account"], i["cash"])[0] += p * q
-            self.b(ao["account"], i["asset"])[1] -= q
-            self.b(bo["account"], i["asset"])[0] += q
-            bo["held"] -= bo["price"] * q; ao["held"] -= q
+            self.settle_pair(inst, i, b, bo, a, ao, p, q)
+            bm = self.desig.get(bo["account"])
+            bo["held"] = bo["held"] * (bo["remaining"] - q) // bo["remaining"] if bm is not None else bo["held"] - bo["price"] * q
+            ao["held"] -= q
             for o in (bo, ao):
                 o["remaining"] -= q; o["filled"] += q
                 o["status"] = "filled" if o["remaining"] == 0 else "live"
@@ -896,6 +1398,43 @@ class Ref:
                 if o["status"] == "filled" and o["held"] > 0:
                     self.close(oid, "filled")
         return p, v
+
+    def settle_pair(self, inst, i, b, bo, a, ao, p, q):
+        """§18: each side as its party's kind says; the CCP between a pre-funded and a clearing party."""
+        v = p * q
+        bm, am = self.desig.get(bo["account"]), self.desig.get(ao["account"])
+        ccp = self.clearing["ccp"] if self.clearing else 0
+        if bm is None:
+            self.b(bo["account"], i["cash"])[1] -= bo["price"] * q
+            self.b(bo["account"], i["cash"])[0] += (bo["price"] - p) * q
+            self.b(bo["account"], i["asset"])[0] += q
+        else:
+            self.owe(bm, self.cycle_no, 0, v)
+            self.bought[(bm, inst, self.cycle_no)] = self.bought.get((bm, inst, self.cycle_no), 0) + q
+            self.custody[(bm, inst)] = self.custody.get((bm, inst), 0) + q
+        if am is None:
+            self.b(ao["account"], i["asset"])[1] -= q
+            self.b(ao["account"], i["cash"])[0] += v
+        else:
+            self.owe(am, self.cycle_no, v, 0)
+            self.custody[(am, inst)] -= q
+        if bm is None and am is None:
+            self.leg(1, i["cash"], bo["account"], ao["account"], v); self.leg(1, i["asset"], ao["account"], bo["account"], q)
+        elif bm is None:
+            self.b(ccp, i["cash"])[0] += v; self.b(ccp, i["asset"])[0] -= q
+            assert self.b(ccp, i["asset"])[0] >= 0, "the CCP delivered shares it does not hold"
+            self.leg(1, i["cash"], bo["account"], ccp, v); self.leg(1, i["asset"], ccp, bo["account"], q)
+        elif am is None:
+            assert self.b(ccp, i["cash"])[0] >= v, "the CCP paid beyond its cash"
+            self.b(ccp, i["cash"])[0] -= v; self.b(ccp, i["asset"])[0] += q
+            self.leg(1, i["cash"], ccp, ao["account"], v); self.leg(1, i["asset"], ao["account"], ccp, q)
+        if am is None and ccp and ao["account"] == ccp and a in self.closeouts:
+            m = self.closeouts[a]
+            self.custody[(m, inst)] -= q
+            paid = min(self.cm[m]["debt"], v)
+            self.cm[m]["debt"] -= paid
+            if v > paid:
+                self.owe(m, self.cycle_no, v - paid, 0)
 
     # ── the day's statistics (§15) ──
     def add_trade(self, inst, p, q):
@@ -1093,11 +1632,37 @@ class Ref:
         self.log.append((now, c["k"], fx))
         return "x:" + ",".join(map(str, fx))
 
+    def reconciled(self):
+        """§19: every movement between two of the venue's accounts is a leg, so each account's holding in a ledger is what
+        came in from outside (deposits, loans) less what left (withdrawals, returns), plus its legs in, less its legs out."""
+        want = dict(self.external)
+        for (_, led, frm, to, units, _) in self.legs:
+            want[(frm, led)] = want.get((frm, led), 0) - units
+            want[(to, led)] = want.get((to, led), 0) + units
+        for key in set(want) | set(self.bal):
+            have = sum(self.bal.get(key, [0, 0]))
+            if have != want.get(key, 0):
+                return f"account {key[0]} on {key[1]}: holds {have}, its deposits and legs say {want.get(key, 0)}"
+        return None
+
     def conserved(self):
         for led, total in self.deposited.items():
             have = sum(v[0] + v[1] for (a, l), v in self.bal.items() if l == led)
             if have != total:
                 return f"ledger {led}: accounts hold {have}, deposits less withdrawals {total}"
+        t = self.clearing
+        if t:
+            # the CCP's cash is what it holds for the members and the venue, plus what it is owed less what it owes
+            want = (sum(r["coll"] + r["fund"] + r["to"] for r in self.cm.values()) + self.skin
+                    - sum(r["by"] + r["debt"] for r in self.cm.values()))
+            have = sum(self.b(t["ccp"], t["cash"]))
+            if have != want:
+                return f"the CCP's cash {have}, its resources and obligations {want}"
+            for inst, i in self.inst.items():
+                held = sum(q for (_, x), q in self.custody.items() if x == inst)
+                if self.bal.get((t["ccp"], i["asset"])) is not None or held:
+                    if sum(self.b(t["ccp"], i["asset"])) != held:
+                        return f"the CCP holds {sum(self.b(t['ccp'], i['asset']))} of instrument {inst}, its custody {held}"
         return None
 
 
@@ -1120,17 +1685,21 @@ def main():
         if l.startswith("+|"):
             if kept:
                 lines[-1] += l[2:]      # a long line printed in pieces
-        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|"):
+        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP"):
             lines.append(l); kept = True
         else:
             kept = False
-    facts = {"accounts": {}, "owns": {}, "may": {}, "instruments": {}, "grants": {}, "offset": 0, "xinstruments": {}, "xbands": None, "members": set(), "traders": {}}
+    facts = {"accounts": {}, "owns": {}, "may": {}, "instruments": {}, "grants": {}, "offset": 0, "xinstruments": {}, "xbands": None, "members": set(), "traders": {},
+             "ledgers": {}, "restdays": set(), "holidays": set()}
     proposals = {}
     errors = []
-    streams = cmds = blocks = checkpoints = 0
+    streams = cmds = blocks = checkpoints = legs_checked = 0
     ref = None
     sblocks, sorders, squeue = [], {}, {}
     sinst, slimits, skills = {}, {}, {}
+    sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
+    block_of = {}
+    custody_legs, custody_pos = [], {}
     for l in lines:
         f = l.split("|")
         if f[0] == "H":
@@ -1153,6 +1722,12 @@ def main():
                 facts["xbands"] = f[2]
             elif kind == "offset":
                 facts["offset"] = int(f[2])
+            elif kind == "ledger":
+                facts["ledgers"][f[2]] = f[3]
+            elif kind == "restdays":
+                facts["restdays"] = {int(x) for x in f[2].split(",") if x}
+            elif kind == "holiday":
+                facts["holidays"].add(int(f[2]))
             elif kind == "instrument":
                 bands = [tuple(int(x) for x in b.split(":")) for b in f[6].split(",")]
                 facts["instruments"][int(f[2])] = {"lot": int(f[3]), "ref": int(f[4]), "collar": int(f[5]), "bands": bands, "asset": f[7], "cash": f[8]}
@@ -1171,6 +1746,8 @@ def main():
                 ref.inst[i].update(collar=c, static=st, dynamic=dy, secs=sx)
             sblocks, sorders, squeue = [], {}, {}
             sinst, slimits, skills = {}, {}, {}
+            sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
+            block_of = {}
             proposals = {}
             streams += 1
         elif f[0] == "C":
@@ -1202,13 +1779,35 @@ def main():
         elif f[0] == "K":
             skills[int(f[1])] = [int(x) for x in f[2:]]
         elif f[0] == "B":
-            sblocks.append((int(f[2]), f[3], f[4]))
+            sblocks.append((int(f[2]), f[3], f[4])); sidx.append(int(f[1]))
+        elif f[0] == "G":
+            sclear[int(f[1])] = [int(x) for x in f[2:]]
+        elif f[0] == "J":
+            scust[(int(f[1]), int(f[2]))] = (int(f[3]), int(f[4]))
+        elif f[0] == "W":
+            sscalars = [int(x) for x in f[1:]]
+        elif f[0] == "M":
+            sroot = (int(f[1]), f[2])
+        elif f[0] == "CL":
+            # custody admitted leg i: it must be the reference's own leg i, a shares leg between the accounts
+            # whose holders custody named
+            i, hf, ht, units = (int(x) for x in f[1:5])
+            lg = ref.legs[i] if i < len(ref.legs) else None
+            if lg is None or lg[1] != "sharesA" or lg[4] != units:
+                errors.append(f"custody admitted leg {i} ({units} units), the reference's leg is {lg}")
+            custody_legs.append((lg[2], lg[3], units, hf, ht) if lg else None)
+        elif f[0] == "CP":
+            custody_pos[int(f[1])] = int(f[2])
         elif f[0] == "O":
             sorders[int(f[1])] = f[2:]
         elif f[0] == "Q":
             squeue[(int(f[1]), f[2])] = (int(f[3]), int(f[4]))
         elif f[0] == "E":
-            mine = [(t, fam, ",".join(map(str, fx))) for (t, fam, fx) in ref.log[ref.compared:] if fam != "setup"]
+            entries = [(e, ref.log[e]) for e in range(ref.compared, len(ref.log)) if ref.log[e][1] != "setup"]
+            mine = [(t, fam, ",".join(map(str, fx))) for (_, (t, fam, fx)) in entries]
+            # every entry of the reference's log is the book's block at the index the book printed for it
+            for (e, _), bi in zip(entries, sidx):
+                block_of[e] = bi
             ref.compared = len(ref.log)
             blocks += len(sblocks)
             if mine != sblocks:
@@ -1250,9 +1849,55 @@ def main():
                     errors.append(f"stream {streams}: kill {kid}: book {row}, reference {mine}")
             if len(skills) != len(ref.kills):
                 errors.append(f"stream {streams}: {len(skills)} kills in the book, {len(ref.kills)} in the reference")
+            # the central counterparty (SPEC §18 to §21): every member's row, the custody, the scalars, the settlement range
+            if ref.clearing or sclear:
+                for m, row in sclear.items():
+                    r = ref.cm.get(m)
+                    mine = [r["settle"], r["credit"], r["coll"], r["fund"], r["req"], ref.im_orders(m), r["to"], r["by"], r["debt"], r["fails"], r["peak"], r["status"]] if r else None
+                    if mine != row:
+                        errors.append(f"stream {streams}: clearing member {m}: book {row}, reference {mine}")
+                if set(sclear) != set(ref.cm):
+                    errors.append(f"stream {streams}: clearing members {sorted(sclear)} in the book, {sorted(ref.cm)} in the reference")
+                for key, v in scust.items():
+                    mine = (ref.custody.get(key, 0), ref.custody_held(*key))
+                    if mine != v:
+                        errors.append(f"stream {streams}: custody {key}: book {v}, reference {mine}")
+                for key, q in ref.custody.items():
+                    if key not in scust and q:
+                        errors.append(f"stream {streams}: custody {key}: the book holds no row, the reference {q}")
+                mine = [ref.committed(), ref.skin, ref.cycle_no, ref.settled, ref.last_cut]
+                if sscalars != mine:
+                    errors.append(f"stream {streams}: the clearing's figures: book {sscalars}, reference {mine}")
+            if sroot is not None:
+                if any(lg[5] not in block_of for lg in ref.legs):
+                    errors.append(f"stream {streams}: a settlement leg of an entry the book printed no block for")
+                else:
+                    leaves = [h_leaf(leg_bytes(lg[0], facts["ledgers"][lg[1]], lg[2], lg[3], lg[4], block_of[lg[5]])) for lg in ref.legs]
+                    mine = (len(leaves), mmr_root(leaves).hex())
+                    if mine != sroot:
+                        errors.append(f"stream {streams}: the settlement range: book {sroot}, reference {mine}")
+                    legs_checked += len(leaves)
+            bad = ref.reconciled()
+            if bad:
+                errors.append(f"stream {streams}: the legs do not account for the balances: {bad}")
             checkpoints += 1
             sblocks, sorders, squeue = [], {}, {}
             sinst, slimits, skills = {}, {}, {}
+            sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
+    if custody_pos:
+        # the custody register refolded here from the deliveries in and the admitted legs: each linked account's position
+        # is the reference's holding of it in instrument 1's shares, and every leg kept its accounts' holders
+        holder_of = {}
+        for (frm, to, units, hf, ht) in (x for x in custody_legs if x):
+            for a, h in ((frm, hf), (to, ht)):
+                if holder_of.setdefault(a, h) != h:
+                    errors.append(f"custody: account {a} admitted under holders {holder_of[a]} and {h}")
+        for a, units in custody_pos.items():
+            have = sum(ref.bal.get((a, "sharesA"), [0, 0]))
+            if units != have:
+                errors.append(f"custody: account {a}'s position {units}, the reference's holding {have}")
+        print(f"reference: {len(custody_legs)} legs admitted into custody, each the reference's own; {len(custody_pos)} positions equal to the holdings")
+    print(f"reference: {legs_checked} settlement legs hashed into the range's root and compared")
     print(f"reference: {streams} streams, {cmds} commands, {blocks} blocks and {checkpoints} checkpoints of every order and balance compared")
     if streams == 0 or cmds == 0 or blocks == 0 or checkpoints == 0:
         errors.append("MISS: the log holds no stream")
