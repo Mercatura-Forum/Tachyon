@@ -16,6 +16,7 @@ import hashlib
 import sys
 
 from reference_book import Ref, order_key
+import feed_projection as FP
 
 LOG_DOMAIN = "tachyon-book-log"
 FOLD_DOMAIN = "THEBES-FOLD-v1"
@@ -141,9 +142,9 @@ def read_command(data):
     elif tag == 3:
         c = {"k": "setReference", "instrument": r.nat(), "price": r.nat()}
     elif tag == 4:
-        c = {"k": "deposit", "account": r.nat(), "ledger": principal_text(r.principal()), "amount": r.nat(), "reference": r.blob()}
+        c = {"k": "deposit", "account": r.nat(), "member": r.nat(), "ledger": principal_text(r.principal()), "amount": r.nat(), "reference": r.blob()}
     elif tag == 5:
-        c = {"k": "withdraw", "account": r.nat(), "ledger": principal_text(r.principal()), "amount": r.nat()}
+        c = {"k": "withdraw", "account": r.nat(), "member": r.nat(), "ledger": principal_text(r.principal()), "amount": r.nat()}
     elif tag == 6:
         c = {"k": "placeOrder", "account": r.nat(), "instrument": r.nat(), "side": SIDE[r.byte()], "kind": KIND[r.byte()], "qty": r.nat(), "price": r.nat(),
              "stop": r.nat(), "peak": r.nat(), "validity": VALIDITY[r.byte()], "gtd": r.nat(), "smp": SMP[r.byte()], "capacity": CAPACITY[r.byte()],
@@ -153,7 +154,7 @@ def read_command(data):
     elif tag == 8:
         c = {"k": "amendOrder", "order": r.nat(), "qty": r.nat(), "price": r.nat()}
     elif tag == 9:
-        c = {"k": "massCancel", "account": r.nat(), "limit": r.nat()}
+        c = {"k": "massCancel", "account": r.nat(), "member": r.nat(), "limit": r.nat()}
     elif tag == 10:
         c = {"k": "flush"}
     elif tag == 11:
@@ -178,6 +179,8 @@ def read_command(data):
         c = {"k": "revive", "kill": r.nat()}
     elif tag == 21:
         c = {"k": "setLimits", "member": r.nat(), "qty": r.nat(), "value": r.nat(), "credit": r.nat()}
+    elif tag == 22:
+        c = {"k": "sealDay", "day": r.nat()}
     else:
         raise ValueError(f"family tag {tag}")
     assert r.p == len(data), "bytes after the command"
@@ -278,7 +281,61 @@ def proposal_row(p):
     return b
 
 
-def fingerprint(book, proposals, n_blocks, tip):
+def concerned(block, order_member, kill_member):
+    """SPEC §14: the members a block concerns, each with whether it is the member's own act, in member order."""
+    out = {}
+    ev = block["event"]
+    if ev["t"] != "executed":
+        return []
+    c, e, k = ev["command"], ev["effects"], ev["command"]["k"]
+
+    def own(m):
+        if m:
+            out[m] = True
+
+    def touched(oid):
+        m = order_member.get(oid)
+        if m is not None and m not in out:
+            out[m] = False
+    if k in ("placeOrder", "deposit", "withdraw", "massCancel", "kill", "setLimits"):
+        own(c["member"])
+    elif k in ("cancelOrder", "amendOrder"):
+        own(order_member.get(c["order"], 0))
+    elif k in ("revive", "killSweep"):
+        own(kill_member.get(c["kill"], 0))
+    elif k in ("endOfDay", "expireGtd"):
+        for oid in e[2:2 + e[1]]:
+            touched(oid)
+    elif k == "clear":
+        i = 1
+        while i < len(e):
+            np_ = e[i + 3]; p = i + 4
+            for _ in range(np_):
+                touched(e[p]); touched(e[p + 1]); p += 3
+            nc = e[p]
+            for oid in e[p + 1:p + 1 + nc]:
+                touched(oid)
+            p += 1 + nc; nt = e[p]
+            for j in range(nt):
+                touched(e[p + 1 + 4 * j])
+            p += 1 + 4 * nt; ns = e[p]
+            for j in range(ns):
+                touched(e[p + 1 + 2 * j])
+            i = p + 1 + 2 * ns + 1
+    elif k == "uncross":
+        np_ = e[4]; p = 5
+        for _ in range(np_):
+            touched(e[p]); touched(e[p + 1]); p += 3
+        nc = e[p]
+        for oid in e[p + 1:p + 1 + nc]:
+            touched(oid)
+        p += 1 + nc; ns = e[p]
+        for j in range(ns):
+            touched(e[p + 1 + 2 * j])
+    return sorted(out.items())
+
+
+def fingerprint(book, proposals, n_blocks, tip, feed_next, feed_head, drops):
     w = Writer()
     w.text("orders"); w.nat(len(book.orders) + 1)
     for oid in sorted(book.orders):
@@ -306,12 +363,26 @@ def fingerprint(book, proposals, n_blocks, tip):
     w.text("limits"); w.nat(len(book.limits) + 1)
     for n, (member, (q, v, c)) in enumerate(book.limits.items(), start=1):
         w.nat(n); w.blob(be(member, 8) + be(q, 8) + be(v, 8) + be(c, 8) + be(book.used(member), 8))
+    w.text("feed"); w.nat(feed_next); w.b += feed_head
+    w.text("drops"); w.nat(len(drops) + 1)
+    for n, (member, block, own_) in enumerate(drops, start=1):
+        w.nat(n); w.blob(be(member, 8) + be(block, 8) + bytes([1 if own_ else 0]))
+    # the day's statistics (§15): the session's by instrument, the sealed days' rows, the seals
+    w.text("stats")
+    for i in sorted(book.stats):
+        w.nat(i); w.blob(b"".join(be(v, 8) for v in book.stats[i]))
+    w.text("days"); w.nat(len(book.days) + 1)
+    for n, (day, inst, st, ref) in enumerate(book.days, start=1):
+        w.nat(n); w.blob(be(day, 8) + be(inst, 8) + b"".join(be(v, 8) for v in st) + be(ref, 8))
+    w.text("seals"); w.nat(len(book.seals) + 1)
+    for n, (day, rows, h) in enumerate(book.seals, start=1):
+        w.nat(n); w.blob(be(day, 8) + be(rows, 8) + h)
     w.text("log"); w.nat(n_blocks); w.opt_blob(tip)
     return hash_with_domain(FOLD_DOMAIN, bytes(w.b))
 
 
 def main():
-    raw, stated = {}, None
+    raw, stated, printed, files_given = {}, None, [], {}
     pending = None
     for line in open(sys.argv[1], encoding="utf-8"):
         line = line.rstrip("\n")
@@ -324,11 +395,19 @@ def main():
             pending = None
             if line.startswith("fingerprint|book|"):
                 stated = line.split("|")[2]
+            elif line.startswith("Y|"):
+                _, d, hx = line.split("|")
+                files_given[int(d)] = bytes.fromhex(hx)
+            elif line.startswith("D|"):
+                _, m, blk, own_, h = line.split("|")
+                printed.append((int(m), int(blk), own_ == "1", h))
     errors = []
     if not raw or stated is None:
         print("MISS: no log or no stated fingerprint"); return 1
     book, proposals = Book(), {}
     prev, executed, clears, pairs = None, 0, 0, 0
+    feed_head, feed_next = FP.GENESIS, 0
+    drops, order_member, kill_member, entry_hash = [], {}, {}, {}
     for i in range(max(raw) + 1):
         if i not in raw:
             errors.append(f"block {i} is missing from the log"); break
@@ -343,6 +422,9 @@ def main():
         if b["parent"] != prev:
             errors.append(f"block {i}: does not link to the block below")
         prev = b["hash"]
+        # the public feed (SPEC §13): this block's message, written from the block, chained
+        msg = FP.message(b)
+        feed_head = FP.chain(feed_head, msg); feed_next += 1
         book.log.append((b["time"], "block", []))
         ev = b["event"]
         if ev["t"] == "proposed":
@@ -362,15 +444,60 @@ def main():
                 k = 1
                 while k < len(got):
                     np = got[k + 3]; pairs += np
-                    at = k + 4 + 3 * np; nc = got[at]; nt = got[at + 1 + nc]
-                    k = at + 3 + nc + nt   # the interruption flag closes each instrument's entry
+                    at = k + 4 + 3 * np; nc = got[at]
+                    tp = at + 1 + nc; nt = got[tp]              # triggered: (order, side, price, shown) each
+                    sp = tp + 1 + 4 * nt; ns = got[sp]          # icebergs traded: (order, shown) each
+                    k = sp + 1 + 2 * ns + 1                     # the interruption flag closes each instrument's entry
             if ev["proposal"] is not None:
                 proposals[ev["proposal"]].update(status="executed", at=i)
+            if c["k"] == "placeOrder":
+                order_member[ev["effects"][1]] = c["member"]
+            if c["k"] == "kill":
+                kill_member[ev["effects"][1]] = c["member"]
+        # the drop copy (SPEC §14): the members this block concerns, and what each is given
+        for member, own_ in concerned(b, order_member, kill_member):
+            drops.append((member, i, own_))
+            entry_hash[(member, i)] = hashlib.sha256(bytes.fromhex(raw[i]) if own_ else msg).hexdigest()
     if errors:
         for e in errors[:10]:
             print("  DISAGREES:", e)
         return 1
-    fp = fingerprint(book, proposals, len(raw), prev).hex()
+    # the drop copy as the book gave it, page by page, against the drop copy computed from the log alone
+    if printed:
+        members = sorted({m for m, _, _ in drops} | {p[0] for p in printed})
+        for m in members:
+            want = [(blk, own_, entry_hash[(m, blk)]) for mm, blk, own_ in drops if mm == m]
+            got = [(blk, own_, h) for mm, blk, own_, h in printed if mm == m]
+            if got != want:
+                first = next((k for k in range(min(len(got), len(want))) if got[k] != want[k]), min(len(got), len(want)))
+                errors.append(f"member {m}'s drop copy: {len(got)} entries given, {len(want)} in the log; first difference at entry {first}: "
+                              f"given {got[first] if first < len(got) else None}, the log {want[first] if first < len(want) else None}")
+        if errors:
+            for e in errors[:10]:
+                print("  DISAGREES:", e)
+            return 1
+        print(f"regulator: the drop copies of {len(members)} members, {len(printed)} entries, each the member's blocks in the log and nothing else: VERIFIED")
+    # the day's files (§15) as the book gave them, against the files rebuilt here from the log alone
+    for d, f in sorted(files_given.items()):
+        if book.files.get(d) != f:
+            print(f"  DISAGREES: day {d}: the book's file is not the file rebuilt from the log"); return 1
+    if files_given:
+        print(f"regulator: {len(files_given)} days' files rebuilt from the log alone, byte for byte the book's: VERIFIED")
+    # the visible book at the log's end, as the replay rebuilt it (§13), in the encoding the feed's consumer digests
+    vw = bytearray(len(b"thebes.book.visible.v1").to_bytes(2, "big") + b"thebes.book.visible.v1")
+
+    def vnat(n):
+        if n == 0:
+            vw.append(0)
+        else:
+            bs = n.to_bytes((n.bit_length() + 7) // 8, "big"); vw.append(len(bs)); vw.extend(bs)
+    for inst in sorted(book.inst):
+        live = sorted((oid, o) for oid, o in book.orders.items() if o["instrument"] == inst and o["status"] == "live")
+        vnat(inst); vw.append(PHASE_CODE[book.inst[inst]["phase"]]); vw.extend(len(live).to_bytes(2, "big"))
+        for oid, o in live:
+            vnat(oid); vw.append(1 if o["side"] == "buy" else 2); vnat(o["price"]); vnat(book.shown(o))
+    print(f"regulator: the visible book at block {len(raw) - 1}: {hashlib.sha256(bytes(vw)).hexdigest()}")
+    fp = fingerprint(book, proposals, len(raw), prev, feed_next, feed_head, drops).hex()
     print(f"regulator: {len(raw)} blocks chained and hashed, {executed} executions refolded with their effects, {clears} clears, {pairs} pairs")
     if fp != stated:
         errors.append(f"the fingerprint of the refolded book {fp[:16]} is not the book's {stated[:16]}")

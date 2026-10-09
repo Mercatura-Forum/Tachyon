@@ -20,6 +20,7 @@ import sys
 
 MAXP = 2 ** 64 - 1
 STATUS = {"waiting": 1, "live": 2, "filled": 3, "cancelled": 4}
+DAY_DOMAIN = "thebes.book.day.v1"   # the day's file (§15)
 PHASE = {"closed": 1, "continuous": 2, "auction": 3, "closingAuction": 4, "tradeAtClose": 5, "halted": 6}
 CALL = ("auction", "closingAuction")
 DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits"}
@@ -90,6 +91,10 @@ class Ref:
         self.inst = {i: dict(v, phase="closed", last=0, close=0, endFrom=0, endTo=0, until=0, opened=False) for i, v in facts["instruments"].items()}
         self.kills = {}       # id -> {member, trader, active}
         self.limits = {}      # member -> [max quantity, max value, credit]; the order of creation is the rows' order
+        self.stats = {}       # instrument -> [first, high, low, last, closing, volume, value, trades] for the session (§15)
+        self.days = []        # every sealed day's rows: (day, instrument, statistics, reference)
+        self.seals = []       # (day, rows, hash)
+        self.files = {}       # day -> the day's file
         self.last_time = 0    # the time of the log's last block (proposals and approvals included)
         self.due = set()
         self.batch = 0
@@ -146,7 +151,8 @@ class Ref:
     def active_kill(self, member=0, trader=0):
         for kid in sorted(self.kills):
             k = self.kills[kid]
-            if k["active"] and ((member and k["member"] == member) or (trader and k["trader"] == trader)):
+            # a member's kill names no trader; a trader's kill names its trader (and its member)
+            if k["active"] and ((member and not k["trader"] and k["member"] == member) or (trader and k["trader"] == trader)):
                 return kid
         return None
 
@@ -200,10 +206,11 @@ class Ref:
         acc = self.f["accounts"].get(account)
         if acc is None:
             return "UnknownAccount"
-        if not acc["open"]:
-            return "AccountClosed"
+        # anonymity: another member's account answers NotYourAccount, never whether it is closed
         if self.f["owns"][(role, account)] != 1:
             return "NotYourAccount"
+        if not acc["open"]:
+            return "AccountClosed"
         return None
 
     def validate(self, now, role, c):
@@ -249,6 +256,8 @@ class Ref:
         if k == "deposit":
             if c["account"] not in self.f["accounts"]:
                 return "UnknownAccount"
+            if self.f["accounts"][c["account"]]["member"] != c["member"]:
+                return "InvalidTerms"
             if c["amount"] == 0:
                 return "InvalidTerms"
             if len(c["reference"]) != 64:   # hex of the 32 bytes
@@ -260,6 +269,8 @@ class Ref:
             e = self.own_account(role, c["account"])
             if e:
                 return e
+            if self.f["accounts"][c["account"]]["member"] != c["member"]:
+                return "InvalidTerms"
             if c["amount"] == 0:
                 return "InvalidTerms"
             if self.b(c["account"], c["ledger"])[0] < c["amount"]:
@@ -385,7 +396,10 @@ class Ref:
                 return "SelfTradePrevented"
             return None
         if k == "massCancel":
-            return self.own_account(role, c["account"])
+            e = self.own_account(role, c["account"])
+            if e:
+                return e
+            return "InvalidTerms" if self.f["accounts"][c["account"]]["member"] != c["member"] else None
         if k == "flush":
             return "NothingToClear" if (self.batch == 0 and not self.due) else None
         if k == "endOfDay":
@@ -423,22 +437,20 @@ class Ref:
                 return None if 1 <= len(c["reason"].encode()) <= 256 else "InvalidTerms"
             return None if i["phase"] == "halted" else "InvalidTerms"
         if k == "kill":
-            if (c["member"] == 0) == (c["trader"] == 0):
+            # §11: a kill names its member; with a trader, a trader of that member
+            if c["member"] == 0:
                 return "InvalidTerms"
             if not (1 <= len(c["reason"].encode()) <= 256):
                 return "InvalidTerms"
-            if c["member"]:
-                if c["member"] not in self.f["members"]:
-                    return "InvalidTerms"
-                target = c["member"]
-            else:
-                if c["trader"] not in self.f["traders"]:
-                    return "InvalidTerms"
-                target = self.f["traders"][c["trader"]]["member"]
+            if c["member"] not in self.f["members"]:
+                return "InvalidTerms"
+            if c["trader"] and (c["trader"] not in self.f["traders"] or self.f["traders"][c["trader"]]["member"] != c["member"]):
+                return "InvalidTerms"
+            target = c["member"]
             me = self.trader_id(role)
             if me and (not self.f["traders"][me]["active"] or self.f["traders"][me]["member"] != target):
                 return "InvalidTerms"
-            if (c["member"] and self.active_kill(member=c["member"])) or (c["trader"] and self.active_kill(trader=c["trader"])):
+            if (self.active_kill(trader=c["trader"]) if c["trader"] else self.active_kill(member=c["member"])):
                 return "InvalidTerms"
             return None
         if k in ("killSweep", "revive"):
@@ -448,12 +460,17 @@ class Ref:
             if not kl["active"]:
                 return "InvalidTerms"
             if k == "revive":
-                still = self.open_ids("member", kl["member"]) if kl["member"] else self.open_ids("trader", kl["trader"])
+                still = self.open_ids("trader", kl["trader"]) if kl["trader"] else self.open_ids("member", kl["member"])
                 if still:
                     return "OrdersStillOpen"
             return None
         if k == "setLimits":
             return None if c["member"] in self.f["members"] else "InvalidTerms"
+        if k == "sealDay":
+            # §15: the market day of the act, later than every day sealed
+            if c["day"] != self.today(now) or c["day"] <= (self.seals[-1][0] if self.seals else 0):
+                return "InvalidTerms"
+            return None
         raise ValueError(k)
 
     # ── apply ──
@@ -489,7 +506,7 @@ class Ref:
             return [18, kid]
         if k == "killSweep":
             kl = self.kills[c["kill"]]
-            ids = sorted(self.open_ids("member", kl["member"]) if kl["member"] else self.open_ids("trader", kl["trader"]))[:min(c["limit"], 500)]
+            ids = sorted(self.open_ids("trader", kl["trader"]) if kl["trader"] else self.open_ids("member", kl["member"]))[:min(c["limit"], 500)]
             for oid in ids:
                 self.close(oid, "cancelled")
             return [19, c["kill"], len(ids)] + ids
@@ -499,6 +516,9 @@ class Ref:
         if k == "setLimits":
             self.limits[c["member"]] = [c["qty"], c["value"], c["credit"]]
             return [21, c["member"]]
+        if k == "sealDay":
+            rows, h = self.seal(c["day"])
+            return [22, c["day"], rows] + list(h)
         if k == "setReference":
             self.inst[c["instrument"]]["ref"] = c["price"]
             return [3, c["instrument"]]
@@ -546,7 +566,8 @@ class Ref:
                     self.batch = now
             if status == "waiting":
                 self.due.add(c["instrument"])
-            return [6, oid, STATUS[status]] + cancelled
+            shows = (c["qty"] if not c["peak"] else min(c["peak"], c["qty"])) if status == "live" else 0
+            return [6, oid, STATUS[status], price, shows] + cancelled
         if k == "cancelOrder":
             self.close(c["order"], "cancelled")
             return [7, c["order"]]
@@ -566,7 +587,7 @@ class Ref:
             self.due.add(o["instrument"])
             if self.batch == 0:
                 self.batch = now
-            return [8, c["order"], 1 if keeps else 0]
+            return [8, c["order"], 1 if keeps else 0, 0 if o["status"] != "live" else (c["qty"] if not o["peak"] else min(o["peak"], c["qty"]))]
         if k == "massCancel":
             own = sorted((o["instrument"], 1 if o["side"] == "buy" else 2, self.pkey(o["side"], o["price"]), oid)
                          for oid, o in ((x, self.orders[x]) for x in self.open_ids("acct", c["account"])))
@@ -747,7 +768,7 @@ class Ref:
         buys, sells = self.live_sides(inst)
         return [self.view(oid, o) for oid, o in buys if o["price"] >= price], [self.view(oid, o) for oid, o in sells if o["price"] <= price]
 
-    def execute(self, i, result, time, cancelled, pairs):
+    def execute(self, inst, i, result, time, cancelled, pairs):
         p, v, fills, prs, killed = result
         for k in killed:
             self.close(k, "cancelled"); cancelled.append(k)
@@ -766,6 +787,7 @@ class Ref:
                 o["remaining"] -= q; o["filled"] += q
                 o["status"] = "filled" if o["remaining"] == 0 else "live"
             pairs.append((b, a, q))
+            self.add_trade(inst, p, q)
         for (oid, f) in fills:
             o = self.orders[oid]
             if o["peak"] and o["remaining"] > 0 and f >= min(o["peak"], o["remaining"] + f):
@@ -777,6 +799,38 @@ class Ref:
                 if o["status"] == "filled" and o["held"] > 0:
                     self.close(oid, "filled")
         return p, v
+
+    # ── the day's statistics (§15) ──
+    def add_trade(self, inst, p, q):
+        x = self.stats.setdefault(inst, [0] * 8)
+        x[0] = p if x[7] == 0 else x[0]
+        x[1] = max(x[1], p)
+        x[2] = p if x[7] == 0 else min(x[2], p)
+        x[3] = p; x[5] += q; x[6] += p * q; x[7] += 1
+
+    def seal(self, day):
+        """The day's file: every instrument in id order with its session's figures and its reference price; hashed."""
+        w = bytearray(len(DAY_DOMAIN.encode()).to_bytes(2, "big") + DAY_DOMAIN.encode())
+
+        def nat(n):
+            if n == 0:
+                w.append(0)
+            else:
+                bs = n.to_bytes((n.bit_length() + 7) // 8, "big"); w.append(len(bs)); w.extend(bs)
+        nat(day)
+        insts = sorted(self.inst)
+        w.extend(len(insts).to_bytes(2, "big"))
+        for i in insts:
+            st = list(self.stats.get(i, [0] * 8))
+            nat(i)
+            for v in st + [self.inst[i]["ref"]]:
+                nat(v)
+            self.days.append((day, i, st, self.inst[i]["ref"]))
+            self.stats[i] = [0] * 8
+        h = hashlib.sha256(bytes(w)).digest()
+        self.seals.append((day, len(insts), h))
+        self.files[day] = bytes(w)
+        return len(insts), h
 
     def end_immediates(self, inst, cancelled):
         for oid in sorted(oid for oid in self.open_ids("inst", inst) if self.orders[oid]["status"] == "live" and self.orders[oid]["kind"] in IMMEDIATE):
@@ -820,7 +874,7 @@ class Ref:
                 if o["status"] != "waiting":
                     continue
                 o["status"] = "live"; o["prio"] = time
-                triggered.append(oid)
+                triggered.append((oid, 1 if o["side"] == "buy" else 2, o["price"], self.shown(o)))
                 # §3.5: judged against the account's own live orders when it is triggered
                 crossing = self.crossing_own(o["account"], inst, o["side"], o["price"])
                 if crossing:
@@ -830,6 +884,24 @@ class Ref:
                     if o["smp"] != "cancelResting":
                         self.close(oid, "cancelled"); cancelled.append(oid)
                 self.cancel_oco(o, cancelled)
+
+    @staticmethod
+    def shown(o):
+        """§2, §13: an iceberg shows its peak, or what remains when less; any other order what remains."""
+        return o["remaining"] if not o["peak"] else min(o["peak"], o["remaining"])
+
+    def shown_after(self, pairs):
+        """§13: the icebergs traded that stay live, with what each shows, in the order they first appear in the pairs."""
+        out, seen = [], set()
+        for (b, a, _) in pairs:
+            for oid in (b, a):
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                o = self.orders[oid]
+                if o["peak"] and o["status"] == "live":
+                    out.append((oid, self.shown(o)))
+        return out
 
     def clear(self, time):
         fx = [13]
@@ -849,18 +921,20 @@ class Ref:
                     if p is not None and (not within(p, i["ref"], i["static"]) or (i["dynamic"] and not within(p, i["last"] or i["ref"], i["dynamic"]))):
                         interrupted = True
                     else:
-                        price, volume = self.execute(i, result, time, cancelled, pairs)
+                        price, volume = self.execute(inst, i, result, time, cancelled, pairs)
             elif i["phase"] == "tradeAtClose":
                 bids, asks = self.views_at(inst, i["close"])
                 if bids and asks:
-                    price, volume = self.execute(i, self.auction(bids, asks, i["lot"], self.price_at(i["close"])), time, cancelled, pairs)
+                    price, volume = self.execute(inst, i, self.auction(bids, asks, i["lot"], self.price_at(i["close"])), time, cancelled, pairs)
             if i["phase"] not in CALL:
                 self.end_immediates(inst, cancelled)
             if interrupted:
                 i.update(phase="auction", until=time + i["secs"] * 1_000_000_000, endFrom=0, endTo=0)
             if price:
                 self.after_trade(inst, price)
-            fx += [inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled + [len(triggered)] + triggered + [1 if interrupted else 0]
+            shown = self.shown_after(pairs)
+            fx += ([inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled + [len(triggered)]
+                   + [x for t in triggered for x in t] + [len(shown)] + [x for t in shown for x in t] + [1 if interrupted else 0])
         self.batch = 0
         return fx
 
@@ -873,16 +947,20 @@ class Ref:
         if v:
             result = self.auction(v[0], v[1], i["lot"], self.price_uncross(i["last"] or i["ref"]))
             if result[0] is not None and not within(result[0], i["ref"], i["static"]):
-                return [15, inst, 0, 0, 0, 0, PHASE[i["phase"]]]
-            price, volume = self.execute(i, result, now, cancelled, pairs)
+                return [15, inst, 0, 0, 0, 0, 0, PHASE[i["phase"]]]
+            price, volume = self.execute(inst, i, result, now, cancelled, pairs)
         self.end_immediates(inst, cancelled)
         last = price or i["last"]
         close = (last or i["ref"]) if i["phase"] == "closingAuction" else i["close"]
+        if i["phase"] == "closingAuction":
+            self.stats.setdefault(inst, [0] * 8)[4] = close
         i.update(phase=nxt, endFrom=0, endTo=0, until=0, close=close)
         if price:
             self.after_trade(inst, price)
         self.due.add(inst)
-        return [15, inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled + [PHASE[nxt]]
+        shown = self.shown_after(pairs)
+        return ([15, inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled
+                + [len(shown)] + [x for t in shown for x in t] + [PHASE[nxt]])
 
     def flush_due(self, now):
         """§1: the clear of a batch waiting from an earlier time, or of an instrument left due, recorded first."""
