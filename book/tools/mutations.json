@@ -457,5 +457,86 @@
   "old": "          case (#cancelOrder(c)) { switch (order(s, c.order)) { case (?o) own(o.member); case null {} } };",
   "new": "          case (#cancelOrder(c)) { ignore c };",
   "test": "Book"
+ },
+ {
+  "id": "V01",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "a pair with one owner on both sides raises no wash alert",
+  "property": "a pair with one owner on both sides raises no wash alert",
+  "old": "    if (ob.owner == oa.owner) {\n      raise(s, out, { rule = 1;",
+  "new": "    if (false) {\n      raise(s, out, { rule = 1;",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V02",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "painting the tape raises no alert",
+  "property": "painting the tape raises no alert",
+  "old": "if (w.count == s.params.paintCount) raise(s, out, { rule = 2;",
+  "new": "if (false) raise(s, out, { rule = 2;",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V03",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "quote stuffing raises no alert",
+  "property": "quote stuffing raises no alert",
+  "old": "if (w.count == s.params.stuffCount) raise(s, out, { rule = 3;",
+  "new": "if (false) raise(s, out, { rule = 3;",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V04",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "spoofing raises no alert",
+  "property": "spoofing raises no alert",
+  "old": "    if (not r.alerted and ((r.cancelledBuy >= q",
+  "new": "    if (false and not r.alerted and ((r.cancelledBuy >= q",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V05",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "marking the close is never judged",
+  "property": "marking the close is never judged",
+  "old": "if (before.phase == 4) markClose(",
+  "new": "if (false) markClose(",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V06",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "marking the close reads the distance in per cent, not basis points",
+  "property": "marking the close reads the distance in per cent, not basis points",
+  "old": "dev * 10_000 >= s.params.markBps * lastContinuous",
+  "new": "dev * 100 >= s.params.markBps * lastContinuous",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V07",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "the report's trade line leaves out the short flag",
+  "property": "the report's trade line leaves out the short flag",
+  "old": "w.nat(ob.account); w.nat(oa.account); w.bool(oa.short);",
+  "new": "w.nat(ob.account); w.nat(oa.account);",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V08",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "no reportable position line is written",
+  "property": "no reportable position line is written",
+  "old": "    if (not r.reported and net >= s.params.positionLevel) {",
+  "new": "    if (false and not r.reported and net >= s.params.positionLevel) {",
+  "test": "surveillance/Surv"
+ },
+ {
+  "id": "V09",
+  "file": "surveillance/src/SurvCore.mo",
+  "mutant": "a counting window never closes",
+  "property": "a counting window never closes",
+  "old": "case (?(id, w)) (id, if (w.count == 0 or t - w.start > Nat64.fromNat(secs) * SEC)",
+  "new": "case (?(id, w)) (id, if (w.count == 0)",
+  "test": "surveillance/Surv"
  }
 ]

@@ -25,9 +25,11 @@ def run(cmd, cwd, timeout=1800):
 
 def build_and_run(tree, test, moc, out_dir, tag):
     pkgs = ' '.join(subprocess.check_output(['./custody/tools/packages.sh'], cwd=tree, text=True).split())
-    wasm = os.path.join(out_dir, f'{test}-{tag}.wasm')
-    log = os.path.join(out_dir, f'{test}-{tag}.log')
-    rc, out = run(f'{moc} -wasi-system-api {pkgs} -o {wasm} book/test/{test}.test.mo', tree)
+    # a battery named alone is the book's (book/test/<name>); one named with its module is that module's (<module>/<name>)
+    module, name = (test.split('/', 1) if '/' in test else ('book', test))
+    wasm = os.path.join(out_dir, f'{module}-{name}-{tag}.wasm')
+    log = os.path.join(out_dir, f'{module}-{name}-{tag}.log')
+    rc, out = run(f'{moc} -wasi-system-api {pkgs} -o {wasm} {module}/test/{name}.test.mo', tree)
     if rc != 0:
         return rc, 'COMPILE FAILED\n' + out
     # each linear memory capped, as test/run.sh caps it: a mutant that runs away traps instead of taking the box
@@ -35,7 +37,7 @@ def build_and_run(tree, test, moc, out_dir, tag):
     open(log, 'w').write(out)
     if rc != 0:
         return rc, out
-    verify = os.path.join(tree, 'book', 'test', f'{test}.verify.sh')
+    verify = os.path.join(tree, module, 'test', f'{name}.verify.sh')
     if os.path.exists(verify):
         rc2, out2 = run([verify, log], tree)
         return rc2, out + out2
