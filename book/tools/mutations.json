@@ -57,7 +57,7 @@
   "id": "Z07",
   "file": "book/src/BookCore.mo",
   "mutant": "the buyer's difference between its limit and the clear's price kept",
-  "old": "        credit(s, bo.account, i0.cashLedger, bo.held - after - v);\n",
+  "old": "        credit(s, bo.account, i0.cashLedger, bo.held - after - v - ai);\n",
   "new": "",
   "test": "Book",
   "property": "the buyer's difference between its limit and the clear's price kept"
@@ -256,8 +256,8 @@
   "file": "book/src/BookCore.mo",
   "mutant": "an order on a halted instrument is accepted",
   "property": "an order on a halted instrument is accepted",
-  "old": "if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });\n        switch (killedFor(s, x.member, x.trader))",
-  "new": "switch (killedFor(s, x.member, x.trader))",
+  "old": "if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });\n        switch (classRefusal(s, x.instrument, X.marketTime(xs, now).0))",
+  "new": "switch (classRefusal(s, x.instrument, X.marketTime(xs, now).0))",
   "test": "Book"
  },
  {
@@ -292,7 +292,7 @@
   "file": "book/src/BookCore.mo",
   "mutant": "the risk value of an order is its quantity, not price times quantity",
   "property": "the risk value of an order is its quantity, not price times quantity",
-  "old": "switch (riskRefusal(s, x.member, x.qty, price * x.qty, 0))",
+  "old": "switch (riskRefusal(s, x.member, x.qty, valueOf(s, x.instrument, price, x.qty), 0))",
   "new": "switch (riskRefusal(s, x.member, x.qty, x.qty, 0))",
   "test": "Book"
  },
@@ -571,7 +571,7 @@
   "file": "book/src/BookCore.mo",
   "mutant": "the CCP's payment left out",
   "property": "the CCP pays a pre-funded seller of a clearing buyer at the fill",
-  "old": "        debit(s, ccp, i0.cashLedger, v); credit(s, ccp, i0.assetLedger, q);",
+  "old": "        debit(s, ccp, i0.cashLedger, v + ai); credit(s, ccp, i0.assetLedger, q);",
   "new": "        credit(s, ccp, i0.assetLedger, q);",
   "test": "BookClearing"
  },
@@ -778,8 +778,8 @@
   "file": "book/src/BookCore.mo",
   "mutant": "no unit a lot",
   "property": "a buy holds a unit a lot for its fills' rounding",
-  "old": "    if (ppm == 0) price * qty else price * qty + ceilDiv(price * qty * ppm, PPM) + qty / i.lot\n",
-  "new": "    if (ppm == 0) price * qty else price * qty + ceilDiv(price * qty * ppm, PPM)\n",
+  "old": "    if (ppm == 0) price * qty + bound else price * qty + ceilDiv(price * qty * ppm, PPM) + qty / i.lot + bound\n",
+  "new": "    if (ppm == 0) price * qty + bound else price * qty + ceilDiv(price * qty * ppm, PPM) + bound\n",
   "test": "BookMarkets"
  },
  {
@@ -796,8 +796,8 @@
   "file": "book/src/BookCore.mo",
   "mutant": "the fee not owed",
   "property": "a clearing buyer's member owes its fee in the cycle",
-  "old": "      case (?m) { owe(s, m, s.cycleNo, 0, v + feeB); owePayable(s, inst, feeB);",
-  "new": "      case (?m) { owe(s, m, s.cycleNo, 0, v); owePayable(s, inst, feeB);",
+  "old": "      case (?m) { owe(s, m, s.cycleNo, 0, v + ai + feeB); owePayable(s, inst, feeB);",
+  "new": "      case (?m) { owe(s, m, s.cycleNo, 0, v + ai); owePayable(s, inst, feeB);",
   "test": "BookMarkets"
  },
  {
@@ -997,5 +997,185 @@
   "old": "let kind = if (row.suspendBps > 0 and move * 10_000 >= row.suspendBps * row.reference) 2 else 1;",
   "new": "let kind = 1;",
   "test": "BookIndex"
+ },
+ {
+  "id": "B01",
+  "file": "book/src/BookCore.mo",
+  "mutant": "accrual from the wrong date",
+  "property": "a fill accrues to its bond's value date",
+  "old": "case (?bd) accruedOn(bd, q, valueDateOf(s, inst));",
+  "new": "case (?bd) accruedOn(bd, q, valueDateOf(s, inst) - 1);",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B02",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no accrued interest",
+  "property": "a bond's buyer pays the seller the accrued interest",
+  "old": "    let ai = switch (bondOf(s, inst)) { case (?bd) accruedOn(bd, q, valueDateOf(s, inst)); case null 0 };",
+  "new": "    let ai = 0;",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B03",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a truncated accrual",
+  "property": "the accrual is quantised once, half-even",
+  "old": "if (num == 0) 0 else halfEvenDiv(T.BOND_FACE * qty * b.couponBps * num, 10_000 * den)",
+  "new": "if (num == 0) 0 else T.BOND_FACE * qty * b.couponBps * num / (10_000 * den)",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B04",
+  "file": "book/src/BookCore.mo",
+  "mutant": "30/360 counted as ACT/365",
+  "property": "30/360 counts the bond basis's days over 360",
+  "old": "case (#thirty360) { let f = DayCount.fraction(#a006_Thirty360Isda, last, day); (f.numerator, f.denominator) };",
+  "new": "case (#thirty360) { let f = DayCount.fraction(#a004_Act365Fixed, last, day); (f.numerator, f.denominator) };",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B05",
+  "file": "book/src/BookCore.mo",
+  "mutant": "ICMA over the year",
+  "property": "ACT/ACT ICMA counts the period's days times the coupons a year",
+  "old": "case (#actActIcma) (day - last, b.perYear * (next - last));",
+  "new": "case (#actActIcma) (day - last, 365);",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B06",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a month's end not taken",
+  "property": "a coupon date past a month's end is its last day",
+  "old": "switch (CivilDate.fromCivil(y2, m2, Nat.min(d, CivilDate.daysInMonth(y2, m2)))) {",
+  "new": "switch (CivilDate.fromCivil(y2, m2, d)) {",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B07",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no accrual in the hold",
+  "property": "a bond's buy holds the most its fill can accrue",
+  "old": "    let bound = accrualBound(s, inst, qty);\n",
+  "new": "    let bound = 0;\n",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B08",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no value date required",
+  "property": "a bond trades only on a recorded value date",
+  "old": "        if (v == 0 or v < today or v >= b.maturity) return ?#InvalidTerms({ reason = \"the bond's value date for the day recorded first\" });\n",
+  "new": "",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B09",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the iNAV half-up",
+  "property": "the iNAV is quantised half-even",
+  "old": "    halfEvenDiv(m, units)\n",
+  "new": "    (m + units / 2) / units\n",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B10",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the iNAV not recomputed",
+  "property": "the iNAV follows every act that moved a price",
+  "old": "recomputeIndices(s); recomputeNavs(s) };",
+  "new": "recomputeIndices(s) };",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B11",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a receipt's units deposited",
+  "property": "a receipt's units come only from its warehouse",
+  "old": "        if (receiptLedger(s, x.ledger)) return ?#InvalidTerms({ reason = \"a receipt's units come only from its warehouse\" });\n",
+  "new": "",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B12",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the receipt class over units in the book",
+  "property": "the receipt class is taken with no unit in the book",
+  "old": "            if (supplyOf(s, i.assetLedger) != 0) return ?#InvalidTerms({ reason = \"no unit of the instrument in the book\" });\n",
+  "new": "",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B13",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a receipt cancelled out of any account",
+  "property": "the presenting account holds the receipt's quantity",
+  "old": "        if (b.available < r.qty) return ?#InsufficientFunds({ ledger = i.assetLedger; available = b.available; wanted = r.qty });\n",
+  "new": "",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B14",
+  "file": "book/src/BookCore.mo",
+  "mutant": "retired units kept",
+  "property": "a retirement takes the units out of the book",
+  "old": "        debit(s, x.account, i.assetLedger, x.qty);\n        moveSupply(s, i.assetLedger, 0, x.qty);\n        let id = s.nextRetire;",
+  "new": "        let id = s.nextRetire;",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B15",
+  "file": "book/src/BookCore.mo",
+  "mutant": "an exercise past the deadline",
+  "property": "rights are exercised by the deadline",
+  "old": "        if (X.marketTime(xs, now).0 > r.deadline) return ?#InvalidTerms({ reason = \"rights past their deadline\" });\n",
+  "new": "",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B16",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a part of a share",
+  "property": "rights are exercised for whole new shares",
+  "old": "        if (x.qty == 0 or x.qty % r.den != 0) return ?#InvalidTerms({ reason = \"rights for whole new shares\" });\n",
+  "new": "        if (x.qty == 0) return ?#InvalidTerms({ reason = \"rights for whole new shares\" });\n",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B17",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the subscription not paid",
+  "property": "an exercise pays the issuer",
+  "old": "        move(s, x.account, r.issuer, i.cashLedger, pay);\n",
+  "new": "",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B18",
+  "file": "book/src/BookCore.mo",
+  "mutant": "rights traded past the deadline",
+  "property": "rights are refused on entry past their deadline",
+  "old": "      case (?#right(r)) { if (today > r.deadline) ?#InvalidTerms({ reason = \"rights past their deadline\" }) else null };",
+  "new": "      case (?#right(_)) null;",
+  "test": "BookInstruments"
+ },
+ {
+  "id": "B19",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the accrual out of a clearing buyer's obligation",
+  "property": "a clearing buyer owes the accrued interest in its cycle",
+  "old": "owe(s, m, s.cycleNo, 0, v + ai + feeB);",
+  "new": "owe(s, m, s.cycleNo, 0, v + feeB);",
+  "test": "BookInstrumentsStreams"
+ },
+ {
+  "id": "B20",
+  "file": "book/src/BookCore.mo",
+  "mutant": "open values without the accrual",
+  "property": "limits, margins and the CCP's commitment count a bond's accrual",
+  "old": "  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty + accrualBound(s, inst, qty) };",
+  "new": "  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { ignore (s, inst); price * qty };",
+  "test": "BookInstrumentsStreams"
  }
 ]
