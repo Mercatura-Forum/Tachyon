@@ -74,30 +74,38 @@ module {
     public let rightL = classLedger(5);
     public let bond2L = classLedger(6);
     public let bond3L = classLedger(7);
+    public let futL = classLedger(8);
+    public let callL = classLedger(9);
+    public let putL = classLedger(10);
     /// The trader of the venue's central counterparty (member 3, made by `openClearing`).
     public let t5 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x01, 0x01]));
     /// The trader of a third clearing firm (member 4, made by `openClearing`).
     public let t6 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x01, 0x01]));
 
+    /// The three price attestors (SPEC §33, registered by `openDerivatives`).
+    public let at1 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x01, 0x01]));
+    public let at2 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x01, 0x01]));
+    public let at3 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x82, 0x01, 0x01]));
     public let roles : [(Text, Principal)] = [("operator", operator), ("director1", director1), ("director2", director2), ("stranger", stranger), ("scheduler", scheduler),
-      ("t1", t1), ("t2", t2), ("t3", t3), ("t4", t4), ("depository", depository), ("clearer", clearer), ("t5", t5), ("t6", t6)];
+      ("t1", t1), ("t2", t2), ("t3", t3), ("t4", t4), ("depository", depository), ("clearer", clearer), ("t5", t5), ("t6", t6), ("at1", at1), ("at2", at2), ("at3", at3)];
     public func roleName(p : Principal) : Text { for ((n, q) in roles.vals()) { if (peq(p, q)) return n }; Principal.toText(p) };
     public func ledgerName(p : Principal) : Text {
       if (peq(p, cash)) "cash" else if (peq(p, sharesA)) "sharesA" else if (peq(p, sharesB)) "sharesB" else if (peq(p, sharesC)) "sharesC" else if (Principal.toText(p) == "qjdve-lqaaa-aaaaa-aaaeq-cai") "sharesD"
-      else if (peq(p, bondL)) "bond" else if (peq(p, fundL)) "fund" else if (peq(p, wheatL)) "wheat" else if (peq(p, carbonL)) "carbon" else if (peq(p, rightL)) "rights" else if (peq(p, bond2L)) "bond2" else if (peq(p, bond3L)) "bond3" else Principal.toText(p)
+      else if (peq(p, bondL)) "bond" else if (peq(p, fundL)) "fund" else if (peq(p, wheatL)) "wheat" else if (peq(p, carbonL)) "carbon" else if (peq(p, rightL)) "rights" else if (peq(p, bond2L)) "bond2" else if (peq(p, bond3L)) "bond3"
+      else if (peq(p, futL)) "future" else if (peq(p, callL)) "call" else if (peq(p, putL)) "put" else Principal.toText(p)
     };
     public func isTrader(p : Principal) : Bool { peq(p, t1) or peq(p, t2) or peq(p, t3) or peq(p, t4) or peq(p, t5) or peq(p, t6) };
 
     public let schedulerActs = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire",
       "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call",
-      "book.statements.seal", "book.maker.settle", "book.bond.valuedate"];
+      "book.statements.seal", "book.maker.settle", "book.bond.valuedate", "book.derivatives.settle"];
     public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
       "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
       "book.certificate.retire", "book.right.exercise"];
     public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift",
       "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
       "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply",
-      "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel"];
+      "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel", "book.attestors.set"];
     public func among(xs : [Text], x : Text) : Bool { Array.find<Text>(xs, func(y) { y == x }) != null };
     public func hasGrant(p : Principal, perm : Text) : Bool {
       if (peq(p, operator)) return (Text.startsWith(perm, #text "exchange.") and perm != "exchange.segment.advance" and perm != "exchange.instrument.reference") or among(operatorBookActs, perm);
@@ -106,6 +114,7 @@ module {
       if (peq(p, depository)) return perm == "book.funds.deposit" or perm == "book.borrow.record";
       // the clear is granted to no principal in the product; this role holds it to show the grant alone admits nothing
       if (peq(p, clearer)) return perm == "book.batch.clear";
+      if (peq(p, at1) or peq(p, at2) or peq(p, at3)) return perm == "book.price.attest";
       if (isTrader(p)) return among(traderActs, perm);
       false
     };
@@ -147,6 +156,18 @@ module {
       (7, "XS0TESTG0075", wheatL, 1, 15_000), (8, "XS0TESTH0082", carbonL, 1, 2_500), (9, "XS0TESTI0099", rightL, 1, 1_200),
       (10, "XS0TESTJ0106", bond2L, 1, 99_000), (11, "XS0TESTK0111", bond3L, 1, 101_250)];
     public func openClasses(r : Run) {
+      listClasses();
+      for ((i, _, l, lot, ref) in classList.vals()) {
+        ignore tick();
+        switch (govern(r, #openInstrument({ instrument = i; assetLedger = l; cashLedger = cash; lot; referencePrice = ref; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }))) {
+          case (#ok(#executed(x))) check(x.effects == [1, i], "class instrument " # Nat.toText(i) # " opened");
+          case (o) check(false, "class instrument " # Nat.toText(i) # ": " # debug_show(o));
+        };
+        Map.add(r.track, Nat.compare, i, { var ref = ref; var last = 0; var close = 0; var phase = #closed : T.Phase });
+      };
+    };
+    /// The classes' instruments listed by the exchange, once (the exchange numbers listings in order: 5 to 11).
+    public func listClasses() {
       if (not classesListed) {
         classesListed := true;
         for ((i, isin, l, lot, ref) in classList.vals()) {
@@ -156,14 +177,52 @@ module {
           for ((nm, p) in roles.vals()) Debug.print("H|may|" # nm # "|" # Nat.toText(i) # "|" # (switch (X.mayTrade(xs, p, i)) { case (?e) Nat.toText(XText.code(e)); case null "0" }));
         };
       };
-      for ((i, _, l, lot, ref) in classList.vals()) {
+    };
+    /// The derivatives (SPEC §33 to §35): the clearing (the CCP on account 18 for member 3; members 1 and 2 clearing
+    /// through their accounts 1 and 9; accounts 5 and 13 designated, 2,000,000 of collateral each), index 1 on instruments
+    /// 1 and 2 (100,000), the three attestors, and three contracts on the index listed once and opened in run `r`: 12 a
+    /// future (multiplier 10, 10% initial margin), 13 a call and 14 a put (strikes 1,000.00 and 900.00, multiplier 10,
+    /// a 15%, b 10%), all expiring three market days after today; every contract trading.
+    var derivativesListed = false;
+    public let derivList : [(Nat, Text, Principal, Nat)] = [(12, "XS0TESTL0128", futL, 100_000), (13, "XS0TESTM0135", callL, 2_500), (14, "XS0TESTN0142", putL, 1_800)];
+    public func openDerivatives(r : Run) : Nat {
+      openClearing();
+      listClasses();
+      if (not derivativesListed) {
+        derivativesListed := true;
+        for ((i, isin, l, ref) in derivList.vals()) {
+          xgovern(#listInstrument({ isin; name = "Test derivative " # Nat.toText(i); segment = 1; currency = "EGP"; assetLedger = l; cashLedger = cash; tickTable = 1; lot = 1; referencePrice = ref; day = today() }), "instrument " # Nat.toText(i));
+          Debug.print("H|ledger|" # ledgerName(l) # "|" # TR.hex(Principal.toBlob(l)));
+          switch (X.instrument(xs, i)) { case (?x) Debug.print("H|xinstrument|" # Nat.toText(i) # "|1|" # ledgerName(x.assetLedger) # "|" # ledgerName(x.cashLedger) # "|" # Nat.toText(x.lot) # "|" # Nat.toText(x.referencePrice)); case null check(false, "a derivative listed") };
+          for ((nm, p) in roles.vals()) Debug.print("H|may|" # nm # "|" # Nat.toText(i) # "|" # (switch (X.mayTrade(xs, p, i)) { case (?e) Nat.toText(XText.code(e)); case null "0" }));
+        };
+      };
+      for ((i, _, l, ref) in derivList.vals()) {
         ignore tick();
-        switch (govern(r, #openInstrument({ instrument = i; assetLedger = l; cashLedger = cash; lot; referencePrice = ref; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }))) {
-          case (#ok(#executed(x))) check(x.effects == [1, i], "class instrument " # Nat.toText(i) # " opened");
-          case (o) check(false, "class instrument " # Nat.toText(i) # ": " # debug_show(o));
+        switch (govern(r, #openInstrument({ instrument = i; assetLedger = l; cashLedger = cash; lot = 1; referencePrice = ref; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }))) {
+          case (#ok(#executed(x))) check(x.effects == [1, i], "derivative " # Nat.toText(i) # " opened");
+          case (o) check(false, "derivative " # Nat.toText(i) # ": " # debug_show(o));
         };
         Map.add(r.track, Nat.compare, i, { var ref = ref; var last = 0; var close = 0; var phase = #closed : T.Phase });
       };
+      ignore tick();
+      // a run that clears already (`clearingRun`) keeps its terms, members and designations
+      if (B.clearingTerms(r.st) == null) {
+        deposit(r, 1, cash, 20_000_000); deposit(r, 9, cash, 20_000_000);
+        ignore govern(r, #setClearing({ ccpAccount = 18; ccpMember = 3; cashLedger = cash; cycleSecs = 900; cycleDays = 0; penaltyBps = 100; deadlineCycles = 2; fundBps = 500; fundFloor = 1_000_000 }));
+        for ((mem, settle_) in [(1, 1), (2, 9)].vals()) ignore govern(r, #admitClearing({ member = mem; settlementAccount = settle_; creditLine = 0 }));
+        for ((a, mem) in [(5, 1), (13, 2)].vals()) ignore govern(r, #designateClearing({ account = a; member = mem }));
+        for ((who, mem) in [(t1, 1), (t3, 2)].vals()) ignore act(r, who, #postCollateral({ member = mem; amount = 2_000_000 }));
+      };
+      if (B.indexRowOf(r.st, 1) == null) ignore govern(r, #defineIndex({ index = 1; base = 1_000; capBps = 6_000; haltBps = 1_000; suspendBps = 2_000; constituents = [{ instrument = 1; shares = 1_000_000 }, { instrument = 2; shares = 20_000_000 }] }));
+      ignore govern(r, #setAttestors({ attestors = [at1, at2, at3] }));
+      let expiry = today() + 3;
+      ignore govern(r, #setTerms({ instrument = 12; terms = #future({ index = 1; multiplier = 10; expiry; imBps = 1_000 }) }));
+      ignore govern(r, #setTerms({ instrument = 13; terms = #option({ index = 1; strike = 100_000; call = true; multiplier = 10; expiry; aBps = 1_500; bBps = 1_000 }) }));
+      ignore govern(r, #setTerms({ instrument = 14; terms = #option({ index = 1; strike = 90_000; call = false; multiplier = 10; expiry; aBps = 1_500; bBps = 1_000 }) }));
+      ignore tick();
+      for ((i, _, _, _) in derivList.vals()) ignore act(r, scheduler, #setTrading({ instrument = i; open = true }));
+      expiry
     };
     public func openLevies() {
       openClearing();
@@ -341,6 +400,9 @@ module {
         case (#retire(x)) "k=retire;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";instrument=" # n(x.instrument) # ";qty=" # n(x.qty) # ";beneficiary=" # TR.hex(x.beneficiary);
         case (#exercise(x)) "k=exercise;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";instrument=" # n(x.instrument) # ";qty=" # n(x.qty);
         case (#valueDate(x)) "k=valueDate;instrument=" # n(x.instrument) # ";day=" # n(x.day);
+        case (#setAttestors(x)) "k=setAttestors;attestors=" # joinText(Array.map<Principal, Text>(x.attestors, roleName));
+        case (#attestPrice(x)) "k=attestPrice;attestor=" # n(x.attestor) # ";instrument=" # n(x.instrument) # ";day=" # n(x.day) # ";price=" # n(x.price);
+        case (#settleDerivatives(x)) "k=settleDerivatives;instrument=" # n(x.instrument) # ";day=" # n(x.day) # ";limit=" # n(x.limit);
       }
     };
     public func joinText(xs : [Text]) : Text { var o = ""; for (x in xs.vals()) o := o # (if (o == "") "" else ",") # x; o };
@@ -351,6 +413,8 @@ module {
         case (#receipt(r)) "cls=receipt;warehouses=" # joinText(Array.map<Nat, Text>(r.warehouses, n));
         case (#certificate(c)) "cls=certificate;registry=" # TR.hex(c.registry);
         case (#right(r)) "cls=right;underlying=" # n(r.underlying) # ";price=" # n(r.price) # ";num=" # n(r.num) # ";den=" # n(r.den) # ";deadline=" # n(r.deadline) # ";issuer=" # n(r.issuer) # ";issuerMember=" # n(r.issuerMember);
+        case (#future(f)) "cls=future;index=" # n(f.index) # ";multiplier=" # n(f.multiplier) # ";expiry=" # n(f.expiry) # ";imBps=" # n(f.imBps);
+        case (#option(o)) "cls=option;index=" # n(o.index) # ";strike=" # n(o.strike) # ";call=" # (if (o.call) "1" else "0") # ";multiplier=" # n(o.multiplier) # ";expiry=" # n(o.expiry) # ";aBps=" # n(o.aBps) # ";bBps=" # n(o.bBps);
       }
     };
     public func constituentsText(cs : [T.Constituent]) : Text { joinText(Array.map<T.Constituent, Text>(cs, func(c) { n(c.instrument) # ":" # n(c.shares) })) };
@@ -772,7 +836,9 @@ module {
               // a clearing order holds nothing on its account: a buy's margin is its member's, a sale's shares the custody's
               switch (B.clearingOf(r.st, o.account)) {
                 case (?m) {
-                  if (o.side == #buy) { addTo(imByMember, n(m), o.held); addTo(committedBy, "all", B.openValueOf(r.st, o)) }
+                  // a derivative's order holds margin on either side and commits the CCP to nothing (SPEC §34)
+                  if (B.isDerivative(r.st, o.instrument)) addTo(imByMember, n(m), o.held)
+                  else if (o.side == #buy) { addTo(imByMember, n(m), o.held); addTo(committedBy, "all", B.openValueOf(r.st, o)) }
                   else addTo(custodyHeld, n(m) # "/" # n(o.instrument), o.held);
                 };
                 case null {
@@ -847,7 +913,10 @@ module {
           // the CCP's cash is what it holds for the members and the venue, plus what it is owed, less what it owes
           let have : Int = B.balance(r.st, t.ccpAccount, t.cashLedger).available + B.balance(r.st, t.ccpAccount, t.cashLedger).held;
           let payable = B.payableTotal(r.st);
-          check(have == coll + fund + skin + payable + to - by - debt, "the CCP's cash: " # debug_show(have) # " against its resources and obligations " # debug_show((coll + fund + skin + payable + to : Int) - by - debt));
+          // a derivative's run in progress has owed members part of what it will charge others (SPEC §34)
+          var running : Int = 0;
+          for (i in r.st.instrumentList.vals()) { switch (B.derivOf(r.st, i)) { case (?d) running += (d.runTo : Int) - d.runBy; case null {} } };
+          check(have == coll + fund + skin + payable + to - by - debt - running, "the CCP's cash: " # debug_show(have) # " against its resources and obligations " # debug_show((coll + fund + skin + payable + to : Int) - by - debt - running));
           for ((i, l) in [(1, sharesA), (2, sharesB)].vals()) {
             var q = 0;
             for (x in B.clearingMembers(r.st).vals()) q += B.custodyOf(r.st, x.member, i).qty;
@@ -896,6 +965,31 @@ module {
       while (k < r.st.nextEntitlement) { switch (B.entitlementOf(r.st, k)) { case (?x) Debug.print("EN|" # n(k) # "|" # n(x.account) # "|" # n(x.instrument) # "|" # n(x.rights) # "|" # n(x.shares) # "|" # n(x.paid)); case null {} }; k += 1 };
       k := 1;
       while (k < r.st.nextSupply) { switch (RS.get(r.st.supplyStore, B.supplyRows, k)) { case (?x) Debug.print("SU|" # ledgerName(x.ledger) # "|" # n(x.units)); case null {} }; k += 1 };
+      // derivatives (SPEC §33 to §35): each contract's settlement state, the attestations, every position, the members'
+      // positions' margin; open interest balanced
+      for (i in r.st.instrumentList.vals()) {
+        switch (B.derivOf(r.st, i)) { case (?d) Debug.print("DV|" # n(i) # "|" # n(d.mark) # "|" # n(d.settled) # "|" # n(d.runDay) # "|" # n(d.runPrice) # "|" # n(d.cursor) # "|" # n(d.runTo) # "|" # n(d.runBy) # "|" # (if (d.expired) "1" else "0")); case null {} };
+      };
+      k := 1;
+      while (k < r.st.nextAttestation) { switch (RS.get(r.st.attestationStore, B.attestationRows, k)) { case (?x) Debug.print("AT|" # n(x.instrument) # "|" # n(x.day) # "|" # n(x.attestor) # "|" # n(x.price)); case null {} }; k += 1 };
+      let openInterest = Map.empty<Nat, Int>();
+      k := 1;
+      while (k < r.st.nextPosition) {
+        switch (RS.get(r.st.positionStore, B.positionRows, k)) {
+          case (?x) {
+            Debug.print("PO|" # n(x.account) # "|" # n(x.instrument) # "|" # n(x.member) # "|" # (if (x.long) "1" else "0") # "|" # n(x.qty) # "|" # n(x.mark) # "|" # n(x.im));
+            Map.add(openInterest, Nat.compare, x.instrument, (switch (Map.get(openInterest, Nat.compare, x.instrument)) { case (?v) v; case null 0 }) + (if (x.long) (x.qty : Int) else -(x.qty : Int)));
+          };
+          case null {};
+        };
+        k += 1;
+      };
+      // balanced whenever no run is in progress: an expiry's run closes the positions slice by slice
+      for ((i, v) in Map.entries(openInterest)) {
+        let running = switch (B.derivOf(r.st, i)) { case (?d) d.runDay != 0; case null false };
+        if (not running) check(v == 0, "derivative " # n(i) # "'s long contracts equal its short ones");
+      };
+      for (row in B.clearingMembers(r.st).vals()) { let im = B.memberImOf(r.st, row.member); Debug.print("PM|" # n(row.member) # "|" # n(im)) };
       let (legs, root) = B.settlementRoot(r.st);
       Debug.print("M|" # n(legs) # "|" # TR.hex(root));
       // inclusion proofs of the range's first and last legs verify against the root; a proof against another leg does not
@@ -1011,7 +1105,7 @@ module {
       switch (c) {
         case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #setClearing(_) or #setMargin(_) or #admitClearing(_)
           or #designateClearing(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_) or #setFeeSchedule(_) or #registerMaker(_) or #defineIndex(_) or #reviewIndex(_) or #corporateAction(_)
-          or #setTerms(_) or #defineNav(_) or #issueReceipt(_) or #cancelReceipt(_)) true;
+          or #setTerms(_) or #defineNav(_) or #issueReceipt(_) or #cancelReceipt(_) or #setAttestors(_)) true;
         case (_) false
       }
     };
@@ -1023,6 +1117,8 @@ module {
       if (B.clearingTerms(r.st) != null and rnd(5) == 0) return randomClearing(r);
       // the makers' quotes, statements and reconciliations (SPEC §22 to §25), on a run with makers, one in four
       if (r.st.nextMaker > 1 and rnd(4) == 0) return randomMarkets(r);
+      // the derivatives' acts (SPEC §33 to §35), on a run with them, one in three
+      if (B.derivOf(r.st, 12) != null and rnd(3) == 0) return randomDerivatives(r);
       // the classes' acts (SPEC §28 to §32), on a run with them, one in three
       if (B.termsOf(r.st, 5) != null and rnd(3) == 0) return randomClasses(r);
       // the indices' acts (SPEC §26, §27), on a run with an index, one in six
@@ -1313,6 +1409,49 @@ module {
         randomStream(r, steps, 250, true); commands += steps;
         clearingBias := false;
         if (replayed(r)) replays += 1 else check(false, "classes stream " # n(k) # " replay");
+      };
+      (commands, replays)
+    };
+    /// A random act on the derivatives (SPEC §33 to §35): orders on the contracts from the clearing accounts (now and then
+    /// from a pre-funded one, refused), the attestors' prices for the day (now and then for another day or a second time),
+    /// the contracts closed and opened, their settlement in slices of one to three positions.
+    public func randomDerivatives(r : Run) : (Principal, T.Command) {
+      let x = rnd(100);
+      let inst = 12 + rnd(3);
+      let mark = switch (B.derivOf(r.st, inst)) { case (?d) d.mark; case null refOf(r, inst) };
+      if (x < 50) {
+        let (who, account) = if (rnd(2) == 0) (t1, if (rnd(12) == 0) 2 else 5 + rnd(2)) else (t3, 13 + rnd(2));
+        let tick_ = if (mark >= 2_000) 10 else 1;
+        let price = Nat.max(tick_, (if (rnd(2) == 0) mark + tick_ * rnd(30) else mark - Nat.min(mark - tick_, tick_ * rnd(30))) / tick_ * tick_);
+        r.refSeq += 1;
+        return (who, lim(account, inst, if (rnd(2) == 0) #buy else #sell, 1 + rnd(5), price, "v" # n(r.refSeq) # "-" # n(streams)));
+      };
+      if (x < 72) {
+        let k = rnd(3);
+        let a = [at1, at2, at3][k];
+        let day = if (rnd(12) == 0) today() - 1 else today();
+        return (a, #attestPrice({ attestor = k + 1; instrument = inst; day; price = Nat.max(1, mark * (97 + rnd(7)) / 100) }));
+      };
+      // closed more often than opened, so that settlements run
+      if (x < 82) return (scheduler, #setTrading({ instrument = inst; open = switch (B.instrument(r.st, inst)) { case (?i) i.phase != #continuous and rnd(3) == 0; case null true } }));
+      (scheduler, #settleDerivatives({ instrument = inst; day = today(); limit = 1 + rnd(3) }))
+    };
+    /// `count` random streams on books that clear, with the derivatives: every contract traded, attested, settled day by day
+    /// and at its expiry on the index's level, among every other command of the book and the clearing's cycles.
+    public func derivativesStreams(first : Nat, count : Nat, steps : Nat) : (Nat, Nat) {
+      var commands = 0; var replays = 0;
+      for (k in Nat.range(first, first + count)) {
+        seed := seed ^ Nat64.fromNat(0xD7_0000 + k);
+        let r = newRun(false);
+        clearingBias := true;
+        for (a in [2, 3, 5, 6, 10 + rnd(2), 13, 14].vals()) { ignore tick(); deposit(r, a, cash, 50_000_000 + rnd(200_000_000)); deposit(r, a, sharesA, 100 * (1 + rnd(30))); deposit(r, a, sharesB, 10 * (1 + rnd(400))) };
+        clearingRun(r);
+        for ((who, mem) in [(t1, 1), (t3, 2)].vals()) ignore act(r, who, #postCollateral({ member = mem; amount = 3_000_000 + rnd(5_000_000) }));
+        ignore openDerivatives(r);
+        ignore tick(); ignore act(r, scheduler, #setTrading({ instrument = 1; open = true })); ignore act(r, scheduler, #setTrading({ instrument = 2; open = true }));
+        randomStream(r, steps, 250, true); commands += steps;
+        clearingBias := false;
+        if (replayed(r)) replays += 1 else check(false, "derivatives stream " # n(k) # " replay");
       };
       (commands, replays)
     };
