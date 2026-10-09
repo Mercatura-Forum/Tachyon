@@ -1,0 +1,44 @@
+[
+ {
+  "id": "X01",
+  "file": "matching/src/MatchLogic.mo",
+  "mutant": "the part-lot check removed (AU-08)",
+  "old": "    if (qty % lot != 0) return ?(\"the quantity is not a whole number of lots of \" # Nat.toText(lot));\n",
+  "new": ""
+ },
+ {
+  "id": "X02",
+  "file": "matching/src/MatchLogic.mo",
+  "mutant": "the lot allowed to equal the asset fee (AU-08)",
+  "old": "    if (lot <= assetFee) return ?\"the lot does not exceed the asset ledger fee\";",
+  "new": "    if (lot < assetFee) return ?\"the lot does not exceed the asset ledger fee\";"
+ },
+ {
+  "id": "X03",
+  "file": "matching/src/MatchLogic.mo",
+  "mutant": "the cash side of the lot rule removed (AU-08)",
+  "old": "    if (limitPrice * lot <= cashFee) return ?\"the price of one lot does not exceed the cash ledger fee\";\n",
+  "new": ""
+ },
+ {
+  "id": "X04",
+  "file": "matching/src/MatchLogic.mo",
+  "mutant": "the terminal step releases only limit x fill, the fee left (AU-02, the defect itself)",
+  "old": "    if (remainingAfter == 0) return (stillReserved, 0);\n",
+  "new": "    if (remainingAfter == 0) { let r = Nat.min(limitPrice * fill, stillReserved); return (r, stillReserved - r) };\n"
+ },
+ {
+  "id": "X05",
+  "file": "matching/src/MatchLogic.mo",
+  "mutant": "a buy at exactly the owner's ask allowed through (AU-03)",
+  "old": "case (#buy) limitPrice >= opp;",
+  "new": "case (#buy) limitPrice > opp;"
+ },
+ {
+  "id": "X06",
+  "file": "matching/src/MatchLogic.mo",
+  "mutant": "self-trade prevention ignores sells (AU-03)",
+  "old": "case (#sell) limitPrice <= opp }",
+  "new": "case (#sell) false }"
+ }
+]
