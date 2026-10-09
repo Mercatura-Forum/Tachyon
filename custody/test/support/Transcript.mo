@@ -6,7 +6,8 @@
 /// `submit` or `approve`; the caller is the role principal the battery acted as; `now` the clock it passed; the argument
 /// the command's frozen bytes (hex) for a submission or the proposal id for an approval; the justification in hex; the
 /// outcome `x=<effects>` for an execution, `p=<proposal>` for a proposal opened or approved short of its quorum, or
-/// `e=<Name>` for a refusal by its name. A command's bytes longer than a WASI print holds go first on `callb|` lines.
+/// `e=<Name>` for a refusal by its name. A command's bytes longer than a WASI print holds go first on `callb|` lines; an
+/// outcome longer than 300 characters goes first on `callo|` lines and its `call|` line carries `@` in its place.
 ///
 /// Attribution: Thebes Core Team. Licence: Apache 2.0.
 
@@ -56,14 +57,22 @@ module {
     };
   };
 
+  /// An outcome as the `call|` line carries it: itself, or `@` after its `callo|` lines when it would not fit.
+  func outcomeField(outcome : Text) : Text {
+    if (outcome.size() <= 300) return outcome;
+    lines("callo|", Blob.toArray(Text.encodeUtf8(outcome)));
+    "@"
+  };
   /// A submission: the command's bytes at `version`, the caller, the clock, the justification, the outcome.
   public func submitted(domain : Text, version : Nat8, bytes : Blob, caller : Principal, now : Nat64, justification : Text, outcome : Text) {
     lines("callb|", hexBytes(bytes));
-    Debug.print("call|" # domain # "|submit|" # Principal.toText(caller) # "|" # Nat64.toText(now) # "|" # Nat8.toText(version) # "|-|" # hex(Text.encodeUtf8(justification)) # "|" # outcome);
+    let o = outcomeField(outcome);
+    Debug.print("call|" # domain # "|submit|" # Principal.toText(caller) # "|" # Nat64.toText(now) # "|" # Nat8.toText(version) # "|-|" # hex(Text.encodeUtf8(justification)) # "|" # o);
   };
   /// An approval of a proposal by the caller at the clock, and its outcome.
   public func approved(domain : Text, proposal : Nat, caller : Principal, now : Nat64, outcome : Text) {
-    Debug.print("call|" # domain # "|approve|" # Principal.toText(caller) # "|" # Nat64.toText(now) # "|0|" # Nat.toText(proposal) # "||" # outcome);
+    let o = outcomeField(outcome);
+    Debug.print("call|" # domain # "|approve|" # Principal.toText(caller) # "|" # Nat64.toText(now) # "|0|" # Nat.toText(proposal) # "||" # o);
   };
   /// The fingerprint a domain stands at, for the judge to compare with the chain's.
   public func fingerprint(domain : Text, fp : Blob) { Debug.print("fingerprint|" # domain # "|" # hex(fp)) };
