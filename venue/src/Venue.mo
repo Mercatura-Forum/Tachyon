@@ -50,7 +50,7 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   X.setPolicies(xs, duals(X.catalogue()));
   B.setPolicies(bs, duals(B.catalogue()));
 
-  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep"];
+  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal"];
   let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set"];
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
@@ -96,22 +96,28 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     account : Nat; instrument : Nat; side : T.Side; kind : T.Kind; qty : Nat; price : Nat; stopPrice : Nat; peak : Nat;
     validity : T.Validity; gtdDay : Nat; selfTrade : T.SelfTrade; capacity : T.Capacity; shortSale : Bool; clientRef : Text; oco : Nat; trail : Nat;
   };
-  public type Placed = { #ok : { order : Nat; status : Nat8; cancelled : [Nat]; block : Nat }; #err : Text };
+  /// An accepted order: its id, status, the price it rests at (a market order's collar), the quantity it shows (an
+  /// iceberg's peak; 0 unless live), the caller's own orders it cancelled, and the block that recorded it.
+  public type Placed = { #ok : { order : Nat; status : Nat8; price : Nat; shown : Nat; cancelled : [Nat]; block : Nat }; #err : Text };
   /// The order records the account's member and the caller's trader id, as the exchange's rows hold them; the book
   /// checks both again.
   public shared (msg) func place(o : Place) : async Placed {
     let member = switch (X.account(xs, o.account)) { case (?a) a.member; case null 0 };
     let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
     switch (B.submit(bs, xs, auth, chainNow(), msg.caller, #placeOrder({ o with member; trader }), null, "")) {
-      case (#ok(#executed(x))) #ok({ order = x.effects[1]; status = Nat8.fromNat(x.effects[2]); cancelled = Array.sliceToArray<Nat>(x.effects, 3, x.effects.size()); block = x.block });
+      case (#ok(#executed(x))) #ok({ order = x.effects[1]; status = Nat8.fromNat(x.effects[2]); price = x.effects[3]; shown = x.effects[4]; cancelled = Array.sliceToArray<Nat>(x.effects, 5, x.effects.size()); block = x.block });
       case (#ok(#proposed(_))) #err("Proposed");
       case (#err(e)) #err(debug_show(e));
     }
   };
   public shared (msg) func cancel(order : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #cancelOrder({ order }), null, "")) };
   public shared (msg) func amend(order : Nat, qty : Nat, price : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #amendOrder({ order; qty; price }), null, "")) };
-  /// A trader's kill switch (SPEC §11): its own member (`trader` 0) or one trader of its member (`member` 0).
-  public shared (msg) func kill(member : Nat, trader : Nat, reason : Text) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #kill({ member; trader; reason }), null, "")) };
+  /// A trader's kill switch (SPEC §11): its own member (`trader` 0) or one trader of its own member. The member is the
+  /// caller's; the book checks the trader is one of it.
+  public shared (msg) func kill(trader : Nat, reason : Text) : async Text {
+    let member = switch (activeTrader(msg.caller)) { case (?m) m; case null 0 };
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #kill({ member; trader; reason }), null, ""))
+  };
 
   // ─── the random end of call auctions ───────────────────────────────────────────────────────
   transient let ic : actor { raw_rand : () -> async Blob } = actor "aaaaa-aa";
@@ -193,6 +199,38 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   public query func counts() : async { orders : Nat; bookBlocks : Nat; exchangeBlocks : Nat } {
     { orders = bs.nextOrder - 1; bookBlocks = B.counts(bs).blocks; exchangeBlocks = X.counts(xs).blocks }
   };
+  // ─── the public feed, the day's statistics and files (SPEC §13, §15) ──────────────────────────
+  /// The most messages one read of the feed returns.
+  let FEED_PAGE = 50;
+  /// The feed from block `from`: up to `count` messages (at most `FEED_PAGE`), each with its sequence and feed hash; the
+  /// feed hash before the first, to chain from; and the head (the next sequence and the last hash). A consumer checks
+  /// every hash against the chain over what it received (SPEC §13).
+  public query func feed(from : Nat, count : Nat) : async { messages : [(Nat, Blob, Blob)]; previous : ?Blob; next : Nat; head : Blob } {
+    let (next, head) = B.feedHeadOf(bs);
+    let out = List.empty<(Nat, Blob, Blob)>();
+    var previous : ?Blob = null;
+    var i = from;
+    while (i < next and List.size(out) < Nat.min(count, FEED_PAGE)) {
+      switch (B.feedEntry(bs, i)) { case (?e) { if (i == from) previous := ?e.previous; List.add(out, (i, e.message, e.hash)) }; case null {} };
+      i += 1;
+    };
+    { messages = List.toArray(out); previous; next; head }
+  };
+  /// The feed's head: the next sequence and the last block's feed hash.
+  public query func feedHead() : async { next : Nat; head : Blob } { let (next, head) = B.feedHeadOf(bs); { next; head } };
+  /// An instrument's statistics for the session since the last seal (SPEC §15).
+  public query func sessionStats(id : Nat) : async ?B.Stats { if (B.instrument(bs, id) == null) null else ?B.statsOf(bs, id) };
+  /// A sealed day's file (SPEC §15); its SHA-256 is the hash its seal recorded in the log.
+  public query func dayFile(day : Nat) : async ?Blob { B.dayFile(bs, day) };
+
+  // ─── the drop copy (SPEC §14), scoped to the caller's member ──────────────────────────────
+  /// The caller's member's drop copy from block `from`: its blocks, its own as stored, the others as their public
+  /// messages; the block to read from next. An update: a query's caller is not authenticated on this substrate.
+  public shared (msg) func dropCopy(from : Nat, count : Nat) : async { #ok : { entries : [(Nat, Bool, Blob)]; next : ?Nat }; #err : Text } {
+    let ?member = activeTrader(msg.caller) else return #err("NotATrader");
+    #ok(B.dropCopy(bs, member, from, count))
+  };
+
   /// An instrument's row in the book (reference data: its phase, bands, reference, last and closing prices, window).
   public query func instrument(id : Nat) : async ?T.Instrument { B.instrument(bs, id) };
   /// The indicative auction price of an instrument in a call phase (SPEC §9): the price, volume and surplus its uncross
