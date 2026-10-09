@@ -162,8 +162,32 @@ module {
     /// Default (four eyes): declared, then closed through the waterfall (§21).
     #declareDefault : { member : Nat; reason : Text };
     #closeDefault : { member : Nat };
+    /// An instrument's fee schedule (SPEC §22; four eyes): each levy a recipient account and a rate in parts per million.
+    #setFeeSchedule : { instrument : InstrumentId; levies : [Levy] };
+    /// The scheduler seals every open member statement for the market day (§23).
+    #sealStatements : { day : Day };
+    /// A trader of the member attests its member's balances as of a market day (§24).
+    #reconcileMember : { member : Nat; day : Day; balances : [Attested] };
+    /// A market maker's registration for an instrument with its obligations and rebate (§25; four eyes).
+    #registerMaker : { member : Nat; instrument : InstrumentId; maxSpreadBps : Nat; minQty : Nat; presenceBps : Nat; rebateBps : Nat };
+    /// A registered maker's two-sided quote on one account, replacing its live quote on the instrument atomically, and
+    /// several at once (§25).
+    #quote : { account : AccountId; member : Nat; trader : Nat; side : QuoteSide };
+    #massQuote : { account : AccountId; member : Nat; trader : Nat; sides : [QuoteSide] };
+    /// The scheduler's close of the makers' period for the market day: presence recorded, rebates paid (§25).
+    #settleMakers : { day : Day };
   };
 
+  /// A levy of a fee schedule (SPEC §22): its recipient account and its rate in parts per million of a fill's value.
+  public type Levy = { account : AccountId; ppm : Nat };
+  /// A balance a member attests (§24): its account, the ledger, the amount (available and held together).
+  public type Attested = { account : AccountId; ledger : Principal; amount : Nat };
+  /// One instrument's quote (§25): the bid and the ask, the quantity each side, the client reference its sides take
+  /// (the bid's with ".b", the ask's with ".a").
+  public type QuoteSide = { instrument : InstrumentId; bidPrice : Nat; askPrice : Nat; qty : Nat; ref : Text };
+  public let MAX_LEVIES = 4;
+  public let MAX_ATTESTED = 64;
+  public let MAX_MASS_QUOTE = 16;
   /// Effects: a flat list of numbers, the family tag first (`BookCore.apply` gives each family's layout).
   public type Effects = [Nat];
 
@@ -208,5 +232,6 @@ module {
     #NotClearing : { member : Nat };
     #CycleNotDue : { due : Nat };
     #FundShort : { required : Nat; paid : Nat };
+    #NotAMaker : { member : Nat; instrument : InstrumentId };
   };
 };

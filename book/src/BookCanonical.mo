@@ -6,6 +6,7 @@
 
 import Blob "mo:core/Blob";
 import List "mo:core/List";
+import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 
@@ -34,6 +35,12 @@ module {
   public func phaseCode(p : T.Phase) : Nat8 { switch (p) { case (#closed) 1; case (#continuous) 2; case (#auction) 3; case (#closingAuction) 4; case (#tradeAtClose) 5; case (#halted) 6 } };
   public func phaseOf(c : Nat8) : ?T.Phase { switch (c) { case 1 ?#closed; case 2 ?#continuous; case 3 ?#auction; case 4 ?#closingAuction; case 5 ?#tradeAtClose; case 6 ?#halted; case _ null } };
 
+  func writeQuote(w : C.Writer, q : T.QuoteSide) { w.nat(q.instrument); w.nat(q.bidPrice); w.nat(q.askPrice); w.nat(q.qty); w.text(q.ref) };
+  func readQuote(r : C.Reader) : ?T.QuoteSide {
+    let ?instrument = r.nat() else return null; let ?bidPrice = r.nat() else return null; let ?askPrice = r.nat() else return null;
+    let ?qty = r.nat() else return null; let ?ref = r.text() else return null;
+    ?{ instrument; bidPrice; askPrice; qty; ref }
+  };
   func writeBands(w : C.Writer, bs : [T.Band]) { w.len16(bs.size()); for (b in bs.vals()) { w.nat(b.fromPrice); w.nat(b.tick) } };
   func readBands(r : C.Reader) : ?[T.Band] {
     let ?n = r.len16() else return null;
@@ -91,6 +98,13 @@ module {
       case (#fundSkin(x)) { w.byte(38); w.nat(x.account); w.nat(x.amount) };
       case (#declareDefault(x)) { w.byte(39); w.nat(x.member); w.text(x.reason) };
       case (#closeDefault(x)) { w.byte(40); w.nat(x.member) };
+      case (#setFeeSchedule(x)) { w.byte(41); w.nat(x.instrument); w.len16(x.levies.size()); for (l in x.levies.vals()) { w.nat(l.account); w.nat(l.ppm) } };
+      case (#sealStatements(x)) { w.byte(42); w.nat(x.day) };
+      case (#reconcileMember(x)) { w.byte(43); w.nat(x.member); w.nat(x.day); w.len16(x.balances.size()); for (b in x.balances.vals()) { w.nat(b.account); w.principal(b.ledger); w.nat(b.amount) } };
+      case (#registerMaker(x)) { w.byte(44); w.nat(x.member); w.nat(x.instrument); w.nat(x.maxSpreadBps); w.nat(x.minQty); w.nat(x.presenceBps); w.nat(x.rebateBps) };
+      case (#quote(x)) { w.byte(45); w.nat(x.account); w.nat(x.member); w.nat(x.trader); writeQuote(w, x.side) };
+      case (#massQuote(x)) { w.byte(46); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.len16(x.sides.size()); for (q in x.sides.vals()) writeQuote(w, q) };
+      case (#settleMakers(x)) { w.byte(47); w.nat(x.day) };
     };
     true
   };
@@ -156,6 +170,32 @@ module {
       case 38 { let ?account = r.nat() else return null; let ?amount = r.nat() else return null; ?#fundSkin({ account; amount }) };
       case 39 { let ?member = r.nat() else return null; let ?reason = r.text() else return null; ?#declareDefault({ member; reason }) };
       case 40 { let ?member = r.nat() else return null; ?#closeDefault({ member }) };
+      case 41 {
+        let ?instrument = r.nat() else return null; let ?n = r.len16() else return null;
+        let out = List.empty<T.Levy>();
+        for (_ in Nat.range(0, n)) { let ?account = r.nat() else return null; let ?ppm = r.nat() else return null; List.add(out, { account; ppm }) };
+        ?#setFeeSchedule({ instrument; levies = List.toArray(out) })
+      };
+      case 42 { let ?day = r.nat() else return null; ?#sealStatements({ day }) };
+      case 43 {
+        let ?member = r.nat() else return null; let ?day = r.nat() else return null; let ?n = r.len16() else return null;
+        let out = List.empty<T.Attested>();
+        for (_ in Nat.range(0, n)) { let ?account = r.nat() else return null; let ?ledger = r.principal() else return null; let ?amount = r.nat() else return null; List.add(out, { account; ledger; amount }) };
+        ?#reconcileMember({ member; day; balances = List.toArray(out) })
+      };
+      case 44 {
+        let ?member = r.nat() else return null; let ?instrument = r.nat() else return null; let ?maxSpreadBps = r.nat() else return null;
+        let ?minQty = r.nat() else return null; let ?presenceBps = r.nat() else return null; let ?rebateBps = r.nat() else return null;
+        ?#registerMaker({ member; instrument; maxSpreadBps; minQty; presenceBps; rebateBps })
+      };
+      case 45 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?trader = r.nat() else return null; let ?side = readQuote(r) else return null; ?#quote({ account; member; trader; side }) };
+      case 46 {
+        let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?trader = r.nat() else return null; let ?n = r.len16() else return null;
+        let out = List.empty<T.QuoteSide>();
+        for (_ in Nat.range(0, n)) { let ?q = readQuote(r) else return null; List.add(out, q) };
+        ?#massQuote({ account; member; trader; sides = List.toArray(out) })
+      };
+      case 47 { let ?day = r.nat() else return null; ?#settleMakers({ day }) };
       case _ null;
     }
   };
@@ -165,7 +205,8 @@ module {
   public let families : [Text] = ["openInstrument", "setTrading", "setReference", "deposit", "withdraw", "placeOrder", "cancelOrder", "amendOrder", "massCancel", "flush", "endOfDay", "expireGtd", "clear",
     "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay", "setBlackout", "liftBlackout", "borrow", "returnBorrow",
     "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle", "settleCycle", "closeOut", "callFund",
-    "contributeFund", "fundSkin", "declareDefault", "closeDefault"];
+    "contributeFund", "fundSkin", "declareDefault", "closeDefault",
+    "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "quote", "massQuote", "settleMakers"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -177,6 +218,8 @@ module {
       case (#setClearing(_)) "setClearing"; case (#setMargin(_)) "setMargin"; case (#admitClearing(_)) "admitClearing"; case (#designateClearing(_)) "designateClearing";
       case (#postCollateral(_)) "postCollateral"; case (#withdrawCollateral(_)) "withdrawCollateral"; case (#cutCycle(_)) "cutCycle"; case (#settleCycle(_)) "settleCycle"; case (#closeOut(_)) "closeOut";
       case (#callFund) "callFund"; case (#contributeFund(_)) "contributeFund"; case (#fundSkin(_)) "fundSkin"; case (#declareDefault(_)) "declareDefault"; case (#closeDefault(_)) "closeDefault";
+      case (#setFeeSchedule(_)) "setFeeSchedule"; case (#sealStatements(_)) "sealStatements"; case (#reconcileMember(_)) "reconcileMember";
+      case (#registerMaker(_)) "registerMaker"; case (#quote(_)) "quote"; case (#massQuote(_)) "massQuote"; case (#settleMakers(_)) "settleMakers";
     }
   };
 

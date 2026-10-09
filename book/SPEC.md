@@ -405,3 +405,50 @@ member order). What it had beyond its loss stays as its collateral, to withdraw;
 the member is closed. Every step is a recorded act, and the waterfall moves claims on the CCP's cash, not cash: the
 CCP's cash is always its members' collateral and contributions plus its skin plus what it is owed, less what it owes
 (checked after every act).
+
+## 22. Fees
+
+An instrument's **fee schedule** (four eyes) names its levies — each a recipient account of the venue's own member (the
+exchange's fee, the depository's, the regulator's) and a rate in parts per million of a fill's value — charged to
+**each side** of every fill. A side's fee is its fill's value × the levies' total rate, computed exactly and quantised
+**once, half-even**, to minor units; the fee is then split among the levies by the largest remainder of their rates
+(the kernel's `Rounding.allocate`), so the parts sum exactly to what was charged and no difference is left to post.
+A pre-funded party pays at the fill. A buy holds at entry its value, the fee on it at its own price rounded up, and
+one minor unit per lot (the most a fill's rounding can take); at each fill it pays the fill's value and fee, its hold
+is recomputed by the same rule for what remains, and the excess returns. A sale's fee is taken from its proceeds. A
+clearing party's fee is owed by its member in the open cycle; the CCP owes it to the levies and pays them at the
+cycle's settlement, after the payers, within its free cash (what it cannot pay rolls to the next cycle). An instrument without a
+schedule charges nothing. Every member's fees are totalled per instrument for the period the next maker settlement closes (§25).
+
+## 23. Member statements
+
+Each fill of a member's account appends a line to the member's open statement (the block, the order, the side, the
+quantity, the price, the fee), chained by SHA-256; the scheduler's `sealStatements` for the market day records every
+open statement's hash and count of lines in the log, and opens the next. A member reads its own statement and its seal.
+
+## 24. Member reconciliation
+
+A trader of a member attests the balances of its member's accounts as of a market day; every attested balance is compared with the book's, the
+matches and the breaks counted, the rows hashed under `thebes.book.reconciliation.v1` and recorded. A break is a
+record, never a correction.
+
+## 25. Market makers
+
+**Registration** (four eyes): a member the exchange admitted as a market maker is registered for an instrument with
+its obligations — the maximum spread in basis points of the mid, the minimum quantity on each side, the presence
+required in basis points of the continuous session — and the rebate it earns when it meets them, in basis points of
+the fees its fills paid on the instrument that day.
+
+**Quotes**: a registered maker's trader enters a two-sided quote (a bid and an ask, a quantity each side) on one of its
+member's accounts, or a mass quote over several instruments. A quote **replaces** the maker's live quote on that
+instrument atomically: both new sides are judged first — with the funds the old quote holds counted as released —
+and either both old sides are cancelled and both new ones entered in the same block, or nothing changes. Quote sides
+are limit orders, good for the day, and trade as any order does.
+
+**Presence** is measured in the fold from the block times: a maker is present on an instrument while the instrument
+is in continuous trading and both sides of its quote are live with at least the minimum quantity each and a spread
+within the maximum. Every act re-judges every registration and accrues the time since the last act to the presence and
+to the continuous session. The scheduler's `settleMakers` for a market day records, for every registration, its
+presence, the session's length and whether the obligation was met, then resets both; a maker that met it is paid its
+rebate from the exchange's fee account. The rebate is the fees its fills paid on that instrument that day × the rebate
+rate, quantised half-even.

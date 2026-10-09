@@ -78,10 +78,26 @@ module {
       case (#sealDay(_)) { w.byte(10); w.nat(e[1]); w.nat(e[2]); w.bytes(Array.tabulate<Nat8>(32, func(i) { Nat8.fromNat(e[3 + i]) })) };
       // effects: [35, order, status, price, shown, member]: the CCP's close-out order, added as any sale is (SPEC §20)
       case (#closeOut(x)) { w.byte(4); w.nat(e[1]); w.nat(x.instrument); w.byte(2); w.nat(e[3]); w.nat(e[4]); list(w, []) };
-      // private: funds, kills, limits, insider lists, securities loans, clearing members' terms, margins and obligations
+      // effects: [45 or 46, quotes, per quote: instrument, cancelled, orders..., then each side's order, status, price,
+      // shown]: a maker's quotes (SPEC §25), each its cancelled orders and the sides it adds
+      case (#quote(_) or #massQuote(_)) {
+        w.byte(11);
+        let n = e[1]; w.len16(n);
+        var p = 2;
+        for (_ in Nat.range(0, n)) {
+          w.nat(e[p]); let nc = e[p + 1]; list(w, slice(e, p + 2, nc)); p += 2 + nc;
+          let adds = Array.filter<Nat>([0, 1], func(k) { e[p + 4 * k + 1] == Nat8.toNat(K.statusCode(#live)) });
+          w.len16(adds.size());
+          for (k in adds.vals()) { w.nat(e[p + 4 * k]); w.byte(if (k == 0) 1 else 2); w.nat(e[p + 4 * k + 2]); w.nat(e[p + 4 * k + 3]) };
+          p += 8;
+        };
+      };
+      // private: funds, kills, limits, insider lists, securities loans, clearing members' terms, margins and obligations,
+      // fee schedules, statements, reconciliations, makers' registrations and periods
       case (#deposit(_) or #withdraw(_) or #flush or #kill(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #borrow(_) or #returnBorrow(_)
         or #setClearing(_) or #setMargin(_) or #admitClearing(_) or #designateClearing(_) or #postCollateral(_) or #withdrawCollateral(_) or #cutCycle(_)
-        or #settleCycle(_) or #callFund or #contributeFund(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_)) w.byte(0);
+        or #settleCycle(_) or #callFund or #contributeFund(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_)
+        or #setFeeSchedule(_) or #sealStatements(_) or #reconcileMember(_) or #registerMaker(_) or #settleMakers(_)) w.byte(0);
     }
   };
 

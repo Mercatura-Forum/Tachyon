@@ -37,6 +37,7 @@ import Page "mo:kernel/rows/Page";
 import R "mo:kernel/rows/StableRows";
 import MP "mo:kernel/proof/MmrProof";
 import Cal "mo:kernel/time/Calendar";
+import Rounding "mo:kernel/num/Rounding";
 
 import X "../../exchange/src/ExchangeCore";
 import XText "../../exchange/src/ExchangeText";
@@ -101,6 +102,13 @@ module {
     Perm.p("book.fund.skin", "fund", #create, #command("fundSkin"), false, false, true),
     Perm.p("book.default.declare", "default", #create, #command("declareDefault"), false, false, true),
     Perm.p("book.default.close", "default", #close, #command("closeDefault"), false, false, true),
+    Perm.p("book.fees.schedule", "fees", #update, #command("setFeeSchedule"), false, false, true),
+    Perm.p("book.statements.seal", "statement", #create, #command("sealStatements"), false, false, false),
+    Perm.p("book.member.reconcile", "reconciliation", #create, #command("reconcileMember"), false, false, false),
+    Perm.p("book.maker.register", "maker", #create, #command("registerMaker"), false, false, true),
+    Perm.p("book.maker.quote", "order", #create, #command("quote"), false, false, false),
+    Perm.p("book.maker.massquote", "order", #create, #command("massQuote"), false, false, false),
+    Perm.p("book.maker.settle", "maker", #update, #command("settleMakers"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -131,6 +139,11 @@ module {
     ("book.cycle.closeout", "the scheduler sells, at the collar, the shares the CCP holds for a member past its deadline or in default; the rule fixes the order"),
     ("book.fund.call", "the scheduler sets each clearing member's fund requirement from its largest cycle purchase in the fold"),
     ("book.fund.contribute", "a trader of the clearing member pays its fund contribution from its settlement account, up to the requirement"),
+    ("book.statements.seal", "the scheduler seals the members' open statements at the market day's end; the lines are the fills the fold recorded"),
+    ("book.member.reconcile", "a trader of the member attests its own accounts' balances; the comparison with the book's is recorded and moves nothing"),
+    ("book.maker.quote", "a registered maker's trader replaces its quote on one of its member's pre-funded accounts, both sides within its funds"),
+    ("book.maker.massquote", "a registered maker's trader replaces up to sixteen quotes at once, each as a quote, all or nothing"),
+    ("book.maker.settle", "the scheduler closes the makers' period at the day's end; presence and rebates are the fold's, none typed"),
   ] };
   public let commandNames : [Text] = K.families;
   public let methodNames : [Text] = ["approve", "reject"];
@@ -404,6 +417,93 @@ module {
     decode = func(a : [Nat8]) : Blob { R.getBlob(a, 0, 32) };
     indexes = [];
   };
+  // ── fees, statements, reconciliation (SPEC §22 to §24) ──
+  /// An instrument's fee schedule: up to four levies, each its recipient account and its rate in parts per million.
+  public let FEE_ROW_BYTES = 49;   // count 1, four levies of account 8 and rate 4
+  public let feeRows : RS.Decl<[T.Levy]> = {
+    table = "feeschedules"; idBytes = 8; rowBytes = FEE_ROW_BYTES;
+    encode = func(x : [T.Levy]) : Blob {
+      let b = R.buf(); R.putNat(b, x.size(), 1);
+      for (k in Nat.range(0, 4)) { if (k < x.size()) { R.putNat(b, x[k].account, 8); R.putNat(b, x[k].ppm, 4) } else { R.putNat(b, 0, 8); R.putNat(b, 0, 4) } };
+      padded(b, FEE_ROW_BYTES)
+    };
+    decode = func(a : [Nat8]) : [T.Levy] { Array.tabulate<T.Levy>(R.getNat(a, 0, 1), func(k) { { account = R.getNat(a, 1 + 12 * k, 8); ppm = R.getNat(a, 9 + 12 * k, 4) } }) };
+    indexes = [];
+  };
+  /// What the CCP owes a levy's account from clearing parties' fees, paid at a cycle (§22).
+  public type Payable = { account : Nat; amount : Nat };
+  public let payableRows : RS.Decl<Payable> = {
+    table = "levypayable"; idBytes = 8; rowBytes = 16;
+    encode = func(x : Payable) : Blob { let b = R.buf(); R.putNat(b, x.account, 8); R.putNat(b, x.amount, 8); padded(b, 16) };
+    decode = func(a : [Nat8]) : Payable { { account = R.getNat(a, 0, 8); amount = R.getNat(a, 8, 8) } };
+    indexes = [{ name = "byAccount"; keyBytes = 8; keyOf = func(_ : Nat, x : Payable) : ?Blob { ?R.key(x.account, 8) } }];
+  };
+  /// A member's fees on an instrument in the makers' open period (§22, §25).
+  public type FeeTotal = { member : Nat; instrument : Nat; fees : Nat };
+  public let feeTotalRows : RS.Decl<FeeTotal> = {
+    table = "feetotals"; idBytes = 8; rowBytes = 24;
+    encode = func(x : FeeTotal) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.instrument, 8); R.putNat(b, x.fees, 8); padded(b, 24) };
+    decode = func(a : [Nat8]) : FeeTotal { { member = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); fees = R.getNat(a, 16, 8) } };
+    indexes = [{ name = "byKey"; keyBytes = 16; keyOf = func(_ : Nat, x : FeeTotal) : ?Blob { ?R.key2(x.member, 8, x.instrument, 8) } }];
+  };
+  /// A member's open statement (§23): the hash chain's head and its count of lines.
+  public type Statement = { member : Nat; head : Blob; lines : Nat };
+  public let statementRows : RS.Decl<Statement> = {
+    table = "statements"; idBytes = 8; rowBytes = 48;
+    encode = func(x : Statement) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putBlob(b, x.head, 32); R.putNat(b, x.lines, 8); R.done(b, 48) };
+    decode = func(a : [Nat8]) : Statement { { member = R.getNat(a, 0, 8); head = R.getBlob(a, 8, 32); lines = R.getNat(a, 40, 8) } };
+    indexes = [{ name = "byMember"; keyBytes = 8; keyOf = func(_ : Nat, x : Statement) : ?Blob { ?R.key(x.member, 8) } }];
+  };
+  /// A sealed statement: the member, the market day, the head and the lines.
+  public type StatementSeal = { member : Nat; day : Nat; head : Blob; lines : Nat };
+  public let statementSealRows : RS.Decl<StatementSeal> = {
+    table = "statementseals"; idBytes = 8; rowBytes = 56;
+    encode = func(x : StatementSeal) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.day, 8); R.putBlob(b, x.head, 32); R.putNat(b, x.lines, 8); R.done(b, 56) };
+    decode = func(a : [Nat8]) : StatementSeal { { member = R.getNat(a, 0, 8); day = R.getNat(a, 8, 8); head = R.getBlob(a, 16, 32); lines = R.getNat(a, 48, 8) } };
+    indexes = [{ name = "byMemberDay"; keyBytes = 16; keyOf = func(_ : Nat, x : StatementSeal) : ?Blob { ?R.key2(x.member, 8, x.day, 8) } }];
+  };
+  /// A member reconciliation (§24): the member, the day, the rows compared, the matches, the breaks, the rows' hash.
+  public type Recon = { member : Nat; day : Nat; rows : Nat; matched : Nat; breaks : Nat; hash : Blob };
+  public let reconRows : RS.Decl<Recon> = {
+    table = "memberrecons"; idBytes = 8; rowBytes = 72;
+    encode = func(x : Recon) : Blob { let b = R.buf(); for (v in [x.member, x.day, x.rows, x.matched, x.breaks].vals()) R.putNat(b, v, 8); R.putBlob(b, x.hash, 32); R.done(b, 72) };
+    decode = func(a : [Nat8]) : Recon { { member = R.getNat(a, 0, 8); day = R.getNat(a, 8, 8); rows = R.getNat(a, 16, 8); matched = R.getNat(a, 24, 8); breaks = R.getNat(a, 32, 8); hash = R.getBlob(a, 40, 32) } };
+    indexes = [];
+  };
+  public let RECON_DOMAIN = "thebes.book.reconciliation.v1";
+  /// A market maker's registration for an instrument (§25): its obligations and rebate, its live quote (the account and
+  /// both sides' orders), and the period's measurement: whether, at the last act, the instrument traded continuously and
+  /// the maker was present, the time of that act, and the time accrued present and in continuous trading.
+  public type Maker = {
+    member : Nat; instrument : Nat; maxSpreadBps : Nat; minQty : Nat; presenceBps : Nat; rebateBps : Nat;
+    account : Nat; bid : Nat; ask : Nat; cont : Bool; present : Bool; lastAt : Nat64; presentNs : Nat; sessionNs : Nat;
+  };
+  public let MAKER_ROW_BYTES = 98;   // nine figures of 8, two flags, the last act 8, presence 8, session 8
+  public let makerRows : RS.Decl<Maker> = {
+    table = "makers"; idBytes = 8; rowBytes = MAKER_ROW_BYTES;
+    encode = func(x : Maker) : Blob {
+      let b = R.buf();
+      for (v in [x.member, x.instrument, x.maxSpreadBps, x.minQty, x.presenceBps, x.rebateBps, x.account, x.bid, x.ask].vals()) R.putNat(b, v, 8);
+      R.putBool(b, x.cont); R.putBool(b, x.present); R.putNat(b, Nat64.toNat(x.lastAt), 8); R.putNat(b, x.presentNs, 8); R.putNat(b, x.sessionNs, 8);
+      padded(b, MAKER_ROW_BYTES)
+    };
+    decode = func(a : [Nat8]) : Maker {
+      { member = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); maxSpreadBps = R.getNat(a, 16, 8); minQty = R.getNat(a, 24, 8); presenceBps = R.getNat(a, 32, 8);
+        rebateBps = R.getNat(a, 40, 8); account = R.getNat(a, 48, 8); bid = R.getNat(a, 56, 8); ask = R.getNat(a, 64, 8); cont = R.getBool(a, 72); present = R.getBool(a, 73);
+        lastAt = Nat64.fromNat(R.getNat(a, 74, 8)); presentNs = R.getNat(a, 82, 8); sessionNs = R.getNat(a, 90, 8) }
+    };
+    indexes = [{ name = "byKey"; keyBytes = 16; keyOf = func(_ : Nat, x : Maker) : ?Blob { ?R.key2(x.member, 8, x.instrument, 8) } }];
+  };
+  /// A maker's period closed (§25): the day, the time present and in continuous trading, whether the obligation was met,
+  /// the rebate paid.
+  public type MakerDay = { member : Nat; instrument : Nat; day : Nat; presentNs : Nat; sessionNs : Nat; met : Bool; rebate : Nat };
+  public let makerDayRows : RS.Decl<MakerDay> = {
+    table = "makerdays"; idBytes = 8; rowBytes = 49;
+    encode = func(x : MakerDay) : Blob { let b = R.buf(); for (v in [x.member, x.instrument, x.day, x.presentNs, x.sessionNs].vals()) R.putNat(b, v, 8); R.putBool(b, x.met); R.putNat(b, x.rebate, 8); padded(b, 49) };
+    decode = func(a : [Nat8]) : MakerDay { { member = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); day = R.getNat(a, 16, 8); presentNs = R.getNat(a, 24, 8); sessionNs = R.getNat(a, 32, 8); met = R.getBool(a, 40); rebate = R.getNat(a, 41, 8) } };
+    indexes = [];
+  };
+  public let MAX_MAKERS = 32;
   /// A drop-copy row (SPEC §14): a block that concerns a member, and whether it is the member's own act.
   public type DropRow = { member : Nat; block : Nat; own : Bool };
   public let DROP_ROW_BYTES = 17;   // member 8, block 8, own 1
@@ -457,6 +557,7 @@ module {
     and PRINCIPAL_BYTES * 2 + 8 + 8 + 1 + T.MAX_BANDS * 16 + 4 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 8 == 390 and 390 <= INSTRUMENT_ROW_BYTES
     and 8 + 8 + 1 <= KILL_ROW_BYTES and 8 * 5 == LIMIT_ROW_BYTES
     and 32 <= REF_ROW_BYTES and 1 <= DUE_ROW_BYTES
+    and 1 + 4 * (8 + 4) == FEE_ROW_BYTES and 9 * 8 + 2 + 8 * 3 == MAKER_ROW_BYTES
     and 8 * 12 + 1 == CLEARING_ROW_BYTES and 1 + PRINCIPAL_BYTES + 8 * 4 == LEG_ROW_BYTES and 8 + 8 + PRINCIPAL_BYTES + 8 * 6 == TERMS_BYTES
   };
 
@@ -489,6 +590,12 @@ module {
     legStore : RS.Store; var nextLeg : Nat; nodeStore : RS.Store; var nextNode : Nat;
     /// The index of the block being applied (a leg records it); set before every apply, by the append or by the replay.
     var applying : Nat;
+    /// Fees, statements, reconciliations (SPEC §22 to §24).
+    feeStore : RS.Store; payableStore : RS.Store; var nextPayable : Nat; feeTotalStore : RS.Store; var nextFeeTotal : Nat;
+    statementStore : RS.Store; var nextStatement : Nat; statementSealStore : RS.Store; var nextStatementSeal : Nat; var lastStatementDay : Nat;
+    reconStore : RS.Store; var nextRecon : Nat;
+    /// Market makers (SPEC §25).
+    makerStore : RS.Store; var nextMaker : Nat; makerDayStore : RS.Store; var nextMakerDay : Nat; var lastMakerDay : Nat;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -515,6 +622,10 @@ module {
       obligationStore = RS.newStore(obligationRows); var nextObligation = 1; boughtStore = RS.newStore(boughtRows); var nextBought = 1; cycleStore = RS.newStore(cycleRows);
       var cycleNo = 1; var settledThrough = 0; var lastCut = 0; var ccpCommitted = 0; var skin = 0;
       legStore = RS.newStore(legRows); var nextLeg = 0; nodeStore = RS.newStore(nodeRows); var nextNode = 0; var applying = 0;
+      feeStore = RS.newStore(feeRows); payableStore = RS.newStore(payableRows); var nextPayable = 1; feeTotalStore = RS.newStore(feeTotalRows); var nextFeeTotal = 1;
+      statementStore = RS.newStore(statementRows); var nextStatement = 1; statementSealStore = RS.newStore(statementSealRows); var nextStatementSeal = 1; var lastStatementDay = 0;
+      reconStore = RS.newStore(reconRows); var nextRecon = 1;
+      makerStore = RS.newStore(makerRows); var nextMaker = 1; makerDayStore = RS.newStore(makerDayRows); var nextMakerDay = 1; var lastMakerDay = 0;
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -669,6 +780,198 @@ module {
   };
   func holdingLedger(i : T.Instrument, side : T.Side) : Principal { switch (side) { case (#buy) i.cashLedger; case (#sell) i.assetLedger } };
   func holdingOf(side : T.Side, price : Nat, qty : Nat) : Nat { switch (side) { case (#buy) price * qty; case (#sell) qty } };
+  // ─── fees (SPEC §22) ───────────────────────────────────────────────────────────────────────
+  public let PPM = 1_000_000;
+  public func feeSchedule(s : State, inst : Nat) : [T.Levy] { switch (RS.get(s.feeStore, feeRows, inst)) { case (?x) x; case null [] } };
+  func feePpm(s : State, inst : Nat) : Nat { var t = 0; for (l in feeSchedule(s, inst).vals()) t += l.ppm; t };
+  /// A side's fee on a value: value × the total rate, quantised once, half-even.
+  public func feeOn(s : State, inst : Nat, value : Nat) : Nat {
+    let ppm = feePpm(s, inst);
+    if (ppm == 0) return 0;
+    let n = value * ppm; let q = n / PPM; let r = n % PPM;
+    if (2 * r > PPM) q + 1 else if (2 * r < PPM) q else q + q % 2
+  };
+  /// What a pre-funded buy holds for `qty` at `price`: the value, the fee on it rounded up, one minor unit per lot (the
+  /// most a fill's half-even rounding can take); the value alone without a schedule.
+  func buyHold(s : State, i : T.Instrument, inst : Nat, price : Nat, qty : Nat) : Nat {
+    let ppm = feePpm(s, inst);
+    if (ppm == 0) price * qty else price * qty + ceilDiv(price * qty * ppm, PPM) + qty / i.lot
+  };
+  func holdNeed(s : State, i : T.Instrument, inst : Nat, side : T.Side, price : Nat, qty : Nat) : Nat {
+    switch (side) { case (#buy) buyHold(s, i, inst, price, qty); case (#sell) qty }
+  };
+  /// A fee split among the instrument's levies by the largest remainder of their rates (the kernel's allocation).
+  func feeParts(s : State, inst : Nat, fee : Nat) : [(Nat, Nat)] {
+    let levies = feeSchedule(s, inst);
+    if (fee == 0 or levies.size() == 0) return [];
+    switch (Rounding.allocate(fee, Array.map<T.Levy, Nat>(levies, func(l) { l.ppm }))) {
+      case (#ok(parts)) Array.tabulate<(Nat, Nat)>(levies.size(), func(k) { (levies[k].account, parts[k]) });
+      case (#err(_)) Runtime.trap("fees: a schedule's rates were checked above zero");
+    }
+  };
+  /// A pre-funded party's fee paid from its account to the levies, each part a leg (kind 4).
+  func payFee(s : State, inst : Nat, account : Nat, ledger : Principal, fee : Nat) {
+    for ((to, part) in feeParts(s, inst, fee).vals()) { if (part > 0) { move(s, account, to, ledger, part); appendLeg(s, 4, ledger, account, to, part) } };
+  };
+  /// A clearing party's fee: the CCP owes it to the levies until a cycle pays them.
+  func owePayable(s : State, inst : Nat, fee : Nat) {
+    for ((to, part) in feeParts(s, inst, fee).vals()) {
+      if (part > 0) {
+        switch (one(s.payableStore, payableRows, "byAccount", R.key(to, 8))) {
+          case (?(id, x)) RS.put(s.payableStore, payableRows, id, { x with amount = x.amount + part });
+          case null { let id = s.nextPayable; s.nextPayable += 1; RS.put(s.payableStore, payableRows, id, { account = to; amount = part }) };
+        };
+      };
+    };
+  };
+  public func payableTotal(s : State) : Nat { var t = 0; var i = 1; while (i < s.nextPayable) { switch (RS.get(s.payableStore, payableRows, i)) { case (?x) t += x.amount; case null {} }; i += 1 }; t };
+  func addFeeTotal(s : State, member : Nat, inst : Nat, fee : Nat) {
+    if (fee == 0) return;
+    switch (one(s.feeTotalStore, feeTotalRows, "byKey", R.key2(member, 8, inst, 8))) {
+      case (?(id, x)) RS.put(s.feeTotalStore, feeTotalRows, id, { x with fees = x.fees + fee });
+      case null { let id = s.nextFeeTotal; s.nextFeeTotal += 1; RS.put(s.feeTotalStore, feeTotalRows, id, { member; instrument = inst; fees = fee }) };
+    }
+  };
+  public func feeTotalOf(s : State, member : Nat, inst : Nat) : Nat { switch (one(s.feeTotalStore, feeTotalRows, "byKey", R.key2(member, 8, inst, 8))) { case (?(_, x)) x.fees; case null 0 } };
+
+  // ─── statements (SPEC §23) ─────────────────────────────────────────────────────────────────
+  public func statementOf(s : State, member : Nat) : Statement {
+    switch (one(s.statementStore, statementRows, "byMember", R.key(member, 8))) { case (?(_, x)) x; case null ({ member; head = F.genesis(); lines = 0 } : Statement) }
+  };
+  /// A statement line: the block, the order, the side (1 buy, 2 sell), the quantity, the price, the fee; chained.
+  public func statementLine(block : Nat, order : Nat, side : Nat, qty : Nat, price : Nat, fee : Nat) : Blob {
+    let w = C.Writer(); for (v in [block, order, side, qty, price, fee].vals()) w.nat(v); w.toBlob()
+  };
+  public func chainLine(head : Blob, line : Blob) : Blob { Sha256.fromArray(#sha256, Array.concat<Nat8>(Blob.toArray(head), Blob.toArray(line))) };
+  func appendStatement(s : State, member : Nat, order : Nat, side : T.Side, qty : Nat, price : Nat, fee : Nat) {
+    let line = statementLine(s.applying, order, (if (side == #buy) 1 else 2), qty, price, fee);
+    switch (one(s.statementStore, statementRows, "byMember", R.key(member, 8))) {
+      case (?(id, x)) RS.put(s.statementStore, statementRows, id, { x with head = chainLine(x.head, line); lines = x.lines + 1 });
+      case null { let id = s.nextStatement; s.nextStatement += 1; RS.put(s.statementStore, statementRows, id, { member; head = chainLine(F.genesis(), line); lines = 1 }) };
+    }
+  };
+  public func statementSealOf(s : State, member : Nat, day : Nat) : ?StatementSeal { switch (one(s.statementSealStore, statementSealRows, "byMemberDay", R.key2(member, 8, day, 8))) { case (?(_, x)) ?x; case null null } };
+  public func reconOf(s : State, id : Nat) : ?Recon { RS.get(s.reconStore, reconRows, id) };
+
+  // ─── market makers (SPEC §25) ──────────────────────────────────────────────────────────────
+  public func makerOf(s : State, member : Nat, inst : Nat) : ?(Nat, Maker) { one(s.makerStore, makerRows, "byKey", R.key2(member, 8, inst, 8)) };
+  public func makerDayOf(s : State, id : Nat) : ?MakerDay { RS.get(s.makerDayStore, makerDayRows, id) };
+  /// Whether a maker is present now: its instrument trading continuously, both sides of its quote live with at least
+  /// the minimum quantity each, the spread within the maximum (spread × 20,000 ≤ the maximum × (bid + ask)).
+  func presentNow(s : State, m : Maker) : (Bool, Bool) {
+    let cont = switch (instrument(s, m.instrument)) { case (?i) i.phase == #continuous; case null false };
+    if (not cont or m.bid == 0) return (cont, false);
+    switch (order(s, m.bid), order(s, m.ask)) {
+      case (?b, ?a) {
+        let ok = b.status == #live and a.status == #live and b.remaining >= m.minQty and a.remaining >= m.minQty and a.price > b.price
+          and (a.price - b.price) * 20_000 <= m.maxSpreadBps * (a.price + b.price);
+        (cont, ok)
+      };
+      case (_) (cont, false);
+    }
+  };
+  /// After every act: each registration accrues the time since the last act to its continuous session and its presence
+  /// (as the last act left them), then is judged again as this act leaves it.
+  func accrueMakers(s : State, now : Nat64) {
+    var id = 1;
+    while (id < s.nextMaker) {
+      switch (RS.get(s.makerStore, makerRows, id)) {
+        case (?m) {
+          let dt = if (m.lastAt != 0 and now > m.lastAt) Nat64.toNat(now - m.lastAt) else 0;
+          let (cont, present) = presentNow(s, m);
+          let next = { m with sessionNs = m.sessionNs + (if (m.cont) dt else 0); presentNs = m.presentNs + (if (m.present) dt else 0); cont; present; lastAt = now };
+          if (next != m) RS.put(s.makerStore, makerRows, id, next);
+        };
+        case null {};
+      };
+      id += 1;
+    };
+  };
+  /// A quote's entry checks (§25), for every side of a quote or mass quote on one pre-funded account: the maker
+  /// registered, the instrument open, both prices on the tick and within the static band, the bid below the ask, whole
+  /// lots, fresh client references, and the funds — what the replaced quotes hold counted as released.
+  func quoteRefusal(s : State, xs : X.State, now : Nat64, caller : Principal, account : Nat, member : Nat, trader : Nat, sides : [T.QuoteSide]) : ?T.Error {
+    switch (ownAccount(xs, caller, account)) { case (?e) return ?e; case null {} };
+    switch (X.account(xs, account), X.traderByPrincipal(xs, caller)) {
+      case (?a, ?(tid, _)) { if (a.member != member or tid != trader) return ?#NotYourAccount({ account }) };
+      case (_) return ?#NotYourAccount({ account });
+    };
+    if (isCcp(s, account) or clearingOf(s, account) != null) return ?#InvalidTerms({ reason = "a quote on a pre-funded account" });
+    if (sides.size() == 0 or sides.size() > T.MAX_MASS_QUOTE) return ?#InvalidTerms({ reason = "one to sixteen quotes" });
+    switch (killedFor(s, member, trader)) { case (?k) return ?#Killed({ kill = k }); case null {} };
+    var cashNeed = 0; var cashFreed = 0; var netAdded : Int = 0;
+    var cashLedger : ?Principal = null;
+    for (k in Nat.range(0, sides.size())) {
+      let q = sides[k];
+      for (j in Nat.range(0, k)) { if (sides[j].instrument == q.instrument) return ?#InvalidTerms({ reason = "one quote an instrument" }) };
+      let ?(_, mk) = makerOf(s, member, q.instrument) else return ?#NotAMaker({ member; instrument = q.instrument });
+      switch (X.mayTrade(xs, caller, q.instrument)) { case (?e) return ?#MayNotTrade({ code = XText.code(e) }); case null {} };
+      let ?i = instrument(s, q.instrument) else return ?#UnknownInstrument({ instrument = q.instrument });
+      if (i.phase == #halted) return ?#InstrumentHalted({ instrument = q.instrument });
+      if (blackedOut(s, xs, account, q.instrument, now)) return ?#InsiderBlackout({ instrument = q.instrument });
+      if (q.qty == 0 or q.qty % i.lot != 0) return ?#NotALot({ qty = q.qty; lot = i.lot });
+      let n = Text.encodeUtf8(q.ref).size();
+      if (n == 0 or n + 2 > T.CLIENT_REF_BYTES) return ?#InvalidTerms({ reason = "a quote reference of 1 to 18 bytes" });
+      for (side in [".b", ".a"].vals()) { if (orderByRef(s, account, q.ref # side) != null) return ?#DuplicateClientRef({ clientRef = q.ref # side }) };
+      for (p in [q.bidPrice, q.askPrice].vals()) {
+        if (not L.onTick(i.bands, p)) return ?#PriceOffTick({ price = p; tick = L.tickAt(i.bands, p) });
+        let (lo, hi) = L.band(i.referencePrice, i.staticBps);
+        if (p < lo or p > hi) return ?#PriceOutsideBand({ price = p; low = lo; high = hi });
+      };
+      if (q.bidPrice >= q.askPrice) return ?#InvalidPrice({ reason = "a bid below the ask" });
+      // the replaced quote's funds count as released; its open value as replaced in the risk limits
+      let (oldBidHeld, oldAskHeld, oldValue) = switch (mk.account == account) {
+        case true {
+          let bh = switch (order(s, mk.bid)) { case (?o) (if (isLiveish(o)) o.held else 0); case null 0 };
+          let ah = switch (order(s, mk.ask)) { case (?o) (if (isLiveish(o)) o.held else 0); case null 0 };
+          let ov = (switch (order(s, mk.bid)) { case (?o) openValue(o); case null 0 }) + (switch (order(s, mk.ask)) { case (?o) openValue(o); case null 0 });
+          (bh, ah, ov)
+        };
+        case false (0, 0, 0);
+      };
+      let value = (q.bidPrice + q.askPrice) * q.qty;
+      switch (riskRefusal(s, member, q.qty, value, oldValue)) { case (?e) return ?e; case null {} };
+      // the earlier quotes of a mass quote count against the member's credit with this one
+      netAdded += value - oldValue;
+      switch (limitsOf(s, member)) {
+        case (?(_, r)) { let use = r.limits.used + netAdded; if (r.limits.creditLimit != 0 and use > r.limits.creditLimit) return ?#RiskLimit({ figure = "credit"; limit = r.limits.creditLimit; wanted = Int.abs(use) }) };
+        case null {};
+      };
+      switch (cashLedger) { case (?l) { if (not Principal.equal(l, i.cashLedger)) return ?#InvalidTerms({ reason = "quotes in one currency" }) }; case null cashLedger := ?i.cashLedger };
+      cashNeed += buyHold(s, i, q.instrument, q.bidPrice, q.qty); cashFreed += oldBidHeld;
+      let freeShares = ownedFree(s, account, i, q.instrument) + oldAskHeld;
+      if (q.qty > freeShares) return ?#ShortSaleNotFlagged({ free = freeShares; wanted = q.qty });
+    };
+    switch (cashLedger) {
+      case (?l) { let b = balance(s, account, l); if (cashNeed > b.available + cashFreed) return ?#InsufficientFunds({ ledger = l; available = b.available + cashFreed; wanted = cashNeed }) };
+      case null {};
+    };
+    null
+  };
+  /// The quotes entered: for each instrument, the maker's live sides cancelled, then the bid and the ask placed as limit
+  /// orders good for the day (each as an order's entry is applied). Effects per quote: the instrument, the orders
+  /// cancelled, then each side's order, status, price and shown quantity.
+  func enterQuotes(s : State, now : Nat64, account : Nat, member : Nat, trader : Nat, sides : [T.QuoteSide], tag : Nat) : T.Effects {
+    let fx = List.empty<Nat>(); List.add(fx, tag); List.add(fx, sides.size());
+    for (q in sides.vals()) {
+      let ?(mid, mk) = makerOf(s, member, q.instrument) else Runtime.trap("quote: a maker vanished");
+      let cancelled = List.empty<Nat>();
+      for (oid in [mk.bid, mk.ask].vals()) { switch (order(s, oid)) { case (?o) { if (isLiveish(o)) { close(s, oid, o, #cancelled); List.add(cancelled, oid) } }; case null {} } };
+      let place = func(side : T.Side, price : Nat, ref : Text) : [Nat] {
+        applyCommand(s, now, #placeOrder({ account; instrument = q.instrument; side; kind = #limit; qty = q.qty; price; stopPrice = 0; peak = 0; validity = #day; gtdDay = 0;
+          selfTrade = #cancelResting; capacity = #principal; shortSale = false; clientRef = ref; oco = 0; trail = 0; member; trader }))
+      };
+      let eb = place(#buy, q.bidPrice, q.ref # ".b");
+      let ea = place(#sell, q.askPrice, q.ref # ".a");
+      // own resting orders the sides crossed were cancelled at their entry (self-trade prevention, §3.5)
+      for (e in [eb, ea].vals()) { for (k in Nat.range(5, e.size())) List.add(cancelled, e[k]) };
+      RS.put(s.makerStore, makerRows, mid, { mk with account; bid = eb[1]; ask = ea[1] });
+      List.add(fx, q.instrument); List.add(fx, List.size(cancelled)); for (c in List.values(cancelled)) List.add(fx, c);
+      for (e in [eb, ea].vals()) { for (k in Nat.range(1, 5)) List.add(fx, e[k]) };
+    };
+    List.toArray(fx)
+  };
+
   /// Available funds leaving an account (a transfer the checks covered).
   func debit(s : State, account : Nat, ledger : Principal, amount : Nat) {
     if (amount == 0) return;
@@ -1041,7 +1344,7 @@ module {
         };
         let price = effectivePrice(i, x.side, x.kind, x.price);
         switch (riskRefusal(s, x.member, x.qty, price * x.qty, 0)) { case (?e) return ?e; case null {} };
-        let need = holdingOf(x.side, price, x.qty);
+        let need = holdNeed(s, i, x.instrument, x.side, price, x.qty);
         let ledger = holdingLedger(i, x.side);
         // self-trade prevention (§3.5), judged with the account's own live orders now: cancel-incoming refuses;
         // cancel-both cancels the incoming order too, so it holds nothing; cancel-resting cancels own orders on the
@@ -1077,7 +1380,7 @@ module {
           else if (x.qty > o.remaining) { let free = sellableFree(s, o.account, i, o.instrument); if (x.qty - o.remaining > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty - o.remaining }) };
         };
         switch (riskRefusal(s, o.member, x.qty, x.price * x.qty, openValue(o))) { case (?e) return ?e; case null {} };
-        let need = holdingOf(o.side, x.price, x.qty);
+        let need = holdNeed(s, i, o.instrument, o.side, x.price, x.qty);
         let ledger = holdingLedger(i, o.side);
         switch (clearingOf(s, o.account)) {
           case null { let b = balance(s, o.account, ledger); if (need > o.held and b.available < need - o.held) return ?#InsufficientFunds({ ledger; available = b.available; wanted = need - o.held }) };
@@ -1326,10 +1629,73 @@ module {
         if (r.owedTo != 0 or r.owedBy != 0) return ?#InvalidTerms({ reason = "the member's cycles settled first" });
         null
       };
+      // SPEC §22 to §25
+      case (#setFeeSchedule(x)) {
+        if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (x.levies.size() == 0 or x.levies.size() > T.MAX_LEVIES) return ?#InvalidTerms({ reason = "one to four levies" });
+        var total = 0;
+        for (k in Nat.range(0, x.levies.size())) {
+          let l = x.levies[k];
+          if (l.ppm == 0) return ?#InvalidTerms({ reason = "a levy's rate above zero" });
+          total += l.ppm;
+          let ?a = X.account(xs, l.account) else return ?#UnknownAccount({ account = l.account });
+          if (a.status != #open) return ?#AccountClosed({ account = l.account });
+          if (isCcp(s, l.account) or clearingOf(s, l.account) != null) return ?#InvalidTerms({ reason = "a levy's account neither the CCP's nor a clearing account" });
+          for (j in Nat.range(0, k)) { if (x.levies[j].account == l.account) return ?#InvalidTerms({ reason = "a levy's account once" }) };
+        };
+        if (total > 100_000) return ?#InvalidTerms({ reason = "fees of at most 10 per cent a side" });
+        // a buy holds its fee at entry, so the schedule changes only while no buy of the instrument is open
+        if (openBuy(s, x.instrument)) return ?#InvalidTerms({ reason = "an instrument with no open buy" });
+        null
+      };
+      case (#sealStatements(x)) {
+        if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day of the act" });
+        if (x.day <= s.lastStatementDay) return ?#InvalidTerms({ reason = "a day later than the last sealed" });
+        null
+      };
+      case (#reconcileMember(x)) {
+        let ?(_, t) = X.traderByPrincipal(xs, caller) else return ?#NotYourAccount({ account = 0 });
+        if (t.status != #active or t.member != x.member) return ?#NotYourAccount({ account = 0 });
+        if (x.day > X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "a day not to come" });
+        if (x.balances.size() == 0 or x.balances.size() > T.MAX_ATTESTED) return ?#InvalidTerms({ reason = "one to sixty-four balances" });
+        for (k in Nat.range(0, x.balances.size())) {
+          let b = x.balances[k];
+          let ?a = X.account(xs, b.account) else return ?#UnknownAccount({ account = b.account });
+          if (a.member != x.member) return ?#NotYourAccount({ account = b.account });
+          for (j in Nat.range(0, k)) { if (x.balances[j].account == b.account and Principal.equal(x.balances[j].ledger, b.ledger)) return ?#InvalidTerms({ reason = "a balance once" }) };
+        };
+        null
+      };
+      case (#registerMaker(x)) {
+        let ?m = X.member(xs, x.member) else return ?#InvalidTerms({ reason = "no such member" });
+        if (not m.marketMaker) return ?#NotAMaker({ member = x.member; instrument = x.instrument });
+        if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (makerOf(s, x.member, x.instrument) != null) return ?#InvalidTerms({ reason = "already registered" });
+        if (s.nextMaker > MAX_MAKERS) return ?#InvalidTerms({ reason = "at most 32 registrations" });
+        if (x.maxSpreadBps == 0 or x.maxSpreadBps > 10_000 or x.minQty == 0 or x.presenceBps > 10_000 or x.rebateBps > 10_000) return ?#InvalidTerms({ reason = "a spread, a quantity, a presence and a rebate within their ranges" });
+        null
+      };
+      case (#quote(x)) quoteRefusal(s, xs, now, caller, x.account, x.member, x.trader, [x.side]);
+      case (#massQuote(x)) quoteRefusal(s, xs, now, caller, x.account, x.member, x.trader, x.sides);
+      case (#settleMakers(x)) {
+        if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day of the act" });
+        if (x.day <= s.lastMakerDay) return ?#InvalidTerms({ reason = "a day later than the last settled" });
+        null
+      };
     }
   };
   /// Whether an account is the central counterparty's.
   func isCcp(s : State, account : Nat) : Bool { switch (s.clearing) { case (?t) t.ccpAccount == account; case null false } };
+  /// Whether an instrument has a live or waiting buy (its book side or its stops).
+  func openBuy(s : State, inst : Nat) : Bool {
+    var found = false;
+    for (ix in [BOOK, STOPS].vals()) {
+      let prefix = sidePrefix(inst, #buy);
+      let (lo, hi) = span(prefix, 48);
+      walk(s, ix, prefix, lo, hi, 8, func(_ : Nat, o : T.Order) : Bool { if (isLiveish(o) and o.instrument == inst and o.side == #buy) { found := true; false } else true });
+    };
+    found
+  };
   /// Whether an account has a live or waiting order.
   func hasLiveOrder(s : State, account : Nat) : Bool {
     let prefix = accountPrefix(account);
@@ -1503,7 +1869,13 @@ module {
   ///   [instrument, phase]; uncross: [instrument, price, volume, pairs, (buy, sell, quantity)..., cancelled, orders...,
   ///   icebergs traded, (order, shown)..., phase after]; halt, resume: [instrument]; kill: [kill]; killSweep: [kill, count, orders...]; revive: [kill];
   ///   setLimits: [member].
+  /// A command applied, then every market maker's presence accrued to its time (SPEC §25).
   public func apply(s : State, now : Nat64, c : T.Command) : T.Effects {
+    let e = applyCommand(s, now, c);
+    accrueMakers(s, now);
+    e
+  };
+  func applyCommand(s : State, now : Nat64, c : T.Command) : T.Effects {
     switch (c) {
       case (#openInstrument(x)) {
         RS.put<T.Instrument>(s.instrumentRows, instruments, x.instrument, { assetLedger = x.assetLedger; cashLedger = x.cashLedger; lot = x.lot; referencePrice = x.referencePrice; bands = x.bands;
@@ -1547,13 +1919,13 @@ module {
             if (x.selfTrade == #cancelBoth) incomingCancelled := true;
           };
         };
-        let need = holdingOf(x.side, price, x.qty);
+        let need = holdNeed(s, i, x.instrument, x.side, price, x.qty);
         let key = K.orderKey(x.account, x.side, price, x.qty, x.clientRef);
         let status : T.Status = if (incomingCancelled) #cancelled else if (stop) #waiting else #live;
         // a pre-funded order holds what it needs; a clearing buy its initial margin, a clearing sale its pledged shares
         let held = if (incomingCancelled) 0 else switch (clearingOf(s, x.account)) {
           case null { hold(s, x.account, holdingLedger(i, x.side), need); need };
-          case (?m) { switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, need); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } } };
+          case (?m) { switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, price * x.qty); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } } };
         };
         putOrder(s, id, { account = x.account; instrument = x.instrument; side = x.side; kind = x.kind; qty = x.qty; remaining = x.qty; price; stopPrice = x.stopPrice;
           peak = x.peak; validity = x.validity; gtdDay = x.gtdDay; selfTrade = x.selfTrade; capacity = x.capacity; shortSale = x.shortSale; clientRef = x.clientRef;
@@ -1577,10 +1949,10 @@ module {
         let ?i = instrument(s, o.instrument) else Runtime.trap("apply: instrument vanished");
         let keeps = x.price == o.price and x.qty <= o.remaining;
         let ledger = holdingLedger(i, o.side);
-        let need = holdingOf(o.side, x.price, x.qty);
+        let need = holdNeed(s, i, o.instrument, o.side, x.price, x.qty);
         let held = switch (clearingOf(s, o.account)) {
           case null { if (need > o.held) hold(s, o.account, ledger, need - o.held) else release(s, o.account, ledger, o.held - need); need };
-          case (?m) { switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, need); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } } };
+          case (?m) { switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, x.price * x.qty); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } } };
         };
         let qty = o.filled + x.qty;
         putOrder(s, x.order, { o with remaining = x.qty; qty; price = x.price; held; prio = if (keeps) o.prio else now;
@@ -1772,16 +2144,101 @@ module {
         [39, x.member, k]
       };
       case (#closeDefault(x)) closeDefault(s, x.member);
+      case (#setFeeSchedule(x)) { RS.put(s.feeStore, feeRows, x.instrument, x.levies); [41, x.instrument, x.levies.size()] };
+      case (#sealStatements(x)) {
+        let fx = List.empty<Nat>(); List.add(fx, 42); List.add(fx, x.day);
+        let sealed = List.empty<(Nat, Nat)>();
+        var id = 1;
+        while (id < s.nextStatement) {
+          switch (RS.get(s.statementStore, statementRows, id)) {
+            case (?st) {
+              if (st.lines > 0) {
+                RS.put(s.statementSealStore, statementSealRows, s.nextStatementSeal, { member = st.member; day = x.day; head = st.head; lines = st.lines }); s.nextStatementSeal += 1;
+                RS.put(s.statementStore, statementRows, id, { st with head = F.genesis(); lines = 0 });
+                List.add(sealed, (st.member, st.lines));
+              };
+            };
+            case null {};
+          };
+          id += 1;
+        };
+        s.lastStatementDay := x.day;
+        List.add(fx, List.size(sealed)); for ((m, n) in List.values(sealed)) { List.add(fx, m); List.add(fx, n) };
+        List.toArray(fx)
+      };
+      case (#reconcileMember(x)) {
+        let w = C.Writer(); w.text(RECON_DOMAIN); w.nat(x.member); w.nat(x.day); w.nat(x.balances.size());
+        var matched = 0;
+        for (b in x.balances.vals()) {
+          let have = balance(s, b.account, b.ledger);
+          let book = have.available + have.held;
+          if (book == b.amount) matched += 1;
+          w.nat(b.account); w.principal(b.ledger); w.nat(b.amount); w.nat(book);
+        };
+        let id = s.nextRecon; s.nextRecon += 1;
+        let breaks = x.balances.size() - matched;
+        RS.put(s.reconStore, reconRows, id, { member = x.member; day = x.day; rows = x.balances.size(); matched; breaks; hash = Sha256.fromArray(#sha256, w.toArray()) });
+        [43, id, matched, breaks]
+      };
+      case (#registerMaker(x)) {
+        let id = s.nextMaker; s.nextMaker += 1;
+        RS.put(s.makerStore, makerRows, id, { member = x.member; instrument = x.instrument; maxSpreadBps = x.maxSpreadBps; minQty = x.minQty; presenceBps = x.presenceBps;
+          rebateBps = x.rebateBps; account = 0; bid = 0; ask = 0; cont = false; present = false; lastAt = now; presentNs = 0; sessionNs = 0 });
+        [44, id]
+      };
+      case (#quote(x)) enterQuotes(s, now, x.account, x.member, x.trader, [x.side], 45);
+      case (#massQuote(x)) enterQuotes(s, now, x.account, x.member, x.trader, x.sides, 46);
+      case (#settleMakers(x)) settleMakers(s, now, x.day);
     }
   };
 
+  /// SPEC §25: the makers' period closed for a market day. Every registration's presence accrued to now; the
+  /// obligation met when it was present for at least its required share of the continuous session (and there was one);
+  /// a maker that met it paid its rebate — its fees on the instrument in the period × its rebate rate, half-even — from
+  /// the exchange's fee account (the schedule's first levy) to its quote's account, when that account holds it; the
+  /// period's figures reset. Effects: [47, day, registrations, (member, instrument, present, session, met, rebate)...].
+  func settleMakers(s : State, now : Nat64, day : Nat) : T.Effects {
+    accrueMakers(s, now);
+    let fx = List.empty<Nat>(); List.add(fx, 47); List.add(fx, day); List.add(fx, s.nextMaker - 1);
+    var id = 1;
+    while (id < s.nextMaker) {
+      switch (RS.get(s.makerStore, makerRows, id)) {
+        case (?m) {
+          let met = m.sessionNs > 0 and m.presentNs * 10_000 >= m.presenceBps * m.sessionNs;
+          let fees = feeTotalOf(s, m.member, m.instrument);
+          let n = fees * m.rebateBps; let q = n / 10_000; let r = n % 10_000;
+          let due = if (2 * r > 10_000) q + 1 else if (2 * r < 10_000) q else q + q % 2;
+          var rebate = 0;
+          let levies = feeSchedule(s, m.instrument);
+          switch (instrument(s, m.instrument)) {
+            case (?i) {
+              if (met and due > 0 and m.account != 0 and levies.size() > 0 and balance(s, levies[0].account, i.cashLedger).available >= due) {
+                move(s, levies[0].account, m.account, i.cashLedger, due);
+                appendLeg(s, 5, i.cashLedger, levies[0].account, m.account, due);
+                rebate := due;
+              };
+            };
+            case null {};
+          };
+          RS.put(s.makerDayStore, makerDayRows, s.nextMakerDay, { member = m.member; instrument = m.instrument; day; presentNs = m.presentNs; sessionNs = m.sessionNs; met; rebate }); s.nextMakerDay += 1;
+          RS.put(s.makerStore, makerRows, id, { m with presentNs = 0; sessionNs = 0 });
+          switch (one(s.feeTotalStore, feeTotalRows, "byKey", R.key2(m.member, 8, m.instrument, 8))) { case (?(fid, f)) RS.put(s.feeTotalStore, feeTotalRows, fid, { f with fees = 0 }); case null {} };
+          for (v in [m.member, m.instrument, m.presentNs, m.sessionNs, (if (met) 1 else 0), rebate].vals()) List.add(fx, v);
+        };
+        case null {};
+      };
+      id += 1;
+    };
+    s.lastMakerDay := day;
+    List.toArray(fx)
+  };
   /// SPEC §19: the oldest cut cycle settled, every clearing member all or nothing. Payers first, so the receivers are paid
   /// out of what the payers brought in: a payer's net (its purchases in the cycle and its rolled debt less its sales) is
   /// paid from its settlement account if it holds it, else it fails and the net rolls with the penalty. A receiver is paid
   /// within the CCP's free cash, else the amount rolls to it in the next cycle. A member that owes nothing after the cycle
   /// receives the shares the CCP holds for it free of its sales and of its purchases in later cycles.
   /// Effects: [34, cycle, outcomes, (member, 1 paid / 2 failed / 3 received / 4 rolled to it, amount)..., deliveries,
-  /// (member, instrument, quantity)...].
+  /// (member, instrument, quantity)..., levies paid, (account, amount)...].
   func settleCycle(s : State, k : Nat) : T.Effects {
     let ?t = s.clearing else Runtime.trap("apply: no clearing");
     let outcomes = List.empty<(Nat, Nat, Nat)>();
@@ -1792,7 +2249,26 @@ module {
       let (to, by) = switch (obligationOf(s, r0.member, k)) { case (?(_, o)) (o.owedTo, o.owedBy); case null (0, 0) };
       (r0.member, to, by, by + r0.debt)
     });
+    let levies = List.empty<(Nat, Nat)>();
     for (payers in [true, false].vals()) {
+      // between the passes, the levies are paid what clearing parties' fees owe them, each in full within the free cash
+      if (not payers) {
+        var id = 1;
+        while (id < s.nextPayable) {
+          switch (RS.get(s.payableStore, payableRows, id)) {
+            case (?x) {
+              if (x.amount > 0 and ccpFree(s) >= x.amount) {
+                move(s, t.ccpAccount, x.account, t.cashLedger, x.amount);
+                appendLeg(s, 4, t.cashLedger, t.ccpAccount, x.account, x.amount);
+                RS.put(s.payableStore, payableRows, id, { x with amount = 0 });
+                List.add(levies, (x.account, x.amount));
+              };
+            };
+            case null {};
+          };
+          id += 1;
+        };
+      };
       for ((member, to, by, pay) in plan.vals()) {
         let ?(_, r) = clearingMember(s, member) else Runtime.trap("settle: a member vanished");
         if (r.status != 3 and (pay > to) == payers) {
@@ -1832,6 +2308,8 @@ module {
     for ((m, o, a) in List.values(outcomes)) { List.add(fx, m); List.add(fx, o); List.add(fx, a) };
     List.add(fx, List.size(deliveries));
     for ((m, i, q) in List.values(deliveries)) { List.add(fx, m); List.add(fx, i); List.add(fx, q) };
+    List.add(fx, List.size(levies));
+    for ((a, x) in List.values(levies)) { List.add(fx, a); List.add(fx, x) };
     List.toArray(fx)
   };
   /// A member that owes nothing and is not in default receives, in each instrument, the shares the CCP holds for it free
@@ -2011,7 +2489,7 @@ module {
         // a clearing buy's margin falls with what remains; every other order's hold by what the fill took
         let held = switch (o0.side, clearingOf(s, o0.account) != null) {
           case (#buy, true) o0.held * (o0.remaining - q) / o0.remaining;
-          case (#buy, false) o0.held - o0.price * q;
+          case (#buy, false) buyHold(s, i0, inst, o0.price, o0.remaining - q);
           case (#sell, _) o0.held - q;
         };
         let remaining = o0.remaining - q;
@@ -2047,17 +2525,22 @@ module {
     let v = p * q;
     let bm = clearingOf(s, bo.account); let am = clearingOf(s, ao.account);
     let ccp = switch (s.clearing) { case (?t) t.ccpAccount; case null 0 };
+    // each side's fee on the fill's value (SPEC §22)
+    let feeB = feeOn(s, inst, v); let feeS = feeOn(s, inst, v);
     switch (bm) {
       case null {
-        spendHeld(s, bo.account, i0.cashLedger, bo.price * q);
-        credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);
+        // the buy's hold recomputed for what remains: what it held beyond that pays the value and the fee, the rest returns
+        let after = buyHold(s, i0, inst, bo.price, bo.remaining - q);
+        spendHeld(s, bo.account, i0.cashLedger, bo.held - after);
+        // the fee stays with the buyer here and is paid to the levies below, as a leg
+        credit(s, bo.account, i0.cashLedger, bo.held - after - v);
         credit(s, bo.account, i0.assetLedger, q);
       };
-      case (?m) { owe(s, m, s.cycleNo, 0, v); addBought(s, m, inst, s.cycleNo, q); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty + q }) };
+      case (?m) { owe(s, m, s.cycleNo, 0, v + feeB); owePayable(s, inst, feeB); addBought(s, m, inst, s.cycleNo, q); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty + q }) };
     };
     switch (am) {
       case null { spendHeld(s, ao.account, i0.assetLedger, q); credit(s, ao.account, i0.cashLedger, v) };
-      case (?m) { owe(s, m, s.cycleNo, v, 0); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty - q }) };
+      case (?m) { owe(s, m, s.cycleNo, v, feeS); owePayable(s, inst, feeS); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty - q }) };
     };
     switch (bm, am) {
       case (null, null) { appendLeg(s, 1, i0.cashLedger, bo.account, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, bo.account, q) };
@@ -2073,15 +2556,21 @@ module {
       };
       case (?_, ?_) {};
     };
-    // a close-out's proceeds pay its member's debt; what is left over is owed to the member in the open cycle (SPEC §20)
+    // a pre-funded party pays its fee to the levies now (the buyer out of what it held, the seller out of its proceeds)
+    if (bm == null) payFee(s, inst, bo.account, i0.cashLedger, feeB);
+    if (am == null) payFee(s, inst, ao.account, i0.cashLedger, feeS);
+    addFeeTotal(s, bo.member, inst, feeB); addFeeTotal(s, ao.member, inst, feeS);
+    appendStatement(s, bo.member, b, #buy, q, p, feeB); appendStatement(s, ao.member, a, #sell, q, p, feeS);
+    // a close-out's proceeds, net of its fee, pay its member's debt; what is left over is owed to the member (SPEC §20)
     if (am == null and ao.account == ccp and ccp != 0) {
       switch (one(s.closeoutStore, closeoutRows, "byOrder", R.key(a, 8))) {
         case (?(_, co)) {
           let c = custodyOf(s, co.member, inst); putCustody(s, { c with qty = c.qty - q });
           let ?(_, r) = clearingMember(s, co.member) else Runtime.trap("close-out: a member vanished");
-          let paid = Nat.min(r.debt, v);
+          let net = v - feeS;
+          let paid = Nat.min(r.debt, net);
           updateMember(s, co.member, func(x : ClearingMember) : ClearingMember { { x with debt = x.debt - paid } });
-          if (v > paid) owe(s, co.member, s.cycleNo, v - paid, 0);
+          if (net > paid) owe(s, co.member, s.cycleNo, net - paid, 0);
         };
         case null {};
       };
@@ -2350,6 +2839,12 @@ module {
           case (#closeDefault(c)) { own(c.member); for (j in Nat.range(0, e[7])) mentioned(e[8 + 2 * j]) };
           case (#closeOut(c)) own(c.member);
           case (#callFund) { for (j in Nat.range(0, e[1])) mentioned(e[2 + 2 * j]) };
+          case (#reconcileMember(c)) own(c.member);
+          case (#registerMaker(c)) own(c.member);
+          case (#quote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
+          case (#massQuote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
+          case (#sealStatements(_)) { for (j in Nat.range(0, e[2])) mentioned(e[3 + 2 * j]) };
+          case (#settleMakers(_)) { for (j in Nat.range(0, e[2])) mentioned(e[3 + 6 * j]) };
           case (#settleCycle(_)) {
             let n = e[2]; for (j in Nat.range(0, n)) mentioned(e[3 + 3 * j]);
             let d = e[3 + 3 * n]; for (j in Nat.range(0, d)) mentioned(e[4 + 3 * n + 3 * j]);
@@ -2542,12 +3037,25 @@ module {
     table<CycleRow>("cycles", s.cycleStore, cycleRows, s.cycleNo);
     table<Leg>("settlementlegs", s.legStore, legRows, s.nextLeg + 1);
     table<Blob>("settlementnodes", s.nodeStore, nodeRows, s.nextNode + 1);
+    Fold.section(f, "fees", func(w : C.Writer) { feeScalars(s, w) });
+    table<Payable>("levypayable", s.payableStore, payableRows, s.nextPayable);
+    table<FeeTotal>("feetotals", s.feeTotalStore, feeTotalRows, s.nextFeeTotal);
+    table<Statement>("statements", s.statementStore, statementRows, s.nextStatement);
+    table<StatementSeal>("statementseals", s.statementSealStore, statementSealRows, s.nextStatementSeal);
+    table<Recon>("memberrecons", s.reconStore, reconRows, s.nextRecon);
+    table<Maker>("makers", s.makerStore, makerRows, s.nextMaker);
+    table<MakerDay>("makerdays", s.makerDayStore, makerDayRows, s.nextMakerDay);
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
   func clearingScalars(s : State, w : C.Writer) {
     w.optBlob(switch (s.clearing) { case (?t) ?encodeTerms(t); case null null });
     w.nat(s.cycleNo); w.nat(s.settledThrough); w.nat64(s.lastCut); w.nat(s.ccpCommitted); w.nat(s.skin)
+  };
+  /// The fee schedules by instrument, and the statements' and makers' last days.
+  func feeScalars(s : State, w : C.Writer) {
+    for (i in s.instrumentList.vals()) { switch (RS.get(s.feeStore, feeRows, i)) { case (?r) { w.nat(i); w.blob(feeRows.encode(r)) }; case null {} } };
+    w.nat(s.lastStatementDay); w.nat(s.lastMakerDay)
   };
   func margins(s : State, w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.marginStore, marginRows, i)) { case (?r) { w.nat(i); w.nat(r) }; case null {} } } };
   /// One step of a table in the sliced fingerprint: its next row, or on to `after` past its end.
@@ -2568,7 +3076,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 48) {
+    while (left > 0 and run.part < 63) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -2618,18 +3126,34 @@ module {
         case 44 tableStep<Leg>(w, run, s.legStore, legRows, s.nextLeg + 1, 45);
         case 45 tableHead(w, run, "settlementnodes", s.nextNode + 1, 46);
         case 46 tableStep<Blob>(w, run, s.nodeStore, nodeRows, s.nextNode + 1, 47);
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 48 };
+        case 47 { w.text("fees"); feeScalars(s, w); run.part := 48 };
+        case 48 tableHead(w, run, "levypayable", s.nextPayable, 49);
+        case 49 tableStep<Payable>(w, run, s.payableStore, payableRows, s.nextPayable, 50);
+        case 50 tableHead(w, run, "feetotals", s.nextFeeTotal, 51);
+        case 51 tableStep<FeeTotal>(w, run, s.feeTotalStore, feeTotalRows, s.nextFeeTotal, 52);
+        case 52 tableHead(w, run, "statements", s.nextStatement, 53);
+        case 53 tableStep<Statement>(w, run, s.statementStore, statementRows, s.nextStatement, 54);
+        case 54 tableHead(w, run, "statementseals", s.nextStatementSeal, 55);
+        case 55 tableStep<StatementSeal>(w, run, s.statementSealStore, statementSealRows, s.nextStatementSeal, 56);
+        case 56 tableHead(w, run, "memberrecons", s.nextRecon, 57);
+        case 57 tableStep<Recon>(w, run, s.reconStore, reconRows, s.nextRecon, 58);
+        case 58 tableHead(w, run, "makers", s.nextMaker, 59);
+        case 59 tableStep<Maker>(w, run, s.makerStore, makerRows, s.nextMaker, 60);
+        case 60 tableHead(w, run, "makerdays", s.nextMakerDay, 61);
+        case 61 tableStep<MakerDay>(w, run, s.makerDayStore, makerDayRows, s.nextMakerDay, 62);
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 63 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 48) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 63) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };
   public func counters(s : State) : [Nat] {
     [s.nextOrder, s.nextBalance, s.nextRef, Nat64.toNat(s.batchTime), s.dueCount, Nat64.toNat(s.lastTime), s.nextKill, s.nextLimit,
-     s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode]
+     s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode,
+     s.nextPayable, s.nextFeeTotal, s.nextStatement, s.nextStatementSeal, s.lastStatementDay, s.nextRecon, s.nextMaker, s.nextMakerDay, s.lastMakerDay]
   };
   /// The order indexes whose entries leave as orders change (the reference index's keys never move).
   public let churnIndexes : [Text] = ["book", "stops", "own", "day", "gtd", "immediate", "trailing", "member", "trader"];
