@@ -275,6 +275,14 @@ def read_command(data):
         c = {"k": "attestPrice", "attestor": r.nat(), "instrument": r.nat(), "day": r.nat(), "price": r.nat()}
     elif tag == 61:
         c = {"k": "settleDerivatives", "instrument": r.nat(), "day": r.nat(), "limit": r.nat()}
+    elif tag == 62:
+        c = {"k": "registerBridge", "ledger": principal_text(r.principal()), "rtgs": principal_text(r.principal())}
+    elif tag == 63:
+        c = {"k": "earmark", "ledger": principal_text(r.principal()), "account": r.nat(), "member": r.nat(), "amount": r.nat(), "reference": r.blob().hex()}
+    elif tag == 64:
+        c = {"k": "redeem", "account": r.nat(), "member": r.nat(), "trader": r.nat(), "ledger": principal_text(r.principal()), "amount": r.nat()}
+    elif tag in (65, 66):
+        c = {"k": "rtgsSettle" if tag == 65 else "rtgsReject", "redemption": r.nat(), "reference": r.blob().hex()}
     elif tag in (45, 46):
         c = {"k": "quote" if tag == 45 else "massQuote", "account": r.nat(), "member": r.nat(), "trader": r.nat()}
         n = 1 if tag == 45 else r.len16()
@@ -384,7 +392,7 @@ def proposal_row(p):
     return b
 
 
-def concerned(block, order_member, kill_member, terms):
+def concerned(block, order_member, kill_member, terms, redemptions):
     """SPEC §14: the members a block concerns, each with whether it is the member's own act, in member order."""
     out = {}
     ev = block["event"]
@@ -412,6 +420,12 @@ def concerned(block, order_member, kill_member, terms):
             mentioned(e[8 + 2 * j])
     elif k in ("reconcileMember", "registerMaker", "issueReceipt", "cancelReceipt", "retire"):
         own(c["member"])
+    elif k == "earmark":
+        mentioned(c["member"])
+    elif k == "redeem":
+        own(c["member"])
+    elif k in ("rtgsSettle", "rtgsReject"):
+        mentioned(redemptions[c["redemption"] - 1][2])
     elif k == "settleDerivatives":
         for j in range(e[5]):
             mentioned(e[7 + 4 * j])
@@ -702,6 +716,16 @@ def classes_sections(w, book):
     for m in sorted(book.cm):
         if m in book.member_im:
             w.nat(m); w.nat(book.member_im[m])
+    # the cash leg's bridges (§36)
+    w.text("bridges"); w.nat(len(book.bridges) + 1)
+    for led, (n, rtgs, backing, redeeming) in book.bridges.items():
+        w.nat(n); w.blob(principal_field(led) + principal_field(rtgs) + be(backing, 8) + be(redeeming, 8))
+    w.text("earmarks"); w.nat(len(book.earmarks) + 1)
+    for n, (bridge, acc, amt, ref) in enumerate(book.earmarks, start=1):
+        w.nat(n); w.blob(be(bridge, 8) + be(acc, 8) + be(amt, 8) + bytes.fromhex(ref))
+    w.text("redemptions"); w.nat(len(book.redemptions) + 1)
+    for n, (bridge, acc, mem, amt, state, ref) in enumerate(book.redemptions, start=1):
+        w.nat(n); w.blob(be(bridge, 8) + be(acc, 8) + be(mem, 8) + be(amt, 8) + bytes([state]) + bytes.fromhex(ref))
 
 
 def main():
@@ -787,7 +811,7 @@ def main():
             if c["k"] == "declareDefault" and ev["effects"][2]:
                 kill_member[ev["effects"][2]] = c["member"]
         # the drop copy (SPEC §14): the members this block concerns, and what each is given
-        for member, own_ in concerned(b, order_member, kill_member, book.terms):
+        for member, own_ in concerned(b, order_member, kill_member, book.terms, book.redemptions):
             drops.append((member, i, own_))
             entry_hash[(member, i)] = hashlib.sha256(bytes.fromhex(raw[i]) if own_ else msg).hexdigest()
     if errors:

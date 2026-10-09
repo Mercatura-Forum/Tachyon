@@ -31,7 +31,7 @@ CALL = ("auction", "closingAuction")
 DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout",
         "setClearing", "setMargin", "admitClearing", "designateClearing", "fundSkin", "declareDefault", "closeDefault",
         "setFeeSchedule", "registerMaker", "defineIndex", "reviewIndex", "corporateAction",
-        "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "setAttestors"}
+        "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "setAttestors", "registerBridge"}
 E18, E9 = 10 ** 18, 10 ** 9
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
@@ -256,6 +256,10 @@ class Ref:
         self.positions = {}     # (account, instrument) -> [member, long, qty, mark, im], in the order the rows were made
         self.derivs = {}        # instrument -> its settlement state
         self.member_im = {}     # member -> its positions' margin
+        # the cash leg's bridges (SPEC §36)
+        self.bridges = {}       # ledger -> [id, the RTGS operator's role, backing, redeeming], in the order registered
+        self.earmarks = []      # (bridge, account, amount, reference)
+        self.redemptions = []   # [bridge, account, member, amount, state, reference]
 
     # ── funds ──
     def b(self, a, l):
@@ -727,7 +731,7 @@ class Ref:
                 return "InvalidTerms"
             if c["reference"] in self.refs:
                 return "DuplicateReference"
-            if self.receipt_ledger(c["ledger"]):
+            if self.receipt_ledger(c["ledger"]) or c["ledger"] in self.bridges:
                 return "InvalidTerms"
             return None
         if k == "withdraw":
@@ -742,7 +746,7 @@ class Ref:
                 return "InvalidTerms"
             if self.b(c["account"], c["ledger"])[0] < c["amount"]:
                 return "InsufficientFunds"
-            if self.receipt_ledger(c["ledger"]):
+            if self.receipt_ledger(c["ledger"]) or c["ledger"] in self.bridges:
                 return "InvalidTerms"
             return None
         if k == "placeOrder":
@@ -1445,6 +1449,38 @@ class Ref:
                 return "InsufficientFunds"
             pay = t["price"] * (c["qty"] // t["den"]) * t["num"]
             return "InsufficientFunds" if self.b(c["account"], i["cash"])[0] < pay else None
+        if k == "registerBridge":
+            return "InvalidTerms" if c["ledger"] in self.bridges or self.deposited.get(c["ledger"], 0) != 0 else None
+        if k == "earmark":
+            b = self.bridges.get(c["ledger"])
+            if b is None or b[1] != role:
+                return "InvalidTerms"
+            if c["account"] not in accts:
+                return "UnknownAccount"
+            if accts[c["account"]]["member"] != c["member"]:
+                return "InvalidTerms"
+            if not accts[c["account"]]["open"]:
+                return "AccountClosed"
+            if self.is_ccp(c["account"]) or c["amount"] == 0 or len(c["reference"]) != 64:
+                return "InvalidTerms"
+            if any(e[3] == c["reference"] for e in self.earmarks):
+                return "DuplicateReference"
+            return None
+        if k == "redeem":
+            e = self.mover(role, c)
+            if e:
+                return e
+            if c["ledger"] not in self.bridges or c["amount"] == 0:
+                return "InvalidTerms"
+            return "InsufficientFunds" if self.b(c["account"], c["ledger"])[0] < c["amount"] else None
+        if k in ("rtgsSettle", "rtgsReject"):
+            if not 1 <= c["redemption"] <= len(self.redemptions):
+                return "InvalidTerms"
+            r = self.redemptions[c["redemption"] - 1]
+            bridge = next(b for b in self.bridges.values() if b[0] == r[0])
+            if r[4] != 1 or bridge[1] != role or len(c["reference"]) != 64:
+                return "InvalidTerms"
+            return None
         if k == "setAttestors":
             a = c["attestors"]
             return "InvalidTerms" if len(a) != 3 or len(set(a)) != 3 else None
@@ -2016,6 +2052,38 @@ class Ref:
             return [60, c["instrument"], c["day"], c["attestor"], self.attested(c["instrument"], c["day"]) or 0]
         if k == "settleDerivatives":
             return self.settle_derivatives(c["instrument"], c["day"], c["limit"])
+        if k == "registerBridge":
+            self.bridges[c["ledger"]] = [len(self.bridges) + 1, c["rtgs"], 0, 0]
+            return [62, len(self.bridges)]
+        if k == "earmark":
+            b = self.bridges[c["ledger"]]
+            self.earmarks.append((b[0], c["account"], c["amount"], c["reference"]))
+            self.b(c["account"], c["ledger"])[0] += c["amount"]
+            self.deposited[c["ledger"]] = self.deposited.get(c["ledger"], 0) + c["amount"]
+            self.external[(c["account"], c["ledger"])] = self.external.get((c["account"], c["ledger"]), 0) + c["amount"]
+            b[2] += c["amount"]
+            return [63, len(self.earmarks), c["account"], c["amount"]]
+        if k == "redeem":
+            b = self.bridges[c["ledger"]]
+            self.hold(c["account"], c["ledger"], c["amount"])
+            self.redemptions.append([b[0], c["account"], c["member"], c["amount"], 1, "00" * 32])
+            b[3] += c["amount"]
+            return [64, len(self.redemptions), c["amount"]]
+        if k in ("rtgsSettle", "rtgsReject"):
+            r = self.redemptions[c["redemption"] - 1]
+            led, b = next((l, x) for l, x in self.bridges.items() if x[0] == r[0])
+            if k == "rtgsSettle":
+                bal = self.b(r[1], led)
+                assert bal[1] >= r[3], "a settled redemption held less than its amount"
+                bal[1] -= r[3]
+                self.deposited[led] -= r[3]
+                self.external[(r[1], led)] = self.external.get((r[1], led), 0) - r[3]
+                b[2] -= r[3]
+            else:
+                self.release(r[1], led, r[3])
+            b[3] -= r[3]
+            r[4], r[5] = (2 if k == "rtgsSettle" else 3), c["reference"]
+            return [65 if k == "rtgsSettle" else 66, c["redemption"], r[3]]
         raise ValueError(k)
 
     def deliver(self, m, k, out):
@@ -2635,6 +2703,10 @@ class Ref:
         return None
 
     def conserved(self):
+        # §36: a bridged ledger's claims in the book are its backing, the cash earmarked less the cash transferred out
+        for led, b in self.bridges.items():
+            if self.deposited.get(led, 0) != b[2]:
+                return f"bridged ledger {led}: {self.deposited.get(led, 0)} claims in the book, backing {b[2]}"
         # §34: every derivative's long contracts equal its short ones
         for inst in self.derivs:
             if self.derivs[inst]["runDay"]:
@@ -2667,7 +2739,7 @@ class Ref:
 
 def new_scls():
     """A checkpoint's lines of the instrument classes (§28 to §32), as the book printed them."""
-    return {"TM": {}, "NV": {}, "VD": {}, "NP": [], "RC": [], "RT": [], "EN": [], "SU": {}, "DV": {}, "AT": [], "PO": [], "PM": {}}
+    return {"TM": {}, "NV": {}, "VD": {}, "NP": [], "RC": [], "RT": [], "EN": [], "SU": {}, "DV": {}, "AT": [], "PO": [], "PM": {}, "BR": [], "EM": [], "RD": []}
 
 
 def terms_text(t):
@@ -2692,7 +2764,7 @@ def parse_cmd(s):
     for kv in s.split(";"):
         k, _, v = kv.partition("=")
         # a client reference and a deposit's reference are text whatever their characters
-        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances", "constituents", "registry", "beneficiary", "warehouses", "bands", "attestors") else (int(v) if v.isdigit() else v)
+        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances", "constituents", "registry", "beneficiary", "warehouses", "bands", "attestors", "rtgs") else (int(v) if v.isdigit() else v)
     if "open" in c:
         c["open"] = c["open"] in (1, True)
     # the nested fields of SPEC §22 to §25: levies (account:ppm), balances (account:ledger:amount), quotes
@@ -2734,7 +2806,7 @@ def main():
             if kept:
                 lines[-1] += l[2:]      # a long line printed in pieces
         elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP", "N|", "P|", "R|", "X|", "Z|", "T|", "IX", "IP",
-                       "TM", "NV", "VD", "NP", "RC", "RT", "EN", "SU", "DV", "AT", "PO", "PM"):
+                       "TM", "NV", "VD", "NP", "RC", "RT", "EN", "SU", "DV", "AT", "PO", "PM", "BR", "EM", "RD"):
             lines.append(l); kept = True
         else:
             kept = False
@@ -2743,7 +2815,7 @@ def main():
     proposals = {}
     errors = []
     books = []   # every stream's reference book, for the legs' kinds at the end
-    streams = cmds = blocks = checkpoints = legs_checked = index_rows_checked = path_checked = class_checked = supply_checked = deriv_checked = 0
+    streams = cmds = blocks = checkpoints = legs_checked = index_rows_checked = path_checked = class_checked = supply_checked = deriv_checked = bridge_checked = 0
     ref = None
     sblocks, sorders, squeue = [], {}, {}
     sinst, slimits, skills = {}, {}, {}
@@ -2881,6 +2953,12 @@ def main():
             scls["PO"].append([int(x) for x in f[1:]])
         elif f[0] == "PM":
             scls["PM"][int(f[1])] = int(f[2])
+        elif f[0] == "BR":
+            scls["BR"].append([int(f[1]), f[2], f[3], int(f[4]), int(f[5])])
+        elif f[0] == "EM":
+            scls["EM"].append([int(x) for x in f[1:5]] + [f[5]])
+        elif f[0] == "RD":
+            scls["RD"].append([int(x) for x in f[1:7]] + [f[7]])
         elif f[0] == "N":
             sstmt[int(f[1])] = (int(f[2]), f[3])
         elif f[0] == "P":
@@ -3043,6 +3121,17 @@ def main():
             if scls["PM"] and mine != scls["PM"]:
                 errors.append(f"stream {streams}: positions' margin: book {scls['PM']}, reference {mine}")
             deriv_checked += len(scls["DV"]) + len(scls["AT"]) + len(scls["PO"])
+            # the cash leg's bridges (§36): bridges, earmarks, redemptions
+            mine = [[b[0], led, b[1], b[2], b[3]] for led, b in ref.bridges.items()]
+            if mine != scls["BR"]:
+                errors.append(f"stream {streams}: bridges: book {scls['BR']}, reference {mine}")
+            mine = [[n + 1] + list(e) for n, e in enumerate(ref.earmarks)]
+            if mine != scls["EM"]:
+                errors.append(f"stream {streams}: earmarks: book {scls['EM'][-3:]}, reference {mine[-3:]}")
+            mine = [[n + 1] + list(r) for n, r in enumerate(ref.redemptions)]
+            if mine != scls["RD"]:
+                errors.append(f"stream {streams}: redemptions: book {scls['RD'][-3:]}, reference {mine[-3:]}")
+            bridge_checked += len(scls["BR"]) + len(scls["EM"]) + len(scls["RD"])
             class_checked += len(scls["TM"]) + len(scls["NV"]) + len(scls["RC"]) + len(scls["RT"]) + len(scls["EN"]) + len(scls["NP"])
             supply_checked += len(have)
             if dict(ref.payable) != spay:
@@ -3079,6 +3168,8 @@ def main():
     if class_checked:
         print(f"reference: {class_checked} class rows (terms, iNAVs and path, receipts, retirements, entitlements) compared at checkpoints")
     print(f"reference: {supply_checked} ledgers' units in the book compared at checkpoints")
+    if bridge_checked:
+        print(f"reference: {bridge_checked} bridge rows (bridges, earmarks, redemptions) compared at checkpoints")
     if deriv_checked:
         print(f"reference: {deriv_checked} derivative rows (settlement states, attestations, positions) compared at checkpoints")
     if index_rows_checked:
