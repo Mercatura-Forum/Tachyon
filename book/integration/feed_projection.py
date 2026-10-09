@@ -105,6 +105,9 @@ def body(w, c, e):
         w.byte(e[p])
     elif k == "sealDay":
         w.byte(10); w.nat(e[1]); w.nat(e[2]); w.b += bytes(e[3:35])
+    elif k == "tripBreaker":
+        # the market-wide breaker (SPEC §27): every instrument it halted in this block
+        w.byte(12); w.nat(e[1]); w.nat(e[2]); w.byte(e[3]); w.nats(e[5:5 + e[4]])
     elif k == "closeOut":
         # the CCP's close-out order, added as any sale is (SPEC §20): effects [35, order, status, price, shown, member]
         w.byte(4); w.nat(e[1]); w.nat(c["instrument"]); w.byte(2); w.nat(e[3]); w.nat(e[4]); w.nats([])
@@ -121,7 +124,8 @@ def body(w, c, e):
     elif k in ("deposit", "withdraw", "flush", "kill", "revive", "setLimits", "setBlackout", "liftBlackout", "borrow", "returnBorrow",
                "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle",
                "settleCycle", "callFund", "contributeFund", "fundSkin", "declareDefault", "closeDefault",
-               "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "settleMakers"):
+               "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "settleMakers",
+               "defineIndex", "reviewIndex", "corporateAction"):
         w.byte(0)
     else:
         raise ValueError(f"no feed message for {k}")

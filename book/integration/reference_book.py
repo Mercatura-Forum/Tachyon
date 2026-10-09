@@ -26,7 +26,8 @@ PHASE = {"closed": 1, "continuous": 2, "auction": 3, "closingAuction": 4, "trade
 CALL = ("auction", "closingAuction")
 DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout",
         "setClearing", "setMargin", "admitClearing", "designateClearing", "fundSkin", "declareDefault", "closeDefault",
-        "setFeeSchedule", "registerMaker"}
+        "setFeeSchedule", "registerMaker", "defineIndex", "reviewIndex", "corporateAction"}
+E18, E9 = 10 ** 18, 10 ** 9
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
 MAX_TRAILING = 64
@@ -185,6 +186,13 @@ class Ref:
         self.makers = {}      # (member, instrument) -> the registration and its period's figures
         self.maker_days = []  # (member, instrument, day, present, session, met, rebate)
         self.last_maker_day = 0
+        # indices and the breaker (SPEC §26, §27)
+        self.indices = {}     # index -> its row
+        self.constituents = {}  # (index, instrument) -> [shares, factor], in the order the rows were made
+        self.path = []        # (index, log entry, level)
+        self.prices_moved = False
+        self.breaker_due = 0
+        self.suspended_at = 0
 
     # ── funds ──
     def b(self, a, l):
@@ -282,8 +290,78 @@ class Ref:
     def apply_all(self, now, c):
         """A block's command applied, then every maker's presence accrued to its time (SPEC §25)."""
         fx = self.clear(c["time"]) if c["k"] == "clear" else self.apply(now, c)
+        if self.prices_moved:
+            self.prices_moved = False
+            self.recompute_indices()
         self.accrue(now)
         return fx
+
+    # ── indices (SPEC §26, §27), written from the text ──
+    @staticmethod
+    def half_even(n, d):
+        q, r = divmod(n, d)
+        return q + 1 if 2 * r > d else q if 2 * r < d else q + q % 2
+
+    def mark(self, inst):
+        i = self.inst[inst]
+        return i["last"] or i["ref"]
+
+    def cap_factors(self, m, cap):
+        n = len(m)
+        if cap == 0:
+            return [E9] * n
+        capped = [False] * n
+        changed = True
+        while changed:
+            changed = False
+            k = sum(capped); rest = sum(m[j] for j in range(n) if not capped[j])
+            for j in range(n):
+                if not capped[j] and rest > 0 and k * cap < 10_000 and m[j] * (10_000 - k * cap) > cap * rest:
+                    capped[j] = True; changed = True
+        k = sum(capped); rest = sum(m[j] for j in range(n) if not capped[j])
+        return [E9 if (not capped[j] or m[j] == 0 or k * cap >= 10_000) else self.half_even(cap * rest * E9, m[j] * (10_000 - k * cap)) for j in range(n)]
+
+    def put_constituents(self, index, cs, cap):
+        factors = self.cap_factors([self.mark(i) * sh for (i, sh) in cs], cap)
+        for (i, sh), f in zip(cs, factors):
+            self.constituents[(index, i)] = [sh, f]
+
+    def capitalisation(self, index):
+        return sum(self.mark(i) * sh * f for (ix, i), (sh, f) in sorted(self.constituents.items()) if ix == index)
+
+    def keep_level(self, index):
+        x = self.indices[index]
+        m = self.capitalisation(index)
+        if m > 0 and x["level"] > 0:
+            x["divisor"] = self.half_even(m * E18, x["level"])
+
+    def recompute_indices(self):
+        for index in sorted(self.indices):
+            x = self.indices[index]
+            m = self.capitalisation(index)
+            level = self.half_even(m * E18, x["divisor"]) if x["divisor"] else 0
+            if level != x["level"]:
+                x["level"] = level
+                self.path.append((index, len(self.log), level))
+            move = abs(level - x["reference"])
+            halt = x["tripped"] == 0 and move * 10_000 >= x["halt"] * x["reference"]
+            susp = x["tripped"] < 2 and x["suspend"] > 0 and move * 10_000 >= x["suspend"] * x["reference"]
+            if (halt or susp) and self.breaker_due == 0:
+                self.breaker_due = index
+
+    def to_tick(self, inst, p):
+        t = tick_at(self.inst[inst]["bands"], p)
+        return max(t, self.half_even(p, t) * t)
+
+    def has_open_order(self, inst):
+        return bool(self.open_ids("inst", inst))
+
+    def append_log(self, now, fam, fx):
+        """A block appended; the breaker's straight after it when an index crossed a threshold (§27)."""
+        self.log.append((now, fam, fx))
+        if self.breaker_due:
+            c = {"k": "tripBreaker", "index": self.breaker_due}
+            self.append_log(now, "tripBreaker", self.apply_all(now, c))
 
     # ── the central counterparty (SPEC §18 to §21) ──
     def is_ccp(self, a):
@@ -770,7 +848,11 @@ class Ref:
                 if i["phase"] == "halted":
                     return "InstrumentHalted"
                 return None if 1 <= len(c["reason"].encode()) <= 256 else "InvalidTerms"
-            return None if i["phase"] == "halted" else "InvalidTerms"
+            if i["phase"] != "halted":
+                return "InvalidTerms"
+            if self.suspended_at and self.today(now) <= self.today(self.suspended_at):
+                return "InvalidTerms"
+            return None
         if k == "kill":
             # §11: a kill names its member; with a trader, a trader of that member
             if c["member"] == 0:
@@ -1035,6 +1117,41 @@ class Ref:
             return None
         if k in ("quote", "massQuote"):
             return self.quote_refusal(now, role, c)
+        if k in ("defineIndex", "reviewIndex"):
+            if k == "defineIndex":
+                if not 1 <= c["index"] <= 8 or c["index"] in self.indices or c["base"] == 0:
+                    return "InvalidTerms"
+            elif c["index"] not in self.indices:
+                return "InvalidTerms"
+            cs = c["constituents"]
+            if not 1 <= len(cs) <= 50:
+                return "InvalidTerms"
+            for n, (i, sh) in enumerate(cs):
+                if i not in self.inst or not self.inst[i]["opened"]:
+                    return "UnknownInstrument"
+                if sh == 0 or any(cs[j][0] == i for j in range(n)):
+                    return "InvalidTerms"
+            if k == "defineIndex":
+                if c["cap"] > 10_000 or (c["cap"] and c["cap"] * len(cs) <= 10_000):
+                    return "InvalidTerms"
+                if c["halt"] == 0 or c["halt"] > 10_000 or (c["suspend"] and (c["suspend"] <= c["halt"] or c["suspend"] > 10_000)):
+                    return "InvalidTerms"
+            else:
+                mine = {i for (ix, i) in self.constituents if ix == c["index"]}
+                if mine != {i for i, _ in cs} or len(mine) != len(cs):
+                    return "InvalidTerms"
+            return None
+        if k == "corporateAction":
+            i = self.inst.get(c["instrument"])
+            if i is None or not i["opened"]:
+                return "UnknownInstrument"
+            if i["phase"] != "closed" or self.has_open_order(c["instrument"]) or len(c["reference"]) != 64:
+                return "InvalidTerms"
+            if c["kind"] == "split":
+                return "InvalidTerms" if c["num"] == 0 or c["den"] == 0 or c["num"] == c["den"] else None
+            return "InvalidTerms" if c["amount"] == 0 or c["amount"] >= self.mark(c["instrument"]) else None
+        if k == "tripBreaker":
+            return "ClearNotSubmittable"
         raise ValueError(k)
 
     def quote_refusal(self, now, role, c):
@@ -1203,6 +1320,7 @@ class Ref:
             return [22, c["day"], rows] + list(h)
         if k == "setReference":
             self.inst[c["instrument"]]["ref"] = c["price"]
+            self.prices_moved = True
             return [3, c["instrument"]]
         if k == "deposit":
             self.refs.add(c["reference"])
@@ -1437,6 +1555,51 @@ class Ref:
                     self.fee_totals[(mem, inst)] = 0
             self.last_maker_day = c["day"]
             return fx
+        if k == "defineIndex":
+            self.put_constituents(c["index"], c["constituents"], c["cap"])
+            m = self.capitalisation(c["index"])
+            d = self.half_even(m * E18, c["base"] * 100)
+            level = self.half_even(m * E18, d)
+            self.indices[c["index"]] = dict(base=c["base"], cap=c["cap"], halt=c["halt"], suspend=c["suspend"], divisor=d, level=level, reference=level, tripped=0)
+            self.path.append((c["index"], len(self.log), level))
+            return [48, c["index"], level]
+        if k == "reviewIndex":
+            x = self.indices[c["index"]]
+            self.put_constituents(c["index"], c["constituents"], x["cap"])
+            self.keep_level(c["index"])
+            return [49, c["index"], x["level"]]
+        if k == "corporateAction":
+            inst = c["instrument"]; i = self.inst[inst]
+            if c["kind"] == "split":
+                adj = lambda p: self.to_tick(inst, self.half_even(p * c["den"], c["num"]))
+            else:
+                adj = lambda p: self.to_tick(inst, p - min(p - 1, c["amount"]))
+            i["ref"] = adj(i["ref"])
+            if i["last"]:
+                i["last"] = adj(i["last"])
+            touched = 0
+            for index in sorted(self.indices):
+                if (index, inst) in self.constituents:
+                    if c["kind"] == "split":
+                        row = self.constituents[(index, inst)]
+                        row[0] = self.half_even(row[0] * c["num"], c["den"])
+                    self.keep_level(index); touched += 1
+            return [50, inst, i["ref"], touched]
+        if k == "tripBreaker":
+            x = self.indices[c["index"]]
+            move = abs(x["level"] - x["reference"])
+            kind = 2 if x["suspend"] and move * 10_000 >= x["suspend"] * x["reference"] else 1
+            x["tripped"] = kind
+            if kind == 2:
+                self.suspended_at = now
+            self.breaker_due = 0
+            halted = []
+            for inst in sorted(self.inst):
+                ii = self.inst[inst]
+                if ii["opened"] and ii["phase"] != "halted":
+                    ii.update(phase="halted", endFrom=0, endTo=0, until=0)
+                    self.due.add(inst); halted.append(inst)
+            return [51, c["index"], x["level"], kind, len(halted)] + halted
         raise ValueError(k)
 
     def deliver(self, m, k, out):
@@ -1794,6 +1957,8 @@ class Ref:
             self.stats[i] = [0] * 8
         h = hashlib.sha256(bytes(w)).digest()
         self.seals.append((day, len(insts), h))
+        for x in self.indices.values():
+            x["reference"] = x["level"]; x["tripped"] = 0
         self.files[day] = bytes(w)
         return len(insts), h
 
@@ -1804,6 +1969,7 @@ class Ref:
     def after_trade(self, inst, price):
         i = self.inst[inst]
         i["last"] = price
+        self.prices_moved = True
         # §2: every trailing stop of the instrument follows the price, never the other way
         for o in (self.orders[x] for x in self.open_ids("inst", inst)):
             if o["status"] == "waiting" and o["kind"] == "trailingStop" and o["instrument"] == inst:
@@ -1931,7 +2097,7 @@ class Ref:
         """§1: the clear of a batch waiting from an earlier time, or of an instrument left due, recorded first."""
         pending = self.batch if self.batch else (self.last_time if self.due else 0)
         if pending and now > pending:
-            self.log.append((now, "clear", self.apply_all(now, {"k": "clear", "time": pending})))
+            self.append_log(now, "clear", self.apply_all(now, {"k": "clear", "time": pending}))
             self.last_time = now
 
     def submit(self, now, role, c):
@@ -1945,7 +2111,7 @@ class Ref:
             self.last_time = now   # the proposal is a block
             return "p:"
         fx = self.apply_all(now, c)
-        self.log.append((now, c["k"], fx))
+        self.append_log(now, c["k"], fx)
         self.last_time = now
         return "x:" + ",".join(map(str, fx))
 
@@ -1958,7 +2124,7 @@ class Ref:
         if e:
             return "e:" + e
         fx = self.apply_all(now, c)
-        self.log.append((now, c["k"], fx))
+        self.append_log(now, c["k"], fx)
         return "x:" + ",".join(map(str, fx))
 
     def reconciled(self):
@@ -2000,7 +2166,7 @@ def parse_cmd(s):
     for kv in s.split(";"):
         k, _, v = kv.partition("=")
         # a client reference and a deposit's reference are text whatever their characters
-        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances") else (int(v) if v.isdigit() else v)
+        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances", "constituents") else (int(v) if v.isdigit() else v)
     if "open" in c:
         c["open"] = c["open"] in (1, True)
     # the nested fields of SPEC §22 to §25: levies (account:ppm), balances (account:ledger:amount), quotes
@@ -2009,6 +2175,8 @@ def parse_cmd(s):
         c["levies"] = [tuple(int(x) for x in t.split(":")) for t in str(c["levies"]).split(",") if t]
     if "balances" in c:
         c["balances"] = [(int(t.split(":")[0]), t.split(":")[1], int(t.split(":")[2])) for t in str(c["balances"]).split(",") if t]
+    if "constituents" in c:
+        c["constituents"] = [tuple(int(x) for x in t.split(":")) for t in str(c["constituents"]).split(",") if t]
     if "sides" in c:
         c["sides"] = [dict(zip(("instrument", "bid", "ask", "qty", "ref"), (int(a), int(b), int(d), int(q), r)))
                       for a, b, d, q, r in (t.split(":") for t in str(c["sides"]).split(",") if t)]
@@ -2023,7 +2191,7 @@ def main():
         if l.startswith("+|"):
             if kept:
                 lines[-1] += l[2:]      # a long line printed in pieces
-        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP", "N|", "P|", "R|", "X|", "Z|", "T|"):
+        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP", "N|", "P|", "R|", "X|", "Z|", "T|", "IX", "IP"):
             lines.append(l); kept = True
         else:
             kept = False
@@ -2031,14 +2199,14 @@ def main():
              "ledgers": {}, "restdays": set(), "holidays": set(), "makers": {}}
     proposals = {}
     errors = []
-    streams = cmds = blocks = checkpoints = legs_checked = 0
+    streams = cmds = blocks = checkpoints = legs_checked = index_rows_checked = path_checked = 0
     ref = None
     sblocks, sorders, squeue = [], {}, {}
     sinst, slimits, skills = {}, {}, {}
     sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
     block_of = {}
     custody_legs, custody_pos = [], {}
-    sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}
+    sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}; sidx_rows, spath = {}, []
     for l in lines:
         f = l.split("|")
         if f[0] == "H":
@@ -2088,7 +2256,7 @@ def main():
             sblocks, sorders, squeue = [], {}, {}
             sinst, slimits, skills = {}, {}, {}
             sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
-            sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}
+            sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}; sidx_rows, spath = {}, []
             block_of = {}
             proposals = {}
             streams += 1
@@ -2140,6 +2308,10 @@ def main():
             custody_legs.append((lg[2], lg[3], units, hf, ht) if lg else None)
         elif f[0] == "CP":
             custody_pos[int(f[1])] = int(f[2])
+        elif f[0] == "IX":
+            sidx_rows[int(f[1])] = [int(x) for x in f[2:]]
+        elif f[0] == "IP":
+            spath.append(tuple(int(x) for x in f[1:]))
         elif f[0] == "N":
             sstmt[int(f[1])] = (int(f[2]), f[3])
         elif f[0] == "P":
@@ -2254,6 +2426,15 @@ def main():
             mine = [(a, b, c_, d, e, int(f_), g) for (a, b, c_, d, e, f_, g) in ref.maker_days]
             if mine != smdays:
                 errors.append(f"stream {streams}: makers' periods: book {smdays}, reference {mine}")
+            # indices (§26, §27): every row and the whole path, the path's blocks as the book printed them
+            mine = {ix: [x["level"], x["reference"], x["tripped"], x["divisor"]] for ix, x in ref.indices.items()}
+            if mine != sidx_rows:
+                errors.append(f"stream {streams}: indices: book {sidx_rows}, reference {mine}")
+            if any(e not in block_of for (_, e, _) in ref.path):
+                errors.append(f"stream {streams}: an index level of an entry the book printed no block for")
+            elif [(ix, block_of[e], lv) for (ix, e, lv) in ref.path] != spath:
+                errors.append(f"stream {streams}: the index path: book {spath[-3:]}, reference {[(ix, block_of[e], lv) for (ix, e, lv) in ref.path][-3:]}")
+            index_rows_checked += len(sidx_rows); path_checked += len(spath)
             if dict(ref.payable) != spay:
                 errors.append(f"stream {streams}: levies payable: book {spay}, reference {ref.payable}")
             if dict(ref.fee_totals) != sfees:
@@ -2265,7 +2446,7 @@ def main():
             sblocks, sorders, squeue = [], {}, {}
             sinst, slimits, skills = {}, {}, {}
             sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
-            sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}
+            sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}; sidx_rows, spath = {}, []
     if custody_pos:
         # the custody register refolded here from the deliveries in and the admitted legs: each linked account's position
         # is the reference's holding of it in instrument 1's shares, and every leg kept its accounts' holders
@@ -2280,6 +2461,8 @@ def main():
                 errors.append(f"custody: account {a}'s position {units}, the reference's holding {have}")
         print(f"reference: {len(custody_legs)} legs admitted into custody, each the reference's own; {len(custody_pos)} positions equal to the holdings")
     print(f"reference: {legs_checked} settlement legs hashed into the range's root and compared")
+    if index_rows_checked:
+        print(f"reference: {index_rows_checked} index rows and {path_checked} path levels compared at checkpoints")
     print(f"reference: {streams} streams, {cmds} commands, {blocks} blocks and {checkpoints} checkpoints of every order and balance compared")
     if streams == 0 or cmds == 0 or blocks == 0 or checkpoints == 0:
         errors.append("MISS: the log holds no stream")

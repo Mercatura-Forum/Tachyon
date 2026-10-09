@@ -131,6 +131,11 @@ class FeedBook:
                 for _ in range(r.len16()):
                     oid, side, price, shown = r.nat(), r.byte(), r.nat(), r.nat()
                     self.orders[oid] = [inst, side, price, shown]
+        elif kind == 12:
+            # the market-wide breaker: every instrument it names halted
+            r.nat(); r.nat(); r.byte()
+            for inst in r.nats():
+                self.phase[inst] = PHASE["halted"]
         elif kind == 10:
             r.nat(); r.nat(); r.p += 32      # the day's seal: day, rows, the file's hash; nothing visible changes
         else:

@@ -222,6 +222,21 @@ def read_command(data):
         c = {"k": "reconcileMember", "member": r.nat(), "day": r.nat(), "balances": [(r.nat(), principal_text(r.principal()), r.nat()) for _ in range(r.len16())]}
     elif tag == 44:
         c = {"k": "registerMaker", "member": r.nat(), "instrument": r.nat(), "maxSpread": r.nat(), "minQty": r.nat(), "presence": r.nat(), "rebate": r.nat()}
+    elif tag in (48, 49):
+        c = {"k": "defineIndex" if tag == 48 else "reviewIndex", "index": r.nat()}
+        if tag == 48:
+            c.update(base=r.nat(), cap=r.nat(), halt=r.nat(), suspend=r.nat())
+        c["constituents"] = [(r.nat(), r.nat()) for _ in range(r.len16())]
+    elif tag == 50:
+        c = {"k": "corporateAction", "instrument": r.nat()}
+        kind = r.byte()
+        if kind == 1:
+            c.update(kind="split", num=r.nat(), den=r.nat())
+        else:
+            c.update(kind="dividend", amount=r.nat())
+        c["reference"] = r.blob().hex()
+    elif tag == 51:
+        c = {"k": "tripBreaker", "index": r.nat()}
     elif tag in (45, 46):
         c = {"k": "quote" if tag == 45 else "massQuote", "account": r.nat(), "member": r.nat(), "trader": r.nat()}
         n = 1 if tag == 45 else r.len16()
@@ -567,6 +582,19 @@ def markets_sections(w, book):
     w.text("makerdays"); w.nat(len(book.maker_days) + 1)
     for n, (m, i, d, pr, se, met, rb) in enumerate(book.maker_days, start=1):
         w.nat(n); w.blob(be(m, 8) + be(i, 8) + be(d, 8) + be(pr, 8) + be(se, 8) + bytes([1 if met else 0]) + be(rb, 8))
+    # indices (§26, §27)
+    w.text("indices"); w.nat(9)
+    for index in sorted(book.indices):
+        x = book.indices[index]
+        row = b"".join(be(v, 8) for v in (x["base"], x["cap"], x["halt"], x["suspend"])) + be(x["divisor"], 32) + be(x["level"], 8) + be(x["reference"], 8) + bytes([x["tripped"]])
+        w.nat(index); w.blob(row)
+    w.text("constituents"); w.nat(len(book.constituents) + 1)
+    for n, ((ix, i), (sh, f)) in enumerate(book.constituents.items(), start=1):
+        w.nat(n); w.blob(be(ix, 8) + be(i, 8) + be(sh, 8) + be(f, 8))
+    w.text("indexpath"); w.nat(len(book.path) + 1)
+    for n, (ix, entry, level) in enumerate(book.path, start=1):
+        w.nat(n); w.blob(be(ix, 8) + be(entry - 1, 8) + be(level, 8))
+    w.text("breaker"); w.nat(book.breaker_due); w.nat64(book.suspended_at)
 
 
 def main():
