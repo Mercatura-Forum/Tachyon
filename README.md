@@ -51,6 +51,14 @@ subnet running the production node binary under the production environment
 (25 of 25 rows); the matching engine and the listing registry are verified in
 the interpreter and on a Thebes subnet. See `docs/VERIFICATION.md`.
 
+**The exchange.** Beside the settlement core, the repository carries an exchange built on the Thebes kernel, each part a
+pure core of commands on a certified log that a contract composes: the exchange's foundation (members, traders,
+accounts, segments, the calendar, instruments), a continuous order book with its central counterparty and the
+instruments and cash legs a national market trades, a surveillance desk over the book's log, the venue contract that
+composes them, and a FIX gateway each member runs at its own edge. Every part has a battery whose output an
+independent Python oracle recomputes from the commands alone, planted-fault controls and mutants; every battery's
+transcript is made again on a chain by the chain judge. See `book/SPEC.md` and `docs/VERIFICATION.md` §7.
+
 ## Why it runs on Thebes
 
 A settlement system holds other people's assets for the duration of a trade.
@@ -86,6 +94,11 @@ custody is:
 | **`core/`: the settlement core** | Two-phase escrow (fund, settle, abort); both-or-neither settlement gated on both legs confirmed in escrow; reclaim in full after the deadline; idempotent retry of a failed payout with a fixed `created_at_time` so the ledger deduplicates; a ledger `Duplicate` verified against the named escrow before it is trusted; five invariants checked on every transition; a Merkle mountain range receipt for every event; the ICRC-7 leg for unique assets; a delivery free of payment (one leg, moved by the taker's acceptance, reclaimed past the deadline) under the same receipts and invariants. |
 | **`matching/`: the batch matching engine** | Orders staged into windows and cleared at one uniform price that maximises executed volume; price-time priority with pro-rata at the margin; reservation against the core rather than custody; each fill a settlement obligation driven through the core as a matched trade; clearing metered against an instruction budget and resumed across rounds, so batch size is unbounded without a partially applied chunk. |
 | **`listing/`: the listing registry** | The issuer-gated record of what is tradeable: fungible shares and unique-asset collections, funded-check at listing time; consulted by the matching engine when configured. |
+| **`exchange/`: the exchange's foundation** | Members admitted under four eyes, their traders, house accounts and client accounts carrying a commitment to the client, each trader's right to trade per segment; segments with their session windows and the scheduler's phase at the chain's clock; the market's calendar and UTC offset; price-dependent tick tables; instruments by ISIN with the ISO 6166 check digit. Every refusal a stable code with an English and an Arabic text. See `exchange/README.md`. |
+| **`book/`: the continuous order book** | Orders of one block cleared at one price; limit, market, immediate-or-cancel, fill-or-kill, stop, iceberg, trailing and one-cancels-other orders; phases, call auctions and the indicative price, price bands and volatility interruptions, halts, the kill switch and risk limits; the public feed, each member's drop copy and the day's sealed statistics; insider blackouts and short sales; a central counterparty for clearing members with netting cycles, fails, the guarantee fund, default and its waterfall, every movement a leg of a Merkle mountain range; fees, statements, reconciliation and market makers; indices and the market-wide circuit breaker; bonds, funds, warehouse receipts, certificates and rights; attested prices, futures and options on an index; the cash leg in central bank reserves, tokenised deposits or claims bridged to the RTGS. Specified in `book/SPEC.md`; see `book/README.md`. |
+| **`surveillance/`: the surveillance desk** | A fold over the book's log: wash trades, painting the tape, quote stuffing, spoofing and layering, marking the close, each threshold a parameter under four eyes; cases opened, closed or reported under four eyes; the daily regulatory report as a hash chain anyone holding the log rebuilds. See `surveillance/SPEC.md`. |
+| **`venue/`: the venue contract** | Composes the exchange's foundation, the book and the desk: a member's typed calls signed by its trader, the operator's and the scheduler's acts under their grants, every read scoped to its caller. |
+| **`gateway/`: the members' FIX gateway** | FIX 4.4, and FIX 5.0 SP2 over FIXT.1.1, terminated at the member's edge and translated into the venue's typed calls signed with the member's own key; ExecutionReports by one rule from the venue's replies and its public feed, rebuilt from the certified log alone; a drop-copy session; QuickFIX/J conformance sessions. Specified in `book/SPEC.md` §37. |
 | **`custody/`: custody beside the venue** | A register of holders and their settled positions as the fold of the venue's receipts (each recorded once by its id and hash, never more than a holder has); reconciliation of the register to the ledgers' attested balances, sealed by a hash; corporate actions (a cash dividend, a split and a bonus with cash in lieu of fractions, rights within the entitlement and by the deadline, a redemption) struck at the record date and paid on the payment date in slices, the entitlement file certified by its hash. An initial public offering beside it: the book of bids on a price ladder, retail applications paid in full, pricing never above the book's clearing price, the underwriter's firm or best-efforts commitment, allocation by cumulative rounding with its file chained by hash, and the hand-off of the allotments to the register behind the listing gate. Pure cores on the Thebes kernel that a venue contract composes; see `custody/README.md`. |
 
 ## Layout
@@ -101,7 +114,14 @@ matching/test/  the interpreter battery (53,443 checks: 4,000 randomised windows
                 properties of the lot rule, exact bid release and self-trade prevention)
 matching/tools/ the mutation tool and its mutants; the upgrade gate
 listing/src/    ListingRegistry
-custody/        the custody register: src/, test/ (WASI batteries), integration/ (the Python twin), tools/
+custody/        the custody register: src/, test/ (WASI batteries), integration/ (the Python twin, the chain judge,
+                its test actor VenueJudge and the chain client), tools/ (the gates, the contracts' build)
+exchange/       the exchange's foundation: src/, test/, integration/ (the twin), tools/
+book/           the order book: SPEC.md, src/, test/ (the batteries, each its own process), integration/ (the
+                reference book, the regulator's replay, the feed's consumer), tools/ (controls, mutants)
+surveillance/   the desk: SPEC.md, src/, test/, integration/ (the oracle), tools/
+venue/src/      Venue, the contract that composes them
+gateway/        the FIX gateway: fix, er, feedwatch, orderlog, reconstruct, gateway; conformance/; test/
 vendor/         the Thebes kernel the custody module builds against, named by commit
 test/chain/    battery.py: the settlement battery on a Thebes chain
 deploy/         an example thebes-deploy manifest
@@ -146,6 +166,24 @@ python3 matching/tools/mutation_test.py
 The mutation tool copies the committed tree with `custody/tools/committed_tree.sh`, so it needs the kernel checkout
 described above, although the matching engine itself does not depend on the kernel.
 
+The exchange's batteries run as the custody module's do, each a WASI process, its log checked by the module's oracle;
+the gateway's checks need Java and fetch QuickFIX/J 2.3.1 by pinned SHA-1:
+
+```
+./exchange/test/run.sh
+./book/test/run.sh
+./surveillance/test/run.sh
+QFJ_DIR=<a directory> ./gateway/test/run.sh
+python3 book/tools/mutation_test.py
+./custody/tools/build_contracts.sh "$PWD" build      # the venue and the judge actor, legacy persistence
+```
+
+Each book battery's planted-fault controls are `book/tools/*_control.sh <the battery's log>`. A battery's transcript is
+judged on a chain with `custody/integration/chain_judge.py --wasm build/VenueJudge.wasm --log <the battery's log>
+--config custody/integration/judge/<battery>.json --chain <chain.json>`, where `chain.json` names the chain's node URLs,
+its deploy gateway and its chain id (the format is in `custody/integration/thebes_client.py`); the client signs as
+identities it imports into the deploy tool's store.
+
 The contracts are built with legacy (classical) persistence so that an in-place
 upgrade keeps its state. `test/chain/README.md` describes the battery on a
 chain; `deploy/example.thebes.toml` is the manifest shape.
@@ -188,6 +226,17 @@ A client that read the removed whole-collection methods moves to the pages.
   validators in diverse locations running it. The matching engine with its fixes has been run on a four-validator
   test chain running the production node binary (`docs/VERIFICATION.md` §6), not on such a subnet. The listing
   registry has not been run on the production binary.
+- **The exchange on a chain.** Its batteries are judged on a four-validator test chain running the production node
+  binary (`docs/VERIFICATION.md` §7), not on a subnet of validators in diverse locations.
+- **Rejected orders and the log.** A refused order writes no block, so the gateway's Rejected report is the venue's
+  reply and the gateway's journal, and is not rebuilt from the log; every other report is.
+- **The central counterparty.** The book carries its mechanics; acting as a central counterparty is the licence of
+  a clearing house that runs them.
+- **Compaction.** An order index is compacted inside one message once its stale entries reach its live ones, a spike
+  in that message's cost (`book/README.md`).
+- **The chain judge's windows.** With several calls in flight, the chain may execute a window's calls in an order
+  other than the one submitted, and a judge then stops at the first reply that differs; the run of record sends one
+  call at a time.
 
 ## Design
 
