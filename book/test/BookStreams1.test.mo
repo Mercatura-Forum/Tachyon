@@ -40,7 +40,7 @@ w.seed := w.seed ^ Nat64.fromNat(0x77_0000 + 1);
 let (commands, replays) = randomStreams(0, 3, 2_000);
 Debug.print("count: random commands judged by the book and the reference = " # n(commands));
 Debug.print("count: books whose log replayed to the same fingerprint = " # n(replays));
-printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "uncrossed books checked", "checkpoints", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price"]);
+printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "uncrossed books checked", "checkpoints", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "feed digests printed"]);
 
 
 if (w.failures > 0) { Debug.print("BOOK STREAMS 1 FAILED: " # Nat.toText(w.failures)); assert false } else Debug.print("BOOK STREAMS 1 GREEN");

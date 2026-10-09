@@ -4,3 +4,4 @@
 set -eu
 here="$(cd "$(dirname "$0")/.." && pwd)"
 python3 "$here/integration/reference_book.py" "$1"
+python3 "$here/integration/feed_book.py" "$1"

@@ -25,6 +25,7 @@ import Auth "mo:kernel/auth/AuthTypes";
 import CivilDate "mo:kernel/num/CivilDate";
 import RS "mo:kernel/rows/RowStore";
 import Page "mo:kernel/rows/Page";
+import Sha256 "mo:sha2/Sha256";
 import XT "../../../exchange/src/ExchangeTypes";
 import X "../../../exchange/src/ExchangeCore";
 import XText "../../../exchange/src/ExchangeText";
@@ -68,7 +69,7 @@ module {
     public func isTrader(p : Principal) : Bool { peq(p, t1) or peq(p, t2) or peq(p, t3) or peq(p, t4) };
 
     public let schedulerActs = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire",
-      "book.instrument.phase", "book.auction.uncross", "book.kill.sweep"];
+      "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal"];
     public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set"];
     public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits"];
     public func among(xs : [Text], x : Text) : Bool { Array.find<Text>(xs, func(y) { y == x }) != null };
@@ -157,6 +158,7 @@ module {
     /// The member of an account (0 for none) and the exchange's id of a role's trader (0 for none).
     public func memberOf(account : Nat) : Nat { switch (X.account(xs, account)) { case (?a) a.member; case null 0 } };
     public func traderIdOf(p : Principal) : Nat { switch (X.traderByPrincipal(xs, p)) { case (?(t, _)) t; case null 0 } };
+    public func memberOfTrader(t : Nat) : Nat { switch (X.trader(xs, t)) { case (?row) row.member; case null 0 } };
     /// The terms a run opens its two instruments with: (collar, static band, dynamic band, interruption seconds). Wide
     /// for the main book (its scenarios trade across 1.2 per cent); random streams set tight ones to interrupt.
     public var terms : [(Nat, Nat, Nat, Nat)] = [(500, 2_000, 0, 600), (500, 2_000, 0, 600)];
@@ -177,12 +179,12 @@ module {
         case (#openInstrument(x)) "k=openInstrument;instrument=" # n(x.instrument) # ";asset=" # ledgerName(x.assetLedger) # ";cash=" # ledgerName(x.cashLedger) # ";lot=" # n(x.lot) # ";price=" # n(x.referencePrice) # ";bands=" # bandsText(x.bands) # ";collar=" # n(x.collarBps) # ";static=" # n(x.staticBps) # ";dynamic=" # n(x.dynamicBps) # ";secs=" # n(x.interruptSecs);
         case (#setTrading(x)) "k=setTrading;instrument=" # n(x.instrument) # ";open=" # (if (x.open) "1" else "0");
         case (#setReference(x)) "k=setReference;instrument=" # n(x.instrument) # ";price=" # n(x.price);
-        case (#deposit(x)) "k=deposit;account=" # n(x.account) # ";ledger=" # ledgerName(x.ledger) # ";amount=" # n(x.amount) # ";reference=" # TR.hex(x.reference);
-        case (#withdraw(x)) "k=withdraw;account=" # n(x.account) # ";ledger=" # ledgerName(x.ledger) # ";amount=" # n(x.amount);
+        case (#deposit(x)) "k=deposit;account=" # n(x.account) # ";member=" # n(x.member) # ";ledger=" # ledgerName(x.ledger) # ";amount=" # n(x.amount) # ";reference=" # TR.hex(x.reference);
+        case (#withdraw(x)) "k=withdraw;account=" # n(x.account) # ";member=" # n(x.member) # ";ledger=" # ledgerName(x.ledger) # ";amount=" # n(x.amount);
         case (#placeOrder(x)) "k=placeOrder;account=" # n(x.account) # ";instrument=" # n(x.instrument) # ";side=" # sideT(x.side) # ";kind=" # kindT(x.kind) # ";qty=" # n(x.qty) # ";price=" # n(x.price) # ";stop=" # n(x.stopPrice) # ";peak=" # n(x.peak) # ";validity=" # validityT(x.validity) # ";gtd=" # n(x.gtdDay) # ";smp=" # smpT(x.selfTrade) # ";oco=" # n(x.oco) # ";capacity=" # (switch (x.capacity) { case (#agency) "agency"; case (#principal) "principal" }) # ";short=" # (if (x.shortSale) "1" else "0") # ";trail=" # n(x.trail) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";ref=" # x.clientRef;
         case (#cancelOrder(x)) "k=cancelOrder;order=" # n(x.order);
         case (#amendOrder(x)) "k=amendOrder;order=" # n(x.order) # ";qty=" # n(x.qty) # ";price=" # n(x.price);
-        case (#massCancel(x)) "k=massCancel;account=" # n(x.account) # ";limit=" # n(x.limit);
+        case (#massCancel(x)) "k=massCancel;account=" # n(x.account) # ";member=" # n(x.member) # ";limit=" # n(x.limit);
         case (#flush) "k=flush";
         case (#endOfDay(x)) "k=endOfDay;limit=" # n(x.limit);
         case (#expireGtd(x)) "k=expireGtd;day=" # n(x.day) # ";limit=" # n(x.limit);
@@ -192,6 +194,7 @@ module {
         case (#halt(x)) "k=halt;instrument=" # n(x.instrument) # ";reason=" # x.reason;
         case (#resume(x)) "k=resume;instrument=" # n(x.instrument);
         case (#kill(x)) "k=kill;member=" # n(x.member) # ";trader=" # n(x.trader) # ";reason=" # x.reason;
+        case (#sealDay(x)) "k=sealDay;day=" # n(x.day);
         case (#killSweep(x)) "k=killSweep;kill=" # n(x.kill) # ";limit=" # n(x.limit);
         case (#revive(x)) "k=revive;kill=" # n(x.kill);
         case (#setLimits(x)) "k=setLimits;member=" # n(x.member) # ";qty=" # n(x.maxOrderQty) # ";value=" # n(x.maxOrderValue) # ";credit=" # n(x.creditLimit);
@@ -210,6 +213,7 @@ module {
       st : B.State;
       traced : Bool;
       var dumped : Nat;       // the log's blocks printed so far
+      var fed : Nat;          // the feed's messages printed so far (SPEC §13)
       var scanned : Nat;      // the log's blocks whose clears the properties have examined
       var refSeq : Nat;       // client references handed out
       var depSeq : Nat;       // deposit references handed out
@@ -231,7 +235,7 @@ module {
     public func newRun(traced : Bool) : Run {
       let st = B.newState();
       B.setPolicies(st, bookDuals());
-      let r : Run = { st; traced; var dumped = 0; var scanned = 0; var refSeq = 0; var depSeq = 0; var printedTo = 1; totals = Map.empty<Text, Int>();
+      let r : Run = { st; traced; var dumped = 0; var fed = 0; var scanned = 0; var refSeq = 0; var depSeq = 0; var printedTo = 1; totals = Map.empty<Text, Int>();
         track = Map.empty<Nat, Track>(); runTerms = terms };
       Map.add(r.track, Nat.compare, 1, { var ref = 85_000; var last = 0; var close = 0; var phase = #closed : T.Phase });
       Map.add(r.track, Nat.compare, 2, { var ref = 1_995; var last = 0; var close = 0; var phase = #closed : T.Phase });
@@ -321,11 +325,19 @@ module {
                       };
                       checkPairs(r, b, effects, k + 4, pairs, price);
                       let at = k + 4 + pairs * 3;
-                      let nc = effects[at]; let nt = effects[at + 1 + nc];
+                      let nc = effects[at]; let tp = at + 1 + nc; let nt = effects[tp];
+                      let sp = tp + 1 + 4 * nt; let ns = effects[sp];
                       for (_ in Nat.range(0, nc)) saw("orders cancelled at a clear");
                       for (_ in Nat.range(0, nt)) saw("stops triggered");
-                      if (effects[at + 2 + nc + nt] == 1) { check(t.phase == #continuous, "an interruption only from continuous trading"); t.phase := #auction; saw("volatility interruptions") };
-                      k := at + 3 + nc + nt;
+                      // a revealed stop shows a positive quantity on its side; an iceberg after the clear at most its peak
+                      for (j in Nat.range(0, nt)) check((effects[tp + 2 + 4 * j] == 1 or effects[tp + 2 + 4 * j] == 2) and effects[tp + 4 + 4 * j] > 0, "a revealed stop shows its side and a quantity");
+                      for (j in Nat.range(0, ns)) {
+                        switch (B.order(r.st, effects[sp + 1 + 2 * j])) { case (?o) check(o.peak != 0 and effects[sp + 2 + 2 * j] <= o.peak and effects[sp + 2 + 2 * j] > 0, "an iceberg shows at most its peak"); case null check(false, "a shown iceberg exists") };
+                        saw("icebergs shown after a clear");
+                      };
+                      let fp = sp + 1 + 2 * ns;
+                      if (effects[fp] == 1) { check(t.phase == #continuous, "an interruption only from continuous trading"); t.phase := #auction; saw("volatility interruptions") };
+                      k := fp + 1;
                     };
                   };
                   case (#uncross(x)) {
@@ -352,6 +364,7 @@ module {
                   case (#killSweep(_)) saw("kill sweeps");
                   case (#revive(_)) saw("revivals");
                   case (#setLimits(_)) saw("limits set");
+                  case (#sealDay(_)) saw("days sealed");
                   case (_) {};
                 };
               };
@@ -410,6 +423,45 @@ module {
     };
     /// A stream's step: an act under four eyes given by the operator is proposed and approved; any other, given.
     public func step(r : Run, who : Principal, c : T.Command) : B.Result<B.Outcome> { if (underFourEyes(c) and peq(who, operator)) govern(r, c) else act(r, who, c) };
+    /// The visible book (SPEC §13) as the book's state holds it: for every open instrument, its phase and every live
+    /// order with its side, price and shown quantity, in order number order; hashed. The feed's consumer
+    /// (`integration/feed_book.py`) computes the same from the feed alone.
+    public func visibleDigest(r : Run) : Blob {
+      let w = C.Writer(); w.text("thebes.book.visible.v1");
+      for (i in Nat.range(1, 9)) {
+        switch (B.instrument(r.st, i)) {
+          case (?x) {
+            let live = Map.empty<Nat, T.Order>();
+            for (side in [#buy, #sell].vals()) {
+              var cursor : ?Page.Cursor = null;
+              label pages loop {
+                switch (B.depth(r.st, i, side, cursor, 500)) {
+                  case (#ok(p)) { for ((id, o) in p.rows.vals()) { if (o.status == #live) Map.add(live, Nat.compare, id, o) }; switch (p.next) { case (?nx) cursor := ?nx; case null break pages } };
+                  case (#err(_)) { check(false, "the depth reads"); break pages };
+                };
+              };
+            };
+            w.nat(i); w.byte(K.phaseCode(x.phase)); w.len16(Map.size(live));
+            for ((id, o) in Map.entries(live)) { w.nat(id); w.byte(if (o.side == #buy) 1 else 2); w.nat(o.price); w.nat(B.shownOf(o)) };
+          };
+          case null {};
+        };
+      };
+      Sha256.fromArray(#sha256, w.toArray())
+    };
+    /// The feed's new messages since the last call, each with its feed hash, then the visible book's digest after them.
+    public func feedOut(r : Run) {
+      let (next, _) = B.feedHeadOf(r.st);
+      // after every act the feed holds every block of the log: no block waits for a later act to be published
+      check(next == DL.length(r.st.log), "the feed holds the log's every block after an act: " # n(next) # " of " # n(DL.length(r.st.log)));
+      if (r.fed == next) return;
+      while (r.fed < next) {
+        switch (B.feedEntry(r.st, r.fed)) { case (?e) line("F|" # n(r.fed) # "|" # TR.hex(e.message) # "|" # TR.hex(e.hash)); case null check(false, "a feed entry reads") };
+        r.fed += 1;
+      };
+      line("V|" # n(next - 1) # "|" # TR.hex(visibleDigest(r)));
+      saw("feed digests printed");
+    };
     public func act(r : Run, who : Principal, c : T.Command) : B.Result<B.Outcome> {
       // the indicative auction price read just before an uncross, after the clears due before it (the command records them
       // first, SPEC §1, and one may open an interruption the uncross then ends): the uncross must trade exactly it
@@ -422,7 +474,7 @@ module {
           switch (c) {
             case (#deposit(d)) addTotal(r, d.ledger, d.amount);
             case (#withdraw(w)) addTotal(r, w.ledger, -w.amount);
-            case (#placeOrder(_)) { if (x.effects.size() > 3) saw("own orders cancelled at entry"); if (x.effects[2] == 4) saw("incoming orders cancelled with the resting") };
+            case (#placeOrder(_)) { if (x.effects.size() > 5) saw("own orders cancelled at entry"); if (x.effects[2] == 4) saw("incoming orders cancelled with the resting") };
             case (#amendOrder(_)) saw(if (x.effects[2] == 1) "amendments keeping priority" else "amendments taking a new priority");
             case (#uncross(_)) {
               switch (ind) {
@@ -440,6 +492,7 @@ module {
         case (#err(_)) saw("refused " # TR.errName(debug_show(res)));
         case (_) {};
       };
+      feedOut(r);
       scanClears(r);
       res
     };
@@ -452,6 +505,7 @@ module {
           let a = bapp(r, director1, p.proposal);
           line("A|" # Nat64.toText(now) # "|director1|" # n(p.proposal) # "|" # outText(a));
           switch (a) { case (#ok(#executed(_))) saw("executed " # K.familyOf(c)); case (#err(_)) saw("refused at approval " # TR.errName(debug_show(a))); case (_) {} };
+          feedOut(r);
           scanClears(r);
           a
         };
@@ -469,6 +523,7 @@ module {
     public func refusedAs(r : Run, who : Principal, c0 : T.Command, want : Text, what : Text) {
       let c = asCaller(c0, who);
       ignore B.flushDue(r.st, now, who);
+      feedOut(r);
       scanClears(r);
       let d0 = dims(r.st);
       let res = act(r, who, c);
@@ -573,7 +628,7 @@ module {
     public func depRef(k : Nat) : Blob { Blob.fromArray(Array.tabulate<Nat8>(32, func(i) { if (i < 24) 0xD0 else Nat8.fromNat((k / (256 ** (31 - i : Nat))) % 256) })) };
     public func deposit(r : Run, account : Nat, ledger : Principal, amount : Nat) {
       r.depSeq += 1;
-      ignore executes(r, depository, #deposit({ account; ledger; amount; reference = depRef(r.depSeq + streams * 1_000_000) }), "deposit");
+      ignore executes(r, depository, #deposit({ account; member = memberOf(account); ledger; amount; reference = depRef(r.depSeq + streams * 1_000_000) }), "deposit");
     };
     /// The order number a placement executed with, or 0.
     public func placed(r : Run, c : T.Command) : Nat { switch (act(r, switch (c) { case (#placeOrder(x)) traderOf(x.account); case (_) operator }, c)) { case (#ok(#executed(x))) x.effects[1]; case (o) { check(false, "placed: " # debug_show(o)); 0 } } };
@@ -647,6 +702,8 @@ module {
     public func underFourEyes(c : T.Command) : Bool { switch (c) { case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_)) true; case (_) false } };
     public func randomPhase() : T.Phase { let x = rnd(100); if (x < 55) #continuous else if (x < 75) #auction else if (x < 85) #closingAuction else if (x < 93) #tradeAtClose else #closed };
     public func randomCommand(r : Run) : (Principal, T.Command) {
+      // the day's seal, now and then; one time in four for a day other than the market day (refused)
+      if (rnd(150) == 0) return (scheduler, #sealDay({ day = if (rnd(4) == 0) today() + 1 else today() }));
       // recovery first, now and then: an active kill swept until its target holds nothing open, then revived; a halted
       // instrument resumed. A block then lasts a few commands, not the stream.
       if (rnd(4) == 0) {
@@ -668,9 +725,11 @@ module {
         let amount = if (peq(ledger, cash)) 1 + rnd(80_000_000) else if (peq(ledger, sharesA)) 10 * (1 + rnd(300)) else 1 + rnd(200);
         r.depSeq += 1;
         let reference = if (rnd(60) == 0) depRef(r.depSeq - 1 + streams * 1_000_000) else if (rnd(80) == 0) bytes(r.depSeq, 31) else depRef(r.depSeq + streams * 1_000_000);
-        return (depository, #deposit({ account = 1 + rnd(18); ledger; amount = if (rnd(80) == 0) 0 else amount; reference }));
+        let account = 1 + rnd(18);
+        // now and then the wrong member: refused (the log's member must be the account's)
+        return (depository, #deposit({ account; member = if (rnd(60) == 0) 3 - Nat.min(2, memberOf(account)) else memberOf(account); ledger; amount = if (rnd(80) == 0) 0 else amount; reference }));
       };
-      if (x < 100) { let who = pickTrader(); return (who, #withdraw({ account = accountFor(who); ledger = pick<Principal>([cash, sharesA, sharesB]); amount = rnd(3_000_000) })) };
+      if (x < 100) { let who = pickTrader(); let account = accountFor(who); return (who, #withdraw({ account; member = memberOf(account); ledger = pick<Principal>([cash, sharesA, sharesB]); amount = rnd(3_000_000) })) };
       if (x < 680) { let who = pickTrader(); return (who, randomOrder(r, who)) };
       let recent = if (r.st.nextOrder > 1) r.st.nextOrder - 1 - rnd(Nat.min(40, r.st.nextOrder - 1)) + (if (rnd(30) == 0) 50 else 0) else 1;
       let owner = switch (B.order(r.st, recent)) { case (?o) (if (rnd(15) == 0) pickTrader() else traderOf(o.account)); case null pickTrader() };
@@ -686,7 +745,7 @@ module {
         };
         return (owner, #amendOrder({ order = recent; qty = q; price = p }));
       };
-      if (x < 855) { let who = pickTrader(); return (who, #massCancel({ account = accountFor(who); limit = 1 + rnd(30) })) };
+      if (x < 855) { let who = pickTrader(); let account = accountFor(who); return (who, #massCancel({ account; member = memberOf(account); limit = 1 + rnd(30) })) };
       if (x < 870) { let i = 1 + rnd(2); return (scheduler, #setReference({ instrument = i; price = if (rnd(6) == 0) jumpPrice(r, i) else nearPrice(r, i) })) };
       if (x < 885) { let i = 1 + rnd(2); return (scheduler, #setTrading({ instrument = i; open = rnd(5) != 0 })) };
       if (x < 905) return (scheduler, #flush);
@@ -712,7 +771,10 @@ module {
       if (x < 980) {
         let target = rnd(3);
         let who = if (rnd(5) < 3) operator else pickTrader();
-        return (who, #kill({ member = if (target == 0) 1 + rnd(2) else 0; trader = if (target == 0) 0 else 1 + rnd(4); reason = "the member's risk desk" }));
+        // a member's kill, or one trader's naming its member (now and then another member: refused)
+        let trader = if (target == 0) 0 else 1 + rnd(4);
+        let member = if (trader == 0) 1 + rnd(2) else if (rnd(30) == 0) 3 - Nat.min(2, memberOfTrader(trader)) else memberOfTrader(trader);
+        return (who, #kill({ member; trader; reason = "the member's risk desk" }));
       };
       if (x < 990) return (scheduler, #killSweep({ kill = latest + (if (rnd(20) == 0) 50 else 0); limit = 1 + rnd(40) }));
       if (x < 994) return (operator, #revive({ kill = latest }));
@@ -733,6 +795,7 @@ module {
         let (who, c) = randomCommand(r);
         if (explicit) {
           ignore B.flushDue(r.st, now, who);
+          feedOut(r);
           scanClears(r);
           uncrossed(r);
           if (k % 97 == 0) {
@@ -790,11 +853,12 @@ module {
                   List.add(out, "clear " # Nat64.toText(b.timestamp) # " instrument " # n(effects[k]) # " at " # n(effects[k + 1]) # " volume " # n(effects[k + 2]));
                   let pairs = effects[k + 3];
                   for (j in Nat.range(0, pairs)) List.add(out, "pair " # Nat64.toText(b.timestamp) # " " # nameOf(effects[k + 4 + j * 3]) # " " # nameOf(effects[k + 5 + j * 3]) # " " # n(effects[k + 6 + j * 3]));
-                  let at = k + 4 + pairs * 3; let nc = effects[at]; let nt = effects[at + 1 + nc];
+                  let at = k + 4 + pairs * 3; let nc = effects[at]; let tp = at + 1 + nc; let nt = effects[tp]; let sp = tp + 1 + 4 * nt; let ns = effects[sp];
                   for (j in Nat.range(0, nc)) List.add(out, "cancelled " # Nat64.toText(b.timestamp) # " " # nameOf(effects[at + 1 + j]));
-                  for (j in Nat.range(0, nt)) List.add(out, "triggered " # Nat64.toText(b.timestamp) # " " # nameOf(effects[at + 2 + nc + j]));
-                  if (effects[at + 2 + nc + nt] == 1) List.add(out, "interrupted " # Nat64.toText(b.timestamp) # " instrument " # n(effects[k]));
-                  k := at + 3 + nc + nt;
+                  for (j in Nat.range(0, nt)) List.add(out, "triggered " # Nat64.toText(b.timestamp) # " " # nameOf(effects[tp + 1 + 4 * j]) # " shows " # n(effects[tp + 4 + 4 * j]));
+                  for (j in Nat.range(0, ns)) List.add(out, "shows " # Nat64.toText(b.timestamp) # " " # nameOf(effects[sp + 1 + 2 * j]) # " " # n(effects[sp + 2 + 2 * j]));
+                  if (effects[sp + 1 + 2 * ns] == 1) List.add(out, "interrupted " # Nat64.toText(b.timestamp) # " instrument " # n(effects[k]));
+                  k := sp + 2 + 2 * ns;
                 };
               };
               case (#executed({ command = #uncross(_); effects })) {
@@ -880,7 +944,11 @@ module {
         let r = newRun(false);
         for (a in Nat.range(1, 17)) { if (rnd(3) != 0) { ignore tick(); deposit(r, a, cash, 50_000_000 + rnd(400_000_000)); deposit(r, a, sharesA, 100 * (1 + rnd(50))); deposit(r, a, sharesB, 10 * (1 + rnd(40))) } };
         ignore tick(); ignore act(r, scheduler, #setTrading({ instrument = 1; open = true })); ignore act(r, scheduler, #setTrading({ instrument = 2; open = true }));
-        randomStream(r, steps, 250, s % 2 == 0); commands += steps;
+        // half the stream, then both instruments into the closing auction (the session's last stretch), then the rest:
+        // the closing price and trade at close occur in every stream
+        randomStream(r, steps / 2, 250, s % 2 == 0);
+        ignore tick(); for (i in [1, 2].vals()) ignore act(r, scheduler, #setPhase({ instrument = i; phase = #closingAuction; endFrom = 0; endTo = 0 }));
+        randomStream(r, steps - steps / 2, 250, s % 2 == 0); commands += steps;
         if (replayed(r)) replays += 1 else check(false, "stream " # n(s) # " replay");
       };
       terms := keep;
@@ -920,7 +988,7 @@ module {
           let a = rnd(100);
           if (a < 30) ignore tick() else if (a == 30) advance(70_000 + rnd(30_000));
           let (who, c) = randomCommand(r);
-          if (k % 5 == 0) { ignore B.flushDue(r.st, now, who); scanClears(r); uncrossed(r) };
+          if (k % 5 == 0) { ignore B.flushDue(r.st, now, who); feedOut(r); scanClears(r); uncrossed(r) };
           ignore step(r, who, c);
         };
         commands += steps;
@@ -965,7 +1033,7 @@ module {
         let open = Map.empty<Nat, Bool>();
         var id = from;
         while (id < r.st.nextOrder) { switch (B.order(r.st, id)) { case (?o) { if (o.status == #live or o.status == #waiting) Map.add(open, Nat.compare, o.account, true) }; case null {} }; id += 1 };
-        for ((acct, _) in Map.entries(open)) ignore act(r, traderOf(acct), #massCancel({ account = acct; limit = 500 }));
+        for ((acct, _) in Map.entries(open)) ignore act(r, traderOf(acct), #massCancel({ account = acct; member = memberOf(acct); limit = 500 }));
         var stillOpen = 0;
         id := from;
         while (id < r.st.nextOrder) { switch (B.order(r.st, id)) { case (?o) { if (o.status == #live or o.status == #waiting) stillOpen += 1 }; case null {} }; id += 1 };
