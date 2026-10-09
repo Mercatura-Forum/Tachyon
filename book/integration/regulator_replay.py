@@ -25,6 +25,8 @@ VALIDITY = {1: "day", 2: "gtc", 3: "gtd"}
 SMP = {1: "cancelIncoming", 2: "cancelResting", 3: "cancelBoth"}
 CAPACITY = {1: "agency", 2: "principal"}
 STATUS = {"waiting": 1, "live": 2, "filled": 3, "cancelled": 4}
+PHASES = {1: "closed", 2: "continuous", 3: "auction", 4: "closingAuction", 5: "tradeAtClose", 6: "halted"}
+PHASE_CODE = {v: k for k, v in PHASES.items()}
 
 
 class Reader:
@@ -133,7 +135,7 @@ def read_command(data):
     tag = r.byte()
     if tag == 1:
         c = {"k": "openInstrument", "instrument": r.nat(), "asset": principal_text(r.principal()), "cash": principal_text(r.principal()),
-             "lot": r.nat(), "price": r.nat(), "bands": read_bands(r), "collar": r.nat()}
+             "lot": r.nat(), "price": r.nat(), "bands": read_bands(r), "collar": r.nat(), "static": r.nat(), "dynamic": r.nat(), "secs": r.nat()}
     elif tag == 2:
         c = {"k": "setTrading", "instrument": r.nat(), "open": r.boolean()}
     elif tag == 3:
@@ -145,7 +147,7 @@ def read_command(data):
     elif tag == 6:
         c = {"k": "placeOrder", "account": r.nat(), "instrument": r.nat(), "side": SIDE[r.byte()], "kind": KIND[r.byte()], "qty": r.nat(), "price": r.nat(),
              "stop": r.nat(), "peak": r.nat(), "validity": VALIDITY[r.byte()], "gtd": r.nat(), "smp": SMP[r.byte()], "capacity": CAPACITY[r.byte()],
-             "short": 1 if r.boolean() else 0, "ref": r.text(), "oco": r.nat(), "trail": r.nat()}
+             "short": 1 if r.boolean() else 0, "ref": r.text(), "oco": r.nat(), "trail": r.nat(), "member": r.nat(), "trader": r.nat()}
     elif tag == 7:
         c = {"k": "cancelOrder", "order": r.nat()}
     elif tag == 8:
@@ -160,6 +162,22 @@ def read_command(data):
         c = {"k": "expireGtd", "day": r.nat(), "limit": r.nat()}
     elif tag == 13:
         c = {"k": "clear", "time": r.nat64()}
+    elif tag == 14:
+        c = {"k": "setPhase", "instrument": r.nat(), "phase": PHASES[r.byte()], "from": r.nat64(), "to": r.nat64()}
+    elif tag == 15:
+        c = {"k": "uncross", "instrument": r.nat(), "next": PHASES[r.byte()]}
+    elif tag == 16:
+        c = {"k": "halt", "instrument": r.nat(), "reason": r.text()}
+    elif tag == 17:
+        c = {"k": "resume", "instrument": r.nat()}
+    elif tag == 18:
+        c = {"k": "kill", "member": r.nat(), "trader": r.nat(), "reason": r.text()}
+    elif tag == 19:
+        c = {"k": "killSweep", "kill": r.nat(), "limit": r.nat()}
+    elif tag == 20:
+        c = {"k": "revive", "kill": r.nat()}
+    elif tag == 21:
+        c = {"k": "setLimits", "member": r.nat(), "qty": r.nat(), "value": r.nat(), "credit": r.nat()}
     else:
         raise ValueError(f"family tag {tag}")
     assert r.p == len(data), "bytes after the command"
@@ -188,7 +206,7 @@ def read_block(raw):
         raise ValueError(f"event tag {tag}")
     pre = r.p
     stored = r.take(32)
-    return {"index": index, "time": ts, "parent": parent, "event": ev, "hash": stored,
+    return {"index": index, "time": ts, "caller": principal_text(caller), "parent": parent, "event": ev, "hash": stored,
             "recomputed": hash_with_domain(LOG_DOMAIN, raw[:pre])}
 
 
@@ -203,7 +221,8 @@ class Book(Ref):
     def apply(self, now, c):
         if c["k"] == "openInstrument":
             self.inst[c["instrument"]] = {"lot": c["lot"], "ref": c["price"], "collar": c["collar"], "bands": c["bands"], "asset": c["asset"],
-                                          "cash": c["cash"], "open": False, "last": 0, "opened": True}
+                                          "cash": c["cash"], "phase": "closed", "last": 0, "close": 0, "endFrom": 0, "endTo": 0, "until": 0,
+                                          "static": c["static"], "dynamic": c["dynamic"], "secs": c["secs"], "opened": True}
             return [1, c["instrument"]]
         if c["k"] == "deposit":
             self.reflist.append(c["reference"])
@@ -229,9 +248,9 @@ def order_row(o):
          + bytes([{v: k for k, v in VALIDITY.items()}[o["validity"]]]) + be(o["gtd"], 4)
          + bytes([{v: k for k, v in SMP.items()}[o["smp"]], {v: k for k, v in CAPACITY.items()}[o["capacity"]], 1 if o["short"] else 0])
          + o["ref"].encode().ljust(20, b"\x00") + be(o["oco"], 8) + be(o["prio"], 8) + o["key"] + bytes([STATUS[o["status"]]])
-         + be(o["held"], 8) + be(o["filled"], 8) + be(o["trail"], 8))
-    assert len(b) == 159
-    return b + b"\x00" * (160 - len(b))
+         + be(o["held"], 8) + be(o["filled"], 8) + be(o["trail"], 8) + be(o["member"], 8) + be(o["trader"], 8))
+    assert len(b) == 175
+    return b + b"\x00" * (176 - len(b))
 
 
 def balance_row(account, ledger, available, held):
@@ -244,8 +263,10 @@ def instrument_row(i):
     for k in range(16):
         f, t = i["bands"][k] if k < len(i["bands"]) else (0, 0)
         b += be(f, 8) + be(t, 8)
-    b += be(i["collar"], 4) + bytes([1 if i["open"] else 0]) + be(i["last"], 8)
-    return b + b"\x00" * (352 - len(b))
+    b += be(i["collar"], 4) + bytes([PHASE_CODE[i["phase"]]]) + be(i["last"], 8)
+    b += be(i["static"], 4) + be(i["dynamic"], 4) + be(i["secs"], 4) + be(i["endFrom"], 8) + be(i["endTo"], 8) + be(i["until"], 8) + be(i["close"], 8)
+    assert len(b) == 390
+    return b + b"\x00" * (400 - len(b))
 
 
 def proposal_row(p):
@@ -278,6 +299,13 @@ def fingerprint(book, proposals, n_blocks, tip):
     w.text("proposals")
     for i in sorted(proposals):
         w.nat(i); w.blob(proposal_row(proposals[i]))
+    w.text("kills"); w.nat(len(book.kills) + 1)
+    for kid in sorted(book.kills):
+        k = book.kills[kid]
+        w.nat(kid); w.blob(be(k["member"], 8) + be(k["trader"], 8) + bytes([1 if k["active"] else 0]) + b"\x00" * 7)
+    w.text("limits"); w.nat(len(book.limits) + 1)
+    for n, (member, (q, v, c)) in enumerate(book.limits.items(), start=1):
+        w.nat(n); w.blob(be(member, 8) + be(q, 8) + be(v, 8) + be(c, 8) + be(book.used(member), 8))
     w.text("log"); w.nat(n_blocks); w.opt_blob(tip)
     return hash_with_domain(FOLD_DOMAIN, bytes(w.b))
 
@@ -335,7 +363,7 @@ def main():
                 while k < len(got):
                     np = got[k + 3]; pairs += np
                     at = k + 4 + 3 * np; nc = got[at]; nt = got[at + 1 + nc]
-                    k = at + 2 + nc + nt
+                    k = at + 3 + nc + nt   # the interruption flag closes each instrument's entry
             if ev["proposal"] is not None:
                 proposals[ev["proposal"]].update(status="executed", at=i)
     if errors:

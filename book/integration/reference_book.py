@@ -20,6 +20,9 @@ import sys
 
 MAXP = 2 ** 64 - 1
 STATUS = {"waiting": 1, "live": 2, "filled": 3, "cancelled": 4}
+PHASE = {"closed": 1, "continuous": 2, "auction": 3, "closingAuction": 4, "tradeAtClose": 5, "halted": 6}
+CALL = ("auction", "closingAuction")
+DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits"}
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
 MAX_TRAILING = 64
@@ -54,6 +57,17 @@ def on_tick(bands, p):
     return p > 0 and p % tick_at(bands, p) == 0
 
 
+def band(r, b):
+    """SPEC §10: ⌈r(10,000 − b)/10,000⌉ to ⌊r(10,000 + b)/10,000⌋."""
+    low = r * (0 if b >= 10_000 else 10_000 - b)
+    return -(-low // 10_000), r * (10_000 + b) // 10_000
+
+
+def within(p, r, b):
+    lo, hi = band(r, b)
+    return lo <= p <= hi
+
+
 def collar(side, ref, c, bands):
     if side == "buy":
         target = ref * (10_000 + c) // 10_000
@@ -73,7 +87,10 @@ class Ref:
         self.orders = {}      # id -> dict
         self.bal = {}         # (account, ledger) -> [available, held]
         self.refs = set()
-        self.inst = {i: dict(v, open=False, last=0, opened=False) for i, v in facts["instruments"].items()}
+        self.inst = {i: dict(v, phase="closed", last=0, close=0, endFrom=0, endTo=0, until=0, opened=False) for i, v in facts["instruments"].items()}
+        self.kills = {}       # id -> {member, trader, active}
+        self.limits = {}      # member -> [max quantity, max value, credit]; the order of creation is the rows' order
+        self.last_time = 0    # the time of the log's last block (proposals and approvals included)
         self.due = set()
         self.batch = 0
         self.next = 1
@@ -112,7 +129,8 @@ class Ref:
         return o["status"] in ("live", "waiting")
 
     def track(self, oid, o):
-        for key in (("all",), ("inst", o["instrument"]), ("acct", o["account"]), ("ais", o["account"], o["instrument"], o["side"])):
+        for key in (("all",), ("inst", o["instrument"]), ("acct", o["account"]), ("ais", o["account"], o["instrument"], o["side"]),
+                    ("member", o["member"]), ("trader", o["trader"])):
             self.opens.setdefault(key, set()).add(oid)
 
     def open_ids(self, *key):
@@ -124,6 +142,38 @@ class Ref:
         return ids
 
     # ── the market's day ──
+    # ── kills and limits (SPEC §11) ──
+    def active_kill(self, member=0, trader=0):
+        for kid in sorted(self.kills):
+            k = self.kills[kid]
+            if k["active"] and ((member and k["member"] == member) or (trader and k["trader"] == trader)):
+                return kid
+        return None
+
+    def killed(self, member, trader):
+        return self.active_kill(member=member) or self.active_kill(trader=trader)
+
+    def used(self, member):
+        return sum(self.orders[x]["price"] * self.orders[x]["remaining"] for x in self.open_ids("member", member))
+
+    def risk(self, member, qty, value, replacing):
+        if member not in self.limits:
+            return None
+        q, v, c = self.limits[member]
+        if q and qty > q:
+            return "RiskLimit"
+        if v and value > v:
+            return "RiskLimit"
+        if c and self.used(member) + value - replacing > c:
+            return "RiskLimit"
+        return None
+
+    def trader_id(self, role):
+        for tid, t in self.f["traders"].items():
+            if t["role"] == role:
+                return tid
+        return 0
+
     def today(self, now):
         local = now // 1_000_000_000 + self.f["offset"] * 60
         return local // 86_400
@@ -169,17 +219,24 @@ class Ref:
                 return "UnknownInstrument"
             if xi["asset"] != c["asset"] or xi["cash"] != c["cash"] or xi["lot"] != c["lot"] or self.f["xbands"] != c["bands"]:
                 return "InstrumentMismatch"
+            if xi["ref"] != c["price"]:
+                return "InstrumentMismatch"
             if c["collar"] == 0 or c["collar"] >= 10_000:
                 return "InvalidTerms"
-            bands = [tuple(int(x) for x in b.split(":")) for b in c["bands"].split(",")]
-            if not on_tick(bands, c["price"]):
-                return "PriceOffTick"
+            if c["static"] == 0 or c["static"] >= 10_000 or c["collar"] > c["static"]:
+                return "InvalidTerms"
+            if c["dynamic"] >= 10_000 or c["secs"] > 86_400:
+                return "InvalidTerms"
             return None
         if k == "setTrading":
             i = self.inst.get(c["instrument"])
             if i is None or not i["opened"]:
                 return "UnknownInstrument"
-            if i["open"] == c["open"]:
+            if i["phase"] == "halted":
+                return "InstrumentHalted"
+            if i["until"]:
+                return "InvalidTerms"
+            if c["open"] == (i["phase"] == "continuous"):
                 return "InvalidTerms"
             return None
         if k == "setReference":
@@ -212,11 +269,17 @@ class Ref:
             e = self.own_account(role, c["account"])
             if e:
                 return e
+            if self.f["accounts"][c["account"]]["member"] != c["member"] or self.trader_id(role) != c["trader"]:
+                return "NotYourAccount"
             if self.f["may"][(role, c["instrument"])] != 0:
                 return "MayNotTrade"
             i = self.inst.get(c["instrument"])
             if i is None or not i["opened"]:
                 return "UnknownInstrument"
+            if i["phase"] == "halted":
+                return "InstrumentHalted"
+            if self.killed(c["member"], c["trader"]):
+                return "Killed"
             if c["qty"] == 0 or c["qty"] % i["lot"] != 0:
                 return "NotALot"
             if c["peak"] != 0 and (c["peak"] % i["lot"] != 0 or c["peak"] >= c["qty"]):
@@ -260,6 +323,8 @@ class Ref:
                 return "InvalidTerms"
             if c["peak"] != 0 and kind != "limit":
                 return "InvalidTerms"
+            if i["phase"] in CALL and kind in ("ioc", "fok"):
+                return "InvalidTerms"
             if c["validity"] == "gtd":
                 if c["gtd"] < self.today(now):
                     return "NotTheChainsDay"
@@ -269,7 +334,12 @@ class Ref:
                 o = self.orders.get(c["oco"])
                 if o is None or o["account"] != c["account"] or o["instrument"] != c["instrument"] or not self.liveish(o) or o["oco"] != 0:
                     return "InvalidOco"
+            if kind in ("limit", "ioc", "fok", "stopLimit") and not within(c["price"], i["ref"], i["static"]):
+                return "PriceOutsideBand"
             price = collar(c["side"], i["ref"], i["collar"], i["bands"]) if kind in ("market", "stop", "trailingStop") else c["price"]
+            e = self.risk(c["member"], c["qty"], price * c["qty"], 0)
+            if e:
+                return e
             need = price * c["qty"] if c["side"] == "buy" else c["qty"]
             crossing = [] if kind in STOPS else self.crossing_own(c["account"], c["instrument"], c["side"], price)
             if crossing and c["smp"] == "cancelIncoming":
@@ -291,6 +361,10 @@ class Ref:
             if o["kind"] != "limit" or o["status"] != "live":
                 return "InvalidTerms"
             i = self.inst[o["instrument"]]
+            if i["phase"] == "halted":
+                return "InstrumentHalted"
+            if self.killed(o["member"], o["trader"]):
+                return "Killed"
             if c["qty"] == 0 or c["qty"] % i["lot"] != 0:
                 return "NotALot"
             if o["peak"] != 0 and o["peak"] >= c["qty"]:
@@ -299,6 +373,11 @@ class Ref:
                 return "PriceOffTick"
             if c["qty"] == o["remaining"] and c["price"] == o["price"]:
                 return "InvalidTerms"
+            if not within(c["price"], i["ref"], i["static"]):
+                return "PriceOutsideBand"
+            e = self.risk(o["member"], c["qty"], c["price"] * c["qty"], o["price"] * o["remaining"])
+            if e:
+                return e
             need = c["price"] * c["qty"] if o["side"] == "buy" else c["qty"]
             if need > o["held"] and self.b(o["account"], self.ledger(o["instrument"], o["side"]))[0] < need - o["held"]:
                 return "InsufficientFunds"
@@ -313,6 +392,68 @@ class Ref:
             return None
         if k == "expireGtd":
             return "NotTheChainsDay" if c["day"] != self.today(now) else None
+        if k in ("setPhase", "uncross", "halt", "resume"):
+            i = self.inst.get(c["instrument"])
+            if i is None or not i["opened"]:
+                return "UnknownInstrument"
+            if k == "setPhase":
+                if i["phase"] == "halted":
+                    return "InstrumentHalted"
+                if i["until"] or c["phase"] == "halted" or c["phase"] == i["phase"]:
+                    return "InvalidTerms"
+                if c["phase"] in CALL:
+                    if (c["from"] == 0) != (c["to"] == 0) or c["from"] > c["to"]:
+                        return "InvalidTerms"
+                elif c["from"] or c["to"]:
+                    return "InvalidTerms"
+                return None
+            if k == "uncross":
+                if i["phase"] not in CALL:
+                    return "NotInAuction"
+                if i["endFrom"] and now < i["endFrom"]:
+                    return "AuctionNotEnded"
+                if i["until"] and now < i["until"]:
+                    return "AuctionNotEnded"
+                if c["next"] not in ("continuous", "tradeAtClose", "closed"):
+                    return "InvalidTerms"
+                return None
+            if k == "halt":
+                if i["phase"] == "halted":
+                    return "InstrumentHalted"
+                return None if 1 <= len(c["reason"].encode()) <= 256 else "InvalidTerms"
+            return None if i["phase"] == "halted" else "InvalidTerms"
+        if k == "kill":
+            if (c["member"] == 0) == (c["trader"] == 0):
+                return "InvalidTerms"
+            if not (1 <= len(c["reason"].encode()) <= 256):
+                return "InvalidTerms"
+            if c["member"]:
+                if c["member"] not in self.f["members"]:
+                    return "InvalidTerms"
+                target = c["member"]
+            else:
+                if c["trader"] not in self.f["traders"]:
+                    return "InvalidTerms"
+                target = self.f["traders"][c["trader"]]["member"]
+            me = self.trader_id(role)
+            if me and (not self.f["traders"][me]["active"] or self.f["traders"][me]["member"] != target):
+                return "InvalidTerms"
+            if (c["member"] and self.active_kill(member=c["member"])) or (c["trader"] and self.active_kill(trader=c["trader"])):
+                return "InvalidTerms"
+            return None
+        if k in ("killSweep", "revive"):
+            kl = self.kills.get(c["kill"])
+            if kl is None:
+                return "UnknownKill"
+            if not kl["active"]:
+                return "InvalidTerms"
+            if k == "revive":
+                still = self.open_ids("member", kl["member"]) if kl["member"] else self.open_ids("trader", kl["trader"])
+                if still:
+                    return "OrdersStillOpen"
+            return None
+        if k == "setLimits":
+            return None if c["member"] in self.f["members"] else "InvalidTerms"
         raise ValueError(k)
 
     # ── apply ──
@@ -324,10 +465,40 @@ class Ref:
     def apply(self, now, c):
         k = c["k"]
         if k == "setTrading":
-            self.inst[c["instrument"]]["open"] = c["open"]
+            self.inst[c["instrument"]]["phase"] = "continuous" if c["open"] else "closed"
             if c["open"]:
                 self.due.add(c["instrument"])
             return [2, c["instrument"]]
+        if k == "setPhase":
+            i = self.inst[c["instrument"]]
+            i.update(phase=c["phase"], endFrom=c["from"], endTo=c["to"])
+            self.due.add(c["instrument"])
+            return [14, c["instrument"], PHASE[c["phase"]]]
+        if k == "uncross":
+            return self.uncross(now, c["instrument"], c["next"])
+        if k == "halt":
+            self.inst[c["instrument"]].update(phase="halted", endFrom=0, endTo=0, until=0)
+            self.due.add(c["instrument"])
+            return [16, c["instrument"]]
+        if k == "resume":
+            self.inst[c["instrument"]]["phase"] = "auction"
+            return [17, c["instrument"]]
+        if k == "kill":
+            kid = len(self.kills) + 1
+            self.kills[kid] = {"member": c["member"], "trader": c["trader"], "active": True}
+            return [18, kid]
+        if k == "killSweep":
+            kl = self.kills[c["kill"]]
+            ids = sorted(self.open_ids("member", kl["member"]) if kl["member"] else self.open_ids("trader", kl["trader"]))[:min(c["limit"], 500)]
+            for oid in ids:
+                self.close(oid, "cancelled")
+            return [19, c["kill"], len(ids)] + ids
+        if k == "revive":
+            self.kills[c["kill"]]["active"] = False
+            return [20, c["kill"]]
+        if k == "setLimits":
+            self.limits[c["member"]] = [c["qty"], c["value"], c["credit"]]
+            return [21, c["member"]]
         if k == "setReference":
             self.inst[c["instrument"]]["ref"] = c["price"]
             return [3, c["instrument"]]
@@ -360,11 +531,13 @@ class Ref:
                 self.hold(c["account"], self.ledger(c["instrument"], c["side"]), need)
             self.orders[oid] = dict(account=c["account"], instrument=c["instrument"], side=c["side"], kind=kind, qty=c["qty"], remaining=c["qty"],
                                     price=price, stop=c["stop"], peak=c["peak"], validity=c["validity"], gtd=c["gtd"], ref=c["ref"], oco=c["oco"],
-                                    smp=c["smp"], trail=c["trail"], capacity=c["capacity"], short=c["short"], prio=now, key=order_key(c["account"], c["side"], price, c["qty"], c["ref"]), status=status,
+                                    smp=c["smp"], trail=c["trail"], capacity=c["capacity"], short=c["short"], member=c["member"], trader=c["trader"], prio=now, key=order_key(c["account"], c["side"], price, c["qty"], c["ref"]), status=status,
                                     held=0 if cancelled_in else need, filled=0)
             self.refs_used.add((c["account"], c["ref"]))
             if status in ("live", "waiting"):
                 self.track(oid, self.orders[oid])
+                # the member's use row is made at its first open order (or by its limits)
+                self.limits.setdefault(c["member"], [0, 0, 0])
             if c["oco"]:
                 self.orders[c["oco"]]["oco"] = oid
             if status == "live":
@@ -419,10 +592,65 @@ class Ref:
         raise ValueError(k)
 
     # ── the auction (§3), written from the text ──
-    def auction(self, bids, asks, lot):
+    # ── the pricing rules ──
+    @staticmethod
+    def demand(bids, p):
+        return sum(o["qty"] for o in bids if o["price"] >= p)
+
+    @staticmethod
+    def supply(asks, p):
+        return sum(o["qty"] for o in asks if o["price"] <= p)
+
+    def price_continuous(self, bids, asks):
+        """§3.1: the most volume, then the least imbalance, then the lower price."""
+        best = None
+        for p in sorted({o["price"] for o in bids + asks}):
+            d, s = self.demand(bids, p), self.supply(asks, p)
+            if min(d, s) == 0:
+                continue
+            cand = (-min(d, s), abs(d - s), p)
+            if best is None or cand < best:
+                best = cand
+        return None if best is None else best[2]
+
+    def price_uncross(self, reference):
+        """§9: the most volume, the least surplus, then market pressure, then the reference."""
+        def rule(bids, asks):
+            cands = []
+            for p in sorted({o["price"] for o in bids + asks}):
+                d, s = self.demand(bids, p), self.supply(asks, p)
+                if min(d, s):
+                    cands.append((min(d, s), abs(d - s), d - s, p))
+            if not cands:
+                return None
+            most = max(c[0] for c in cands)
+            rest = [c for c in cands if c[0] == most]
+            least = min(c[1] for c in rest)
+            rest = [c for c in rest if c[1] == least]
+            if len(rest) == 1:
+                return rest[0][3]
+            lo, hi = min(c[3] for c in rest), max(c[3] for c in rest)
+            if all(c[2] > 0 for c in rest):
+                return hi
+            if all(c[2] < 0 for c in rest):
+                return lo
+            if least > 0:
+                # the reference-price rule: with a bid surplus at some limits and an ask surplus at others, the highest
+                # limit with a bid surplus and the lowest with an ask surplus are the ones the reference is held against
+                lo = max(c[3] for c in rest if c[2] > 0)
+                hi = min(c[3] for c in rest if c[2] < 0)
+            return reference if lo <= reference <= hi else (lo if reference < lo else hi)
+        return rule
+
+    def price_at(self, price):
+        """Trade at close (§8): the closing price, when both sides have an order there."""
+        return lambda bids, asks: price if min(self.demand(bids, price), self.supply(asks, price)) > 0 else None
+
+    def auction(self, bids, asks, lot, pricer=None):
+        pricer = pricer or self.price_continuous
         killed = []
         while True:
-            price, volume, fills = self.once(bids, asks, lot)
+            price, volume, fills = self.once(bids, asks, lot, pricer)
             under = [o for o in bids + asks if o["fok"] and fills.get(o["id"], 0) < o["qty"]]
             if under:
                 w = max(under, key=lambda o: (o["prio"], o["key"]))
@@ -445,20 +673,10 @@ class Ref:
             fl = [(o["id"], q) for (o, q) in bf] + [(o["id"], q) for (o, q) in af]
             return (price if volume else None), volume, fl, pairs, killed
 
-    def once(self, bids, asks, lot):
-        best = None
-        for p in sorted({o["price"] for o in bids + asks}):
-            d = sum(o["qty"] for o in bids if o["price"] >= p)
-            s = sum(o["qty"] for o in asks if o["price"] <= p)
-            ex = min(d, s)
-            if ex == 0:
-                continue
-            cand = (-ex, abs(d - s), p)
-            if best is None or cand < best:
-                best = cand
-        if best is None:
+    def once(self, bids, asks, lot, pricer):
+        p = pricer(bids, asks)
+        if p is None:
             return None, 0, {}
-        p = best[2]
         eb = [o for o in bids if o["price"] >= p]
         ea = [o for o in asks if o["price"] <= p]
         d = sum(o["qty"] for o in eb); s = sum(o["qty"] for o in ea)
@@ -506,6 +724,113 @@ class Ref:
             left = 0
         return p, v, fills
 
+    # ── the pieces of a clear ──
+    @staticmethod
+    def view(oid, o):
+        return dict(id=oid, price=o["price"], qty=o["remaining"], prio=o["prio"], key=o["key"], fok=o["kind"] == "fok")
+
+    def live_sides(self, inst):
+        live = [(oid, self.orders[oid]) for oid in self.open_ids("inst", inst) if self.orders[oid]["status"] == "live"]
+        return [x for x in live if x[1]["side"] == "buy"], [x for x in live if x[1]["side"] == "sell"]
+
+    def views(self, inst):
+        """The crossing orders when the best buy reaches the best sell: buys from the best sell up, sells to the best buy."""
+        buys, sells = self.live_sides(inst)
+        if not buys or not sells:
+            return None
+        bb = max(o["price"] for _, o in buys); ba = min(o["price"] for _, o in sells)
+        if bb < ba:
+            return None
+        return [self.view(oid, o) for oid, o in buys if o["price"] >= ba], [self.view(oid, o) for oid, o in sells if o["price"] <= bb]
+
+    def views_at(self, inst, price):
+        buys, sells = self.live_sides(inst)
+        return [self.view(oid, o) for oid, o in buys if o["price"] >= price], [self.view(oid, o) for oid, o in sells if o["price"] <= price]
+
+    def execute(self, i, result, time, cancelled, pairs):
+        p, v, fills, prs, killed = result
+        for k in killed:
+            self.close(k, "cancelled"); cancelled.append(k)
+        if p is None:
+            return 0, 0
+        for (b, a, q) in prs:
+            bo, ao = self.orders[b], self.orders[a]
+            # the buyer pays p x q from what it holds at its price; the rest returns to it
+            self.b(bo["account"], i["cash"])[1] -= bo["price"] * q
+            self.b(bo["account"], i["cash"])[0] += (bo["price"] - p) * q
+            self.b(ao["account"], i["cash"])[0] += p * q
+            self.b(ao["account"], i["asset"])[1] -= q
+            self.b(bo["account"], i["asset"])[0] += q
+            bo["held"] -= bo["price"] * q; ao["held"] -= q
+            for o in (bo, ao):
+                o["remaining"] -= q; o["filled"] += q
+                o["status"] = "filled" if o["remaining"] == 0 else "live"
+            pairs.append((b, a, q))
+        for (oid, f) in fills:
+            o = self.orders[oid]
+            if o["peak"] and o["remaining"] > 0 and f >= min(o["peak"], o["remaining"] + f):
+                o["prio"] = time
+        for (b, a, _) in prs:
+            for oid in (b, a):
+                o = self.orders[oid]
+                self.cancel_oco(o, cancelled)
+                if o["status"] == "filled" and o["held"] > 0:
+                    self.close(oid, "filled")
+        return p, v
+
+    def end_immediates(self, inst, cancelled):
+        for oid in sorted(oid for oid in self.open_ids("inst", inst) if self.orders[oid]["status"] == "live" and self.orders[oid]["kind"] in IMMEDIATE):
+            self.close(oid, "cancelled"); cancelled.append(oid)
+
+    def after_trade(self, inst, price):
+        i = self.inst[inst]
+        i["last"] = price
+        # §2: every trailing stop of the instrument follows the price, never the other way
+        for o in (self.orders[x] for x in self.open_ids("inst", inst)):
+            if o["status"] == "waiting" and o["kind"] == "trailingStop" and o["instrument"] == inst:
+                if o["side"] == "sell":
+                    if price > o["trail"]:
+                        c = price - o["trail"]
+                        o["stop"] = max(o["stop"], c - c % tick_at(i["bands"], c))
+                else:
+                    c = price + o["trail"]
+                    t = tick_at(i["bands"], c)
+                    o["stop"] = min(o["stop"], c if c % t == 0 else c + (t - c % t))
+        for side in ("buy", "sell"):
+            w = [self.orders[x] for x in self.open_ids("inst", inst) if self.orders[x]["status"] == "waiting" and self.orders[x]["side"] == side]
+            if w:
+                first = min(w, key=lambda o: o["stop"]) if side == "buy" else max(w, key=lambda o: o["stop"])
+                if (side == "buy" and price >= first["stop"]) or (side == "sell" and price <= first["stop"]):
+                    self.due.add(inst)
+
+    def trigger(self, inst, i, time, triggered, cancelled):
+        if not i["last"]:
+            return
+        for side in ("buy", "sell"):
+            stops = sorted(((o["stop"] if side == "buy" else MAXP - o["stop"]), oid) for oid, o in ((x, self.orders[x]) for x in list(self.open_ids("inst", inst)))
+                           if o["status"] == "waiting" and o["side"] == side)
+            hits = []
+            for (_, oid) in stops:
+                o = self.orders[oid]
+                if not (i["last"] >= o["stop"] if side == "buy" else i["last"] <= o["stop"]):
+                    break
+                hits.append(oid)
+            for oid in hits:
+                o = self.orders[oid]
+                if o["status"] != "waiting":
+                    continue
+                o["status"] = "live"; o["prio"] = time
+                triggered.append(oid)
+                # §3.5: judged against the account's own live orders when it is triggered
+                crossing = self.crossing_own(o["account"], inst, o["side"], o["price"])
+                if crossing:
+                    if o["smp"] != "cancelIncoming":
+                        for rid in crossing:
+                            self.close(rid, "cancelled"); cancelled.append(rid)
+                    if o["smp"] != "cancelResting":
+                        self.close(oid, "cancelled"); cancelled.append(oid)
+                self.cancel_oco(o, cancelled)
+
     def clear(self, time):
         fx = [13]
         for inst in sorted(self.due):
@@ -513,108 +838,82 @@ class Ref:
             i = self.inst[inst]
             cancelled, triggered, pairs = [], [], []
             price = volume = 0
-            if i["open"]:
-                if i["last"]:
-                    for side in ("buy", "sell"):
-                        stops = sorted(((o["stop"] if side == "buy" else MAXP - o["stop"]), oid) for oid, o in ((x, self.orders[x]) for x in list(self.open_ids("inst", inst)))
-                                       if o["status"] == "waiting" and o["instrument"] == inst and o["side"] == side)
-                        hits = []
-                        for (_, oid) in stops:
-                            o = self.orders[oid]
-                            if not (i["last"] >= o["stop"] if side == "buy" else i["last"] <= o["stop"]):
-                                break
-                            hits.append(oid)
-                        for oid in hits:
-                            o = self.orders[oid]
-                            if o["status"] != "waiting":
-                                continue
-                            o["status"] = "live"; o["prio"] = time
-                            triggered.append(oid)
-                            # §3.5: judged against the account's own live orders when it is triggered
-                            crossing = self.crossing_own(o["account"], inst, o["side"], o["price"])
-                            if crossing:
-                                if o["smp"] != "cancelIncoming":
-                                    for rid in crossing:
-                                        self.close(rid, "cancelled"); cancelled.append(rid)
-                                if o["smp"] != "cancelResting":
-                                    self.close(oid, "cancelled"); cancelled.append(oid)
-                            self.cancel_oco(o, cancelled)
-                live = [(oid, self.orders[oid]) for oid in self.open_ids("inst", inst) if self.orders[oid]["status"] == "live"]
-                buys = [x for x in live if x[1]["side"] == "buy"]; sells = [x for x in live if x[1]["side"] == "sell"]
-                if buys and sells:
-                    bb = max(o["price"] for _, o in buys); ba = min(o["price"] for _, o in sells)
-                    if bb >= ba:
-                        def view(oid, o):
-                            return dict(id=oid, price=o["price"], qty=o["remaining"], prio=o["prio"], key=o["key"], fok=o["kind"] == "fok")
-                        bids = [view(oid, o) for oid, o in buys if o["price"] >= ba]
-                        asks = [view(oid, o) for oid, o in sells if o["price"] <= bb]
-                        p, v, fills, prs, killed = self.auction(bids, asks, i["lot"])
-                        for k in killed:
-                            self.close(k, "cancelled"); cancelled.append(k)
-                        if p is not None:
-                            price, volume = p, v
-                            for (b, a, q) in prs:
-                                bo, ao = self.orders[b], self.orders[a]
-                                # the buyer pays p x q from what it holds at its price; the rest returns to it
-                                self.b(bo["account"], i["cash"])[1] -= bo["price"] * q
-                                self.b(bo["account"], i["cash"])[0] += (bo["price"] - p) * q
-                                self.b(ao["account"], i["cash"])[0] += p * q
-                                self.b(ao["account"], i["asset"])[1] -= q
-                                self.b(bo["account"], i["asset"])[0] += q
-                                bo["held"] -= bo["price"] * q; ao["held"] -= q
-                                for o in (bo, ao):
-                                    o["remaining"] -= q; o["filled"] += q
-                                    o["status"] = "filled" if o["remaining"] == 0 else "live"
-                                pairs.append((b, a, q))
-                            for (oid, f) in fills:
-                                o = self.orders[oid]
-                                if o["peak"] and o["remaining"] > 0 and f >= min(o["peak"], o["remaining"] + f):
-                                    o["prio"] = time
-                            for (b, a, _) in prs:
-                                for oid in (b, a):
-                                    o = self.orders[oid]
-                                    self.cancel_oco(o, cancelled)
-                                    if o["status"] == "filled" and o["held"] > 0:
-                                        self.close(oid, "filled")
-            for oid in sorted(oid for oid in self.open_ids("inst", inst) if self.orders[oid]["status"] == "live" and self.orders[oid]["kind"] in IMMEDIATE):
-                self.close(oid, "cancelled"); cancelled.append(oid)
+            interrupted = False
+            if i["phase"] == "continuous":
+                self.trigger(inst, i, time, triggered, cancelled)
+                v = self.views(inst)
+                if v:
+                    result = self.auction(v[0], v[1], i["lot"])
+                    p = result[0]
+                    # §10: a price outside either band trades nothing and interrupts
+                    if p is not None and (not within(p, i["ref"], i["static"]) or (i["dynamic"] and not within(p, i["last"] or i["ref"], i["dynamic"]))):
+                        interrupted = True
+                    else:
+                        price, volume = self.execute(i, result, time, cancelled, pairs)
+            elif i["phase"] == "tradeAtClose":
+                bids, asks = self.views_at(inst, i["close"])
+                if bids and asks:
+                    price, volume = self.execute(i, self.auction(bids, asks, i["lot"], self.price_at(i["close"])), time, cancelled, pairs)
+            if i["phase"] not in CALL:
+                self.end_immediates(inst, cancelled)
+            if interrupted:
+                i.update(phase="auction", until=time + i["secs"] * 1_000_000_000, endFrom=0, endTo=0)
             if price:
-                i["last"] = price
-                # §2: every trailing stop of the instrument follows the price, never the other way
-                for o in (self.orders[x] for x in self.open_ids("inst", inst)):
-                    if o["status"] == "waiting" and o["kind"] == "trailingStop" and o["instrument"] == inst:
-                        if o["side"] == "sell":
-                            if price > o["trail"]:
-                                c = price - o["trail"]
-                                o["stop"] = max(o["stop"], c - c % tick_at(i["bands"], c))
-                        else:
-                            c = price + o["trail"]
-                            t = tick_at(i["bands"], c)
-                            o["stop"] = min(o["stop"], c if c % t == 0 else c + (t - c % t))
-                hit = False
-                for side in ("buy", "sell"):
-                    w = [self.orders[x] for x in self.open_ids("inst", inst) if self.orders[x]["status"] == "waiting" and self.orders[x]["side"] == side]
-                    if w:
-                        first = min(w, key=lambda o: o["stop"]) if side == "buy" else max(w, key=lambda o: o["stop"])
-                        if (side == "buy" and price >= first["stop"]) or (side == "sell" and price <= first["stop"]):
-                            hit = True
-                if hit:
-                    self.due.add(inst)
-            fx += [inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled + [len(triggered)] + triggered
+                self.after_trade(inst, price)
+            fx += [inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled + [len(triggered)] + triggered + [1 if interrupted else 0]
         self.batch = 0
         return fx
 
-    def submit(self, now, role, c):
-        pending = self.batch if self.batch else (self.log[-1][0] if self.due and self.log else 0)
+    def uncross(self, now, inst, nxt):
+        """§9."""
+        i = self.inst[inst]
+        cancelled, pairs = [], []
+        price = volume = 0
+        v = self.views(inst)
+        if v:
+            result = self.auction(v[0], v[1], i["lot"], self.price_uncross(i["last"] or i["ref"]))
+            if result[0] is not None and not within(result[0], i["ref"], i["static"]):
+                return [15, inst, 0, 0, 0, 0, PHASE[i["phase"]]]
+            price, volume = self.execute(i, result, now, cancelled, pairs)
+        self.end_immediates(inst, cancelled)
+        last = price or i["last"]
+        close = (last or i["ref"]) if i["phase"] == "closingAuction" else i["close"]
+        i.update(phase=nxt, endFrom=0, endTo=0, until=0, close=close)
+        if price:
+            self.after_trade(inst, price)
+        self.due.add(inst)
+        return [15, inst, price, volume, len(pairs)] + [x for pr in pairs for x in pr] + [len(cancelled)] + cancelled + [PHASE[nxt]]
+
+    def flush_due(self, now):
+        """§1: the clear of a batch waiting from an earlier time, or of an instrument left due, recorded first."""
+        pending = self.batch if self.batch else (self.last_time if self.due else 0)
         if pending and now > pending:
             self.log.append((now, "clear", self.clear(pending)))
+            self.last_time = now
+
+    def submit(self, now, role, c):
+        self.flush_due(now)
         if not self.f["grants"].get((role, c["k"]), False):
             return "a:NoGrant"
         e = self.validate(now, role, c)
         if e:
             return "e:" + e
-        if c["k"] == "openInstrument":
-            return "p:"   # opening is under four eyes: the battery opens instruments only in a stream's setup
+        if c["k"] in DUAL:
+            self.last_time = now   # the proposal is a block
+            return "p:"
+        fx = self.apply(now, c)
+        self.log.append((now, c["k"], fx))
+        self.last_time = now
+        return "x:" + ",".join(map(str, fx))
+
+    def approve(self, now, maker, c):
+        """A proposal approved: judged again as its maker gave it, then applied (an approval and an execution, or an
+        approval and a rejection, are blocks)."""
+        self.flush_due(now)
+        self.last_time = now
+        e = self.validate(now, maker, c)
+        if e:
+            return "e:" + e
         fx = self.apply(now, c)
         self.log.append((now, c["k"], fx))
         return "x:" + ",".join(map(str, fx))
@@ -646,21 +945,27 @@ def main():
         if l.startswith("+|"):
             if kept:
                 lines[-1] += l[2:]      # a long line printed in pieces
-        elif l[:2] in ("H|", "S|", "C|", "B|", "O|", "Q|", "E|"):
+        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|"):
             lines.append(l); kept = True
         else:
             kept = False
-    facts = {"accounts": {}, "owns": {}, "may": {}, "instruments": {}, "grants": {}, "offset": 0, "xinstruments": {}, "xbands": None}
+    facts = {"accounts": {}, "owns": {}, "may": {}, "instruments": {}, "grants": {}, "offset": 0, "xinstruments": {}, "xbands": None, "members": set(), "traders": {}}
+    proposals = {}
     errors = []
     streams = cmds = blocks = checkpoints = 0
     ref = None
     sblocks, sorders, squeue = [], {}, {}
+    sinst, slimits, skills = {}, {}, {}
     for l in lines:
         f = l.split("|")
         if f[0] == "H":
             kind = f[1]
             if kind == "account":
-                facts["accounts"][int(f[2])] = {"open": f[3] == "1"}
+                facts["accounts"][int(f[2])] = {"open": f[3] == "1", "member": int(f[4])}
+            elif kind == "member":
+                facts["members"].add(int(f[2]))
+            elif kind == "trader":
+                facts["traders"][int(f[2])] = {"member": int(f[3]), "active": f[4] == "1", "role": f[5]}
             elif kind == "owns":
                 facts["owns"][(f[2], int(f[3]))] = int(f[4])
             elif kind == "may":
@@ -668,7 +973,7 @@ def main():
             elif kind == "grant":
                 facts["grants"][(f[2], f[3])] = True
             elif kind == "xinstrument":
-                facts["xinstruments"][int(f[2])] = {"listed": f[3] == "1", "asset": f[4], "cash": f[5], "lot": int(f[6])}
+                facts["xinstruments"][int(f[2])] = {"listed": f[3] == "1", "asset": f[4], "cash": f[5], "lot": int(f[6]), "ref": int(f[7])}
             elif kind == "xbands":
                 facts["xbands"] = f[2]
             elif kind == "offset":
@@ -681,20 +986,46 @@ def main():
             # the setup's blocks (the instruments opened under four eyes) end at the time f[1]: the time a due clear
             # takes when no batch is waiting (§5) may be theirs
             ref.log.append((int(f[1]), "setup", []))
+            ref.last_time = int(f[1])
             for p in f[2].split(","):
                 if p:
                     ref.inst[int(p)]["opened"] = True
+            # the terms the stream's instruments were opened with: collar, static and dynamic bands, interruption
+            for t in (f[3].split(",") if len(f) > 3 and f[3] else []):
+                i, c, st, dy, sx = (int(x) for x in t.split(":"))
+                ref.inst[i].update(collar=c, static=st, dynamic=dy, secs=sx)
             sblocks, sorders, squeue = [], {}, {}
+            sinst, slimits, skills = {}, {}, {}
+            proposals = {}
             streams += 1
         elif f[0] == "C":
             now, role, cmd, want = int(f[1]), f[2], parse_cmd(f[3]), f[4]
             got = ref.submit(now, role, cmd)
             cmds += 1
+            if got == "p:" and want.startswith("p:"):
+                proposals[int(want[2:])] = (cmd, role)   # proposed: the reference applies it when it is approved
+                got = want
             if got != want:
                 errors.append(f"stream {streams} command {cmds} {f[3][:80]}: the book gave {want[:120]}, the reference {got[:120]}")
             bad = ref.conserved()
             if bad:
                 errors.append(f"stream {streams}: conservation: {bad}")
+        elif f[0] == "A":
+            now, pid, want = int(f[1]), int(f[3]), f[4]
+            cmds += 1
+            if pid not in proposals:
+                errors.append(f"stream {streams}: an approval of proposal {pid}, which the reference never saw proposed")
+                continue
+            cmd, maker = proposals.pop(pid)
+            got = ref.approve(now, maker, cmd)
+            if got != want:
+                errors.append(f"stream {streams} approval of {cmd['k']}: the book gave {want[:120]}, the reference {got[:120]}")
+        elif f[0] == "I":
+            sinst[int(f[1])] = f[2:]
+        elif f[0] == "U":
+            slimits[int(f[1])] = [int(x) for x in f[2:]]
+        elif f[0] == "K":
+            skills[int(f[1])] = [int(x) for x in f[2:]]
         elif f[0] == "B":
             sblocks.append((int(f[2]), f[3], f[4]))
         elif f[0] == "O":
@@ -713,7 +1044,7 @@ def main():
                 if o is None:
                     errors.append(f"stream {streams}: order {oid} unknown to the reference"); continue
                 mine_row = [str(STATUS[o["status"]]), str(o["remaining"]), str(o["filled"]), str(o["held"]), str(o["prio"]), str(o["price"]),
-                            str(o["stop"]), "1" if o["capacity"] == "agency" else "2", str(o["short"]), str(o["trail"])]
+                            str(o["stop"]), "1" if o["capacity"] == "agency" else "2", str(o["short"]), str(o["trail"]), str(o["member"]), str(o["trader"])]
                 if mine_row != row:
                     errors.append(f"stream {streams}: order {oid}: book {row}, reference {mine_row}")
             total = int(f[1]) if len(f) > 1 and f[1] else len(sorders)
@@ -726,8 +1057,27 @@ def main():
             for key, v in ref.bal.items():
                 if key not in squeue and tuple(v) != (0, 0):
                     errors.append(f"stream {streams}: balance {key}: the book holds no row, the reference {tuple(v)}")
+            for i, row in sinst.items():
+                x = ref.inst[i]
+                mine = [x["phase"], str(x["last"]), str(x["close"]), str(x["until"]), str(x["endFrom"]), str(x["endTo"]), str(x["ref"])]
+                if mine != row:
+                    errors.append(f"stream {streams}: instrument {i}: book {row}, reference {mine}")
+            if set(slimits) != set(ref.limits):
+                errors.append(f"stream {streams}: limit rows for members {sorted(slimits)} in the book, {sorted(ref.limits)} in the reference")
+            for m, row in slimits.items():
+                mine = (ref.limits.get(m) or [0, 0, 0]) + [ref.used(m)]
+                if mine != row:
+                    errors.append(f"stream {streams}: member {m}'s limits and use: book {row}, reference {mine}")
+            for kid, row in skills.items():
+                kl = ref.kills.get(kid)
+                mine = [kl["member"], kl["trader"], 1 if kl["active"] else 0] if kl else None
+                if mine != row:
+                    errors.append(f"stream {streams}: kill {kid}: book {row}, reference {mine}")
+            if len(skills) != len(ref.kills):
+                errors.append(f"stream {streams}: {len(skills)} kills in the book, {len(ref.kills)} in the reference")
             checkpoints += 1
             sblocks, sorders, squeue = [], {}, {}
+            sinst, slimits, skills = {}, {}, {}
     print(f"reference: {streams} streams, {cmds} commands, {blocks} blocks and {checkpoints} checkpoints of every order and balance compared")
     if streams == 0 or cmds == 0 or blocks == 0 or checkpoints == 0:
         errors.append("MISS: the log holds no stream")
