@@ -1312,5 +1312,77 @@
   "old": "o.bBps * (if (o.call) u else o.strike));",
   "new": "o.bBps * u);",
   "test": "BookDerivatives"
+ },
+ {
+  "id": "G01",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a mint without an earmark",
+  "property": "claims come only from an earmark",
+  "old": "        if (bridgeOf(s, x.ledger) != null) return ?#InvalidTerms({ reason = \"a bridged ledger's claims come only from an earmark\" });\n",
+  "new": "",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G02",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a burn without a settlement",
+  "property": "claims leave only by a settled redemption",
+  "old": "        if (bridgeOf(s, x.ledger) != null) return ?#InvalidTerms({ reason = \"a bridged ledger's claims leave only by a settled redemption\" });\n",
+  "new": "",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G03",
+  "file": "book/src/BookCore.mo",
+  "mutant": "an earmark by any RTGS",
+  "property": "only the bridge's own RTGS operator earmarks",
+  "old": "        if (not Principal.equal(caller, b.rtgs)) return ?#InvalidTerms({ reason = \"the RTGS operator's earmark\" });\n",
+  "new": "",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G04",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a rejection burns",
+  "property": "a rejected transfer returns the claims",
+  "old": "        let settled = switch (c) { case (#rtgsSettle(_)) true; case (_) false };",
+  "new": "        let settled = true;",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G05",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a settlement returns",
+  "property": "a settled transfer burns the claims",
+  "old": "        if (settled) { spendHeld(s, r.account, b.ledger, r.amount); moveSupply(s, b.ledger, 0, r.amount) } else release(s, r.account, b.ledger, r.amount);",
+  "new": "        release(s, r.account, b.ledger, r.amount);",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G06",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a bridge over units in the book",
+  "property": "a ledger is bridged with no unit in the book",
+  "old": "        if (supplyOf(s, x.ledger) != 0) return ?#InvalidTerms({ reason = \"a ledger with no unit in the book\" });\n",
+  "new": "",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G07",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a redemption not held",
+  "property": "a redemption holds its claims at once",
+  "old": "        hold(s, x.account, x.ledger, x.amount);\n        let id = s.nextRedemption;",
+  "new": "        let id = s.nextRedemption;",
+  "test": "BookCashLeg"
+ },
+ {
+  "id": "G08",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the backing kept at a settlement",
+  "property": "a settlement lowers the backing by the cash transferred",
+  "old": "{ b with backing = if (settled) b.backing - r.amount else b.backing; redeeming = b.redeeming - r.amount }",
+  "new": "{ b with redeeming = b.redeeming - r.amount }",
+  "test": "BookCashLeg"
  }
 ]
