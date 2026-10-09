@@ -261,6 +261,32 @@ check(rep.faults.size() == 0 and rep.blocks == c.blocks and Cu.fingerprint(fresh
 check(Cu.fingerprint(Cu.newState()) != Cu.fingerprint(s), "control: a different state fingerprints differently");
 Debug.print("count: blocks replayed into a fresh state with the same fingerprint = " # Nat.toText(rep.blocks));
 
+// ─── AU-10: the guard on one open action per asset holds after many actions closed ───────
+// On a fresh register (not in the transcript or the twin's dump): twenty actions announced and cancelled on one asset,
+// then one announced; a second is refused while it is open. The open action's index entry follows twenty stale ones,
+// more than one page's scan budget.
+let s10 = Cu.newState();
+Cu.setPolicies(s10, [dual("custody.holder.register"), dual("custody.asset.register"), dual("custody.action.announce"), dual("custody.action.cancel")]);
+func gov10(c : CT.Command) : [Nat] {
+  switch (Cu.submit(s10, auth, tick(), registrar, c, null, "x")) {
+    case (#ok(#proposed(p))) { switch (Cu.approve(s10, auth, tick(), director1, p.proposal)) { case (#ok(#executed(x))) x.effects; case (o) { check(false, "AU-10 approval: " # debug_show(o)); [] } } };
+    case (o) { check(false, "AU-10 proposal: " # debug_show(o)); [] };
+  }
+};
+ignore gov10(#registerHolder({ holder = 1; commit = bytes(0xE1, 32); account = shares }));
+ignore gov10(#registerAsset({ code = "AUTEN"; name = "AU-10 regression"; ledger = shares; cashLedger = cash; issuedSupply = 1_000; issuer = 1 }));
+func dividend(k : Nat) : CT.Command { #announceAction({ asset = 1; kind = #cashDividend({ perUnitMicro = 1 + k }); recordDate = D0 + 10; exDate = D0 + 9; paymentDate = D0 + 20; source = bytes(0xE0 + k, 32) }) };
+for (k in Nat.range(1, 21)) {
+  let fx = gov10(dividend(k));
+  if (fx.size() == 1) ignore gov10(#cancelAction({ action = fx[0]; day = D0; reason = "withdrawn" })) else check(false, "AU-10 announce " # Nat.toText(k));
+};
+check(gov10(dividend(21)) == [21], "AU-10: the twenty-first action announced");
+check(Cu.openActionOf(s10, 1) == ?21, "AU-10: the open action found behind twenty closed ones");
+switch (Cu.submit(s10, auth, tick(), registrar, dividend(22), null, "x")) {
+  case (#err(#custody(#ActionOpenOnAsset(_)))) Debug.print("count: AU-10 second actions refused while one is open behind twenty closed = 1");
+  case (o) check(false, "AU-10: a second action while one is open: " # debug_show(o));
+};
+
 // ─── the dump for the twin ─────────────────────────────────────────────────────────────────
 for (h in [1, 2, 3, 4].vals()) Debug.print("holder|" # Nat.toText(h) # "|" # Nat.toText(Cu.position(s, 1, h)));
 switch (Cu.asset(s, 1)) { case (?a) Debug.print("asset|1|" # a.code # "|" # Nat.toText(a.issuedSupply) # "|1000000|" # Nat.toText(a.issuer)); case null {} };

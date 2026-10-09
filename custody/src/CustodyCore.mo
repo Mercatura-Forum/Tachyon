@@ -214,7 +214,21 @@ module {
   public func receipt(s : State, kind : CT.ReceiptKind, id : Nat) : ?(Nat, ReceiptRow) { one(s.receiptRows, receipts, "byReceipt", receiptKey(kind, id)) };
   public func receiptById(s : State, id : Nat) : ?ReceiptRow { RS.get(s.receiptRows, receipts, id) };
   public func action(s : State, id : CT.ActionId) : ?ActionRow { RS.get(s.actionRows, actions, id) };
-  public func openActionOf(s : State, a : CT.AssetId) : ?CT.ActionId { let (lo, hi) = R.prefixRange(a, 8, 8); switch (RS.page(s.actionRows, actions, "openByAsset", lo, hi, null, 1)) { case (#ok(p)) { if (p.rows.size() == 0) null else ?p.rows[0].0 }; case (#err(_)) null } };
+  /// The asset's open action, if any. A page stops at its scan budget and may hold no row while the range still does
+  /// (entries of actions since paid or cancelled), so the walk follows the cursor until a row or the end of the range.
+  public func openActionOf(s : State, a : CT.AssetId) : ?CT.ActionId {
+    let (lo, hi) = R.prefixRange(a, 8, 8);
+    var cursor : ?Page.Cursor = null;
+    loop {
+      switch (RS.page(s.actionRows, actions, "openByAsset", lo, hi, cursor, 1)) {
+        case (#ok(p)) {
+          if (p.rows.size() > 0) return ?p.rows[0].0;
+          switch (p.next) { case (?n) cursor := ?n; case null return null };
+        };
+        case (#err(_)) return null;
+      };
+    };
+  };
   public func entitlement(s : State, id : Nat) : ?EntitlementRow { RS.get(s.entitlementRows, entitlements, id) };
   public func entitlementOf(s : State, act : CT.ActionId, h : CT.HolderId) : ?(Nat, EntitlementRow) { one(s.entitlementRows, entitlements, "byAction", R.key2(act, 8, h, 8)) };
   public func entitlementsOf(s : State, act : CT.ActionId, cursor : ?Page.Cursor, limit : Nat) : Page.Result<(Nat, EntitlementRow)> { let (lo, hi) = R.prefixRange(act, 8, 8); RS.page(s.entitlementRows, entitlements, "byAction", lo, hi, cursor, limit) };
