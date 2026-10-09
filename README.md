@@ -97,7 +97,9 @@ core/test/      the interpreter batteries (90,035 and 25,033 checks)
 core/fixtures/  the ledger fixtures: an ICRC-1/2 ledger and its flaky variant for
                 failure injection
 matching/src/   MatchTypes, MatchLogic (pure), Matching (the actor), Guards, ICRC
-matching/test/  the interpreter battery (53,425 checks over 4,000 randomised windows)
+matching/test/  the interpreter battery (53,443 checks: 4,000 randomised windows and the
+                properties of the lot rule, exact bid release and self-trade prevention)
+matching/tools/ the mutation tool and its mutants; the upgrade gate
 listing/src/    ListingRegistry
 custody/        the custody register: src/, test/ (WASI batteries), integration/ (the Python twin), tools/
 vendor/         the Thebes kernel the custody module builds against, named by commit
@@ -134,14 +136,58 @@ placed in `vendor/thebes-kernel` before its batteries run (WASI under `wasmtime`
 python3 custody/tools/mutation_test.py
 ```
 
+The matching engine's mutation tool and upgrade gate (`moc` 1.4.1 on the `PATH`):
+
+```
+python3 matching/tools/mutation_test.py
+./matching/tools/stable_compat.sh <the commit the deployed engine was built from>
+```
+
+The mutation tool copies the committed tree with `custody/tools/committed_tree.sh`, so it needs the kernel checkout
+described above, although the matching engine itself does not depend on the kernel.
+
 The contracts are built with legacy (classical) persistence so that an in-place
 upgrade keeps its state. `test/chain/README.md` describes the battery on a
 chain; `deploy/example.thebes.toml` is the manifest shape.
 
+## Upgrading the matching engine
+
+The engine built from this release closes the defects recorded in `docs/VERIFICATION.md` §6 (AU-01 to AU-05, AU-08,
+AU-09). Its stored state upgrades in place from the previous release (`./matching/tools/stable_compat.sh` checks
+this). Every order, obligation and reservation is kept. The interface and the behaviour change as follows.
+
+**Methods removed:** `recordSettlement`, `allOrders`, `ordersInWindow`, `allObligations`, `unsettledObligations`,
+`obligationSummary`, `bookSummary`, `killLogView`.
+
+**Queries that became update calls,** with results scoped to the caller: `getOrder` and `reservationOf` (the owner or
+the clearing agent), and `invariantLog` (the clearing agent). A query's caller is not authenticated by the node, so a
+scoped read must be an update call.
+
+**Methods added:**
+- `setClearingAgent` and `setLotSize`, the installer's settings;
+- `ordersPage`, `obligationsPage`, `obligationSummaryPage` and `killLogPage`, pages of at most 500 rows, for the
+  clearing agent;
+- `refusedObligation`, `obligationCount`, `lot` and `clearingAgentPrincipal`.
+
+A client that read the removed whole-collection methods moves to the pages.
+
+**Behaviour on upgrade:**
+- **The lot.** An engine upgraded in place refuses every order until the installer sets the lot with `setLotSize`. The
+  lot must be above the asset ledger's fee, read from the ledger when the lot is set. From then on an order is accepted
+  only if its quantity is a whole number of lots and its limit price times the lot is above the cash ledger's fee.
+- **The clearing agent.** Until the installer names it with `setClearingAgent`, only the installer closes and clears
+  windows. The installer is the controller that installed or last upgraded the engine.
+- **Indexes.** The first upgrade builds the per-owner index of live limits that self-trade prevention reads, and the
+  per-window obligation cursors, from the book as it stands.
+- **Bids accepted before the upgrade** keep the release rule they were reserved under. A cancelled bid of that kind
+  leaves its one cash fee reserved, as the previous release did.
+
 ## Known limitations
 
-- **Matching and listing on the production binary.** The settlement core has
-  been run there; the matching engine's rows have not yet.
+- **Matching and listing on the production binary.** The settlement core has been run on a subnet of
+  validators in diverse locations running it. The matching engine with its fixes has been run on a four-validator
+  test chain running the production node binary (`docs/VERIFICATION.md` §6), not on such a subnet. The listing
+  registry has not been run on the production binary.
 
 ## Design
 
