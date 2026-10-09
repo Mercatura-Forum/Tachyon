@@ -169,7 +169,7 @@ refused(scheduler, #cutCycle({ cycle = 2; settleDay = 0 }), "e:InvalidTerms", "a
 refused(scheduler, #settleCycle({ cycle = 2 }), "e:InvalidTerms", "the open cycle settled");
 // the cycle: member 1 pays 8_500_000 from account 1 (50_000_000 - 20_000_000 - 1_000_000 = 29_000_000) and receives its
 // 100 shares; member 2 receives 5_100_000; member 4 has nothing
-does(scheduler, #settleCycle({ cycle = 1 }), [34, 1, 2, 1, 1, 8_500_000, 2, 3, 5_100_000, 1, 1, 1, 100], "A: cycle 1 settled");
+does(scheduler, #settleCycle({ cycle = 1 }), [34, 1, 2, 1, 1, 8_500_000, 2, 3, 5_100_000, 1, 1, 1, 100, 0], "A: cycle 1 settled");
 check(cashOf(1) == 20_500_000 and sharesOf(1) == 1_100 and cashOf(9) == 52_100_000 and B.ccpCash(m.st) == 25_100_000 and sharesOf(18) == 0, "A: the net legs moved");
 check(member(1).peak == 8_500_000 and member(1).owedBy == 0 and member(2).owedTo == 0, "A: the obligations settled, member 1's largest cycle purchase 8_500_000");
 refused(scheduler, #settleCycle({ cycle = 1 }), "e:InvalidTerms", "a cycle settled twice");
@@ -201,7 +201,7 @@ refused(scheduler, #cutCycle({ cycle = 2; settleDay = 0 }), "e:CycleNotDue", "a 
 advance(900);
 does(scheduler, #cutCycle({ cycle = 2; settleDay = 0 }), [33, 2, 0], "B: cycle 2 cut");
 // net 4_255_000 - 2_553_000 = 1_702_000 from member 1, to member 2; member 1 receives 20 shares, member 2 30
-does(scheduler, #settleCycle({ cycle = 2 }), [34, 2, 2, 1, 1, 1_702_000, 2, 3, 1_702_000, 2, 1, 1, 20, 2, 1, 30], "B: cycle 2 settled at the net");
+does(scheduler, #settleCycle({ cycle = 2 }), [34, 2, 2, 1, 1, 1_702_000, 2, 3, 1_702_000, 2, 1, 1, 20, 2, 1, 30, 0], "B: cycle 2 settled at the net");
 check(cashOf(1) == 18_798_000 and cashOf(9) == 53_802_000 and sharesOf(1) == 1_120 and sharesOf(9) == 920, "B: 1_702_000 moved each way where 6_808_000 traded");
 check(member(2).peak == 2_553_000, "B: member 2's largest cycle purchase");
 // the fund called again: member 1's requirement 20% × 8_500_000 = 1_700_000 above the floor's share; the others 1_000_000
@@ -227,7 +227,7 @@ does(t3, #withdraw({ account = 9; member = 2; ledger = cash; amount = 40_000_000
 advance(900);
 does(scheduler, #cutCycle({ cycle = 3; settleDay = 0 }), [33, 3, 0], "C: cycle 3 cut");
 // member 2 fails: 17_020_000 + ⌈1% × 17_020_000⌉ = 17_190_200 rolls; its shares stay with the CCP
-does(scheduler, #settleCycle({ cycle = 3 }), [34, 3, 1, 2, 2, 17_190_200, 0], "C: member 2 fails cycle 3");
+does(scheduler, #settleCycle({ cycle = 3 }), [34, 3, 1, 2, 2, 17_190_200, 0, 0], "C: member 2 fails cycle 3");
 check(member(2).debt == 17_190_200 and member(2).fails == 1 and custody(2) == (200, 0) and sharesOf(9) == 920, "C: the debt rolled, nothing delivered");
 // variation margin: 17_190_200 owed against 200 × 85_100 = 17_020_000 held: 170_200
 check(B.variationOf(m.st, member(2)) == 170_200, "C: variation margin 170_200");
@@ -238,7 +238,7 @@ refused(scheduler, #closeOut({ member = 1; instrument = 1 }), "e:InvalidTerms", 
 advance(900);
 does(scheduler, #cutCycle({ cycle = 4; settleDay = 0 }), [33, 4, 0], "C: cycle 4 cut");
 // a second fail: 17_190_200 + ⌈1% × 17_190_200⌉ = 17_190_200 + 171_902 = 17_362_102
-does(scheduler, #settleCycle({ cycle = 4 }), [34, 4, 1, 2, 2, 17_362_102, 0], "C: member 2 fails cycle 4");
+does(scheduler, #settleCycle({ cycle = 4 }), [34, 4, 1, 2, 2, 17_362_102, 0, 0], "C: member 2 fails cycle 4");
 check(member(2).fails == 2, "C: two cycles failed: the deadline");
 // the close-out: account 3 (pre-funded) bids 200 at 85_100; the reference moves to 70_000, so the CCP's market sale's
 // collar is 70_000 × 95% = 66_500, and the batch clears at the lower of the two prices with the most volume: 66_500
@@ -303,13 +303,13 @@ does(scheduler, #cutCycle({ cycle = 6; settleDay = day(2026, 3, 8) }), [33, 6, d
 check(custody(1) == (20, 0), "E: two cycles pending, the CCP holds 20 for member 1");
 // Thursday: cycle 5 settles; member 1 pays 700_000 and receives 10 shares only: the other 10 are cycle 6's, unpaid
 advance(2 * 86_400);
-does(scheduler, #settleCycle({ cycle = 5 }), [34, 5, 1, 1, 1, 700_000, 1, 1, 1, 10], "E: Thursday settles Monday's cycle, delivering against its payment only");
+does(scheduler, #settleCycle({ cycle = 5 }), [34, 5, 1, 1, 1, 700_000, 1, 1, 1, 10, 0], "E: Thursday settles Monday's cycle, delivering against its payment only");
 refused(scheduler, #settleCycle({ cycle = 6 }), "e:CycleNotDue", "Tuesday's cycle on Thursday");
 check(custody(1) == (10, 0), "E: Tuesday's 10 shares stay with the CCP");
 // Sunday 2026-03-08
 advance(3 * 86_400);
 check(today() == day(2026, 3, 8), "E: Sunday");
-does(scheduler, #settleCycle({ cycle = 6 }), [34, 6, 1, 1, 1, 700_000, 1, 1, 1, 10], "E: Sunday settles Tuesday's cycle");
+does(scheduler, #settleCycle({ cycle = 6 }), [34, 6, 1, 1, 1, 700_000, 1, 1, 1, 10, 0], "E: Sunday settles Tuesday's cycle");
 check(custody(1) == (0, 0), "E: everything delivered");
 checkpoint(m);
 
@@ -333,7 +333,7 @@ does(t6, #withdraw({ account = 20; member = 4; ledger = cash; amount = 2_000_000
 does(scheduler, #cutCycle({ cycle = 7; settleDay = day(2026, 3, 10) }), [33, 7, day(2026, 3, 10)], "G: Sunday's cycle settles Tuesday");
 advance(2 * 86_400);
 // member 4 fails: 7_000_000 + 1% = 7_070_000
-does(scheduler, #settleCycle({ cycle = 7 }), [34, 7, 1, 4, 2, 7_070_000, 0], "G: member 4 fails");
+does(scheduler, #settleCycle({ cycle = 7 }), [34, 7, 1, 4, 2, 7_070_000, 0, 0], "G: member 4 fails");
 governs(#declareDefault({ member = 4; reason = "a fail it cannot pay" }), [39, 4, 2], "G: member 4 in default (kill 2)");
 // the close-out: account 3 bids 100 at 70_000; the reference at 60_000, so the collar is 57_000 and the batch clears there
 ignore tick();
