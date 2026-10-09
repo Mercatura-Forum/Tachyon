@@ -90,6 +90,9 @@ class Writer:
     def nat64(self, n):
         self.b += n.to_bytes(8, "big")
 
+    def byte(self, x):
+        self.b += bytes([x])
+
     def len16(self, n):
         self.b += n.to_bytes(2, "big")
 
@@ -237,6 +240,31 @@ def read_command(data):
         c["reference"] = r.blob().hex()
     elif tag == 51:
         c = {"k": "tripBreaker", "index": r.nat()}
+    elif tag == 52:
+        c = {"k": "setTerms", "instrument": r.nat()}
+        cls = r.byte()
+        if cls == 1:
+            t = {"cls": "bond", "coupon": r.nat(), "perYear": r.nat(), "basis": r.byte(), "maturity": r.nat(), "settleDays": r.nat()}
+        elif cls == 2:
+            t = {"cls": "receipt", "warehouses": [r.nat() for _ in range(r.len16())]}
+        elif cls == 3:
+            t = {"cls": "certificate", "registry": r.blob().hex()}
+        else:
+            t = {"cls": "right", "underlying": r.nat(), "price": r.nat(), "num": r.nat(), "den": r.nat(), "deadline": r.nat(), "issuer": r.nat(), "issuerMember": r.nat()}
+        c["terms"] = t
+    elif tag == 53:
+        c = {"k": "defineNav", "instrument": r.nat(), "units": r.nat(), "cash": r.nat()}
+        c["constituents"] = [(r.nat(), r.nat()) for _ in range(r.len16())]
+    elif tag == 54:
+        c = {"k": "issueReceipt", "warehouse": r.nat(), "instrument": r.nat(), "account": r.nat(), "member": r.nat(), "qty": r.nat(), "reference": r.blob().hex()}
+    elif tag == 55:
+        c = {"k": "cancelReceipt", "receipt": r.nat(), "account": r.nat(), "member": r.nat()}
+    elif tag == 56:
+        c = {"k": "retire", "account": r.nat(), "member": r.nat(), "trader": r.nat(), "instrument": r.nat(), "qty": r.nat(), "beneficiary": r.blob().hex()}
+    elif tag == 57:
+        c = {"k": "exercise", "account": r.nat(), "member": r.nat(), "trader": r.nat(), "instrument": r.nat(), "qty": r.nat()}
+    elif tag == 58:
+        c = {"k": "valueDate", "instrument": r.nat(), "day": r.nat()}
     elif tag in (45, 46):
         c = {"k": "quote" if tag == 45 else "massQuote", "account": r.nat(), "member": r.nat(), "trader": r.nat()}
         n = 1 if tag == 45 else r.len16()
@@ -346,7 +374,7 @@ def proposal_row(p):
     return b
 
 
-def concerned(block, order_member, kill_member):
+def concerned(block, order_member, kill_member, terms):
     """SPEC §14: the members a block concerns, each with whether it is the member's own act, in member order."""
     out = {}
     ev = block["event"]
@@ -372,8 +400,11 @@ def concerned(block, order_member, kill_member):
         own(c["member"])
         for j in range(e[7]):
             mentioned(e[8 + 2 * j])
-    elif k in ("reconcileMember", "registerMaker"):
+    elif k in ("reconcileMember", "registerMaker", "issueReceipt", "cancelReceipt", "retire"):
         own(c["member"])
+    elif k == "exercise":
+        # the holder's act, and the issuer's member, whose account is paid the subscription (§32)
+        own(c["member"]); mentioned(terms[c["instrument"]]["issuerMember"])
     elif k in ("quote", "massQuote"):
         own(c["member"]); p = 2
         for _ in range(e[1]):
@@ -595,6 +626,50 @@ def markets_sections(w, book):
     for n, (ix, entry, level) in enumerate(book.path, start=1):
         w.nat(n); w.blob(be(ix, 8) + be(entry - 1, 8) + be(level, 8))
     w.text("breaker"); w.nat(book.breaker_due); w.nat64(book.suspended_at)
+    classes_sections(w, book)
+
+
+def terms_row(t):
+    """An instrument's terms as the book stores them (§28): the class, seven figures, the warehouses, the registry."""
+    cls = {"bond": 1, "receipt": 2, "certificate": 3, "right": 4}[t["cls"]]
+    f = {"bond": [t.get("coupon", 0), t.get("perYear", 0), t.get("basis", 0), t.get("maturity", 0), t.get("settleDays", 0), 0, 0],
+         "right": [t.get(k, 0) for k in ("underlying", "price", "num", "den", "deadline", "issuer", "issuerMember")]}.get(t["cls"], [0] * 7)
+    ws = t.get("warehouses", [])
+    b = bytes([cls]) + b"".join(be(v, 8) for v in f) + bytes([len(ws)]) + b"".join(be(ws[k] if k < len(ws) else 0, 8) for k in range(8))
+    b += bytes.fromhex(t["registry"]) if t["cls"] == "certificate" else b"\x00" * 32
+    assert len(b) == 154
+    return b
+
+
+def classes_sections(w, book):
+    """§28 to §32: terms, iNAV rows and value dates by instrument; baskets, the iNAV path, receipts, retirements,
+    entitlements and every ledger's units in the book, as the book's tables."""
+    w.text("classes")
+    for i in sorted(book.inst):
+        if i in book.terms:
+            w.nat(i); w.byte(1); w.blob(terms_row(book.terms[i]))
+        if i in book.navs:
+            w.nat(i); w.byte(2); w.blob(b"".join(be(v, 8) for v in book.navs[i]))
+        if i in book.value_dates:
+            w.nat(i); w.byte(3); w.nat(book.value_dates[i])
+    w.text("baskets"); w.nat(len(book.baskets) + 1)
+    for n, (fd, i, sh) in enumerate(book.baskets, start=1):
+        w.nat(n); w.blob(be(fd, 8) + be(i, 8) + be(sh, 8))
+    w.text("navpath"); w.nat(len(book.nav_path) + 1)
+    for n, (fd, entry, v) in enumerate(book.nav_path, start=1):
+        w.nat(n); w.blob(be(fd, 8) + be(entry - 1, 8) + be(v, 8))
+    w.text("receipts"); w.nat(len(book.receipts) + 1)
+    for n, (wh, i, a, q, live, ref) in enumerate(book.receipts, start=1):
+        w.nat(n); w.blob(be(wh, 8) + be(i, 8) + be(a, 8) + be(q, 8) + bytes([1 if live else 0]) + bytes.fromhex(ref))
+    w.text("retirements"); w.nat(len(book.retirements) + 1)
+    for n, (a, i, q, ben) in enumerate(book.retirements, start=1):
+        w.nat(n); w.blob(be(a, 8) + be(i, 8) + be(q, 8) + bytes.fromhex(ben))
+    w.text("entitlements"); w.nat(len(book.entitlements) + 1)
+    for n, row in enumerate(book.entitlements, start=1):
+        w.nat(n); w.blob(b"".join(be(v, 8) for v in row))
+    w.text("supply"); w.nat(len(book.deposited) + 1)
+    for n, (led, units) in enumerate(book.deposited.items(), start=1):
+        w.nat(n); w.blob(principal_field(led) + be(units, 8))
 
 
 def main():
@@ -680,7 +755,7 @@ def main():
             if c["k"] == "declareDefault" and ev["effects"][2]:
                 kill_member[ev["effects"][2]] = c["member"]
         # the drop copy (SPEC §14): the members this block concerns, and what each is given
-        for member, own_ in concerned(b, order_member, kill_member):
+        for member, own_ in concerned(b, order_member, kill_member, book.terms):
             drops.append((member, i, own_))
             entry_hash[(member, i)] = hashlib.sha256(bytes.fromhex(raw[i]) if own_ else msg).hexdigest()
     if errors:

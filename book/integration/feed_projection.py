@@ -125,7 +125,8 @@ def body(w, c, e):
                "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle",
                "settleCycle", "callFund", "contributeFund", "fundSkin", "declareDefault", "closeDefault",
                "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "settleMakers",
-               "defineIndex", "reviewIndex", "corporateAction"):
+               "defineIndex", "reviewIndex", "corporateAction",
+               "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "retire", "exercise", "valueDate"):
         w.byte(0)
     else:
         raise ValueError(f"no feed message for {k}")
