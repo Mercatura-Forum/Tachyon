@@ -40,19 +40,25 @@ import XK "../../exchange/src/ExchangeCanonical";
 import B "../../book/src/BookCore";
 import BK "../../book/src/BookCanonical";
 import T "../../book/src/BookTypes";
+import S "../../surveillance/src/SurvCore";
+import SK "../../surveillance/src/SurvCanonical";
+import ST "../../surveillance/src/SurvTypes";
 
-persistent actor class Venue(init : { operator : Principal; directors : [Principal]; scheduler : Principal; depository : Principal; regulator : Principal }) = this {
+persistent actor class Venue(init : { operator : Principal; directors : [Principal]; scheduler : Principal; depository : Principal; regulator : Principal; analyst : Principal }) = this {
 
   let xs = X.newState();
   let bs = B.newState();
+  let ss = S.newState();
   func dual(permission : Text) : Auth.DualPolicy { { permission; required = 1; eligibleRole = "director"; ttlSeconds = 86_400 } };
   func duals(cat : [Auth.Permission]) : [Auth.DualPolicy] { Array.map<Auth.Permission, Auth.DualPolicy>(Array.filter<Auth.Permission>(cat, func(p) { p.dualByDefault }), func(p) { dual(p.id) }) };
   X.setPolicies(xs, duals(X.catalogue()));
   B.setPolicies(bs, duals(B.catalogue()));
+  S.setPolicies(ss, duals(S.catalogue()));
 
-  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal"];
-  let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set"];
-  let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits"];
+  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "surv.scan", "surv.report.seal"];
+  let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return"];
+  let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
+    "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -63,7 +69,8 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     if (Principal.equal(p, Principal.fromActor(this))) return perm == "book.auction.uncross";
     if (Principal.equal(p, init.scheduler)) return among(schedulerActs, perm);
     if (isDirector(p)) return perm == "command.approve" or perm == "command.reject";
-    if (Principal.equal(p, init.depository)) return perm == "book.funds.deposit";
+    if (Principal.equal(p, init.depository)) return perm == "book.funds.deposit" or perm == "book.borrow.record";
+    if (Principal.equal(p, init.analyst)) return perm == "surv.case.open" or perm == "surv.case.note";
     activeTrader(p) != null and among(traderActs, perm)
   };
   func holdsRole(p : Principal, role : Text) : Bool { role == "director" and isDirector(p) };
@@ -90,6 +97,16 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, c, null, justification))
   };
   public shared (msg) func bookApprove(proposal : Nat) : async Text { bOut(B.approve(bs, xs, auth, chainNow(), msg.caller, proposal)) };
+  func sOut(r : S.Result<S.Outcome>) : Text {
+    switch (r) { case (#ok(#executed(x))) "x=" # csv(x.effects); case (#ok(#proposed(p))) "p=" # Nat.toText(p.proposal); case (#err(e)) errText(debug_show(e)) }
+  };
+  /// The surveillance desk's acts (surveillance/SPEC.md), in their frozen bytes: the scheduler's scans and the day's
+  /// seal, the analyst's cases, the thresholds and a case's end under four eyes.
+  public shared (msg) func surveillance(version : Nat8, command : Blob, justification : Text) : async Text {
+    let ?c = E.readAt(SK.registry, version, C.Reader(Blob.toArray(command))) else return errText("Undecodable");
+    sOut(S.submit(ss, bs, xs, auth, chainNow(), msg.caller, c, null, justification))
+  };
+  public shared (msg) func surveillanceApprove(proposal : Nat) : async Text { sOut(S.approve(ss, bs, xs, auth, chainNow(), msg.caller, proposal)) };
 
   // ─── a trader's acts, typed: one update each ──────────────────────────────────────────────
   public type Place = {
@@ -179,6 +196,17 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   };
   public shared (msg) func myBalance(account : Nat, ledger : Principal) : async ?T.Balance {
     if (ownsAccount(msg.caller, account)) ?B.balance(bs, account, ledger) else null
+  };
+
+  // ─── the desk's rows, to the desk and the regulator only (no tipping off) ─────────────────────
+  func desk(p : Principal) : Bool { Principal.equal(p, init.analyst) or Principal.equal(p, init.regulator) or isDirector(p) };
+  /// An alert, a case, a sealed day's report and the desk's counters, to the analyst, the directors and the regulator;
+  /// to anyone else, a refusal that says nothing of what exists. Updates: a query's caller is not authenticated.
+  public shared (msg) func survAlert(id : Nat) : async { #ok : ?ST.Alert; #err : Text } { if (not desk(msg.caller)) #err("NotTheDesk") else #ok(S.alert(ss, id)) };
+  public shared (msg) func survCase(id : Nat) : async { #ok : ?ST.Case; #err : Text } { if (not desk(msg.caller)) #err("NotTheDesk") else #ok(S.caseOf(ss, id)) };
+  public shared (msg) func survReport(day : Nat) : async { #ok : ?S.ReportRow; #err : Text } { if (not desk(msg.caller)) #err("NotTheDesk") else #ok(S.report(ss, day)) };
+  public shared (msg) func survCounts() : async { #ok : { cursor : Nat; alerts : Nat; cases : Nat; reports : Nat; blocks : Nat; lines : Nat }; #err : Text } {
+    if (not desk(msg.caller)) #err("NotTheDesk") else #ok(S.counts(ss))
   };
 
   // ─── the regulator's copy of the book's log ───────────────────────────────────────────────
