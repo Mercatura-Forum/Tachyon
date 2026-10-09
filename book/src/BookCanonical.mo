@@ -177,6 +177,11 @@ module {
       case (#setAttestors(x)) { w.byte(59); w.len16(x.attestors.size()); for (p in x.attestors.vals()) w.principal(p) };
       case (#attestPrice(x)) { w.byte(60); w.nat(x.attestor); w.nat(x.instrument); w.nat(x.day); w.nat(x.price) };
       case (#settleDerivatives(x)) { w.byte(61); w.nat(x.instrument); w.nat(x.day); w.nat(x.limit) };
+      case (#registerBridge(x)) { w.byte(62); w.principal(x.ledger); w.principal(x.rtgs) };
+      case (#earmark(x)) { w.byte(63); w.principal(x.ledger); w.nat(x.account); w.nat(x.member); w.nat(x.amount); w.blob(x.reference) };
+      case (#redeem(x)) { w.byte(64); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.principal(x.ledger); w.nat(x.amount) };
+      case (#rtgsSettle(x)) { w.byte(65); w.nat(x.redemption); w.blob(x.reference) };
+      case (#rtgsReject(x)) { w.byte(66); w.nat(x.redemption); w.blob(x.reference) };
     };
     true
   };
@@ -320,6 +325,19 @@ module {
         ?#attestPrice({ attestor; instrument; day; price })
       };
       case 61 { let ?instrument = r.nat() else return null; let ?day = r.nat() else return null; let ?limit = r.nat() else return null; ?#settleDerivatives({ instrument; day; limit }) };
+      case 62 { let ?ledger = r.principal() else return null; let ?rtgs = r.principal() else return null; ?#registerBridge({ ledger; rtgs }) };
+      case 63 {
+        let ?ledger = r.principal() else return null; let ?account = r.nat() else return null; let ?member = r.nat() else return null;
+        let ?amount = r.nat() else return null; let ?reference = r.blob() else return null;
+        ?#earmark({ ledger; account; member; amount; reference })
+      };
+      case 64 {
+        let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?trader = r.nat() else return null;
+        let ?ledger = r.principal() else return null; let ?amount = r.nat() else return null;
+        ?#redeem({ account; member; trader; ledger; amount })
+      };
+      case 65 { let ?redemption = r.nat() else return null; let ?reference = r.blob() else return null; ?#rtgsSettle({ redemption; reference }) };
+      case 66 { let ?redemption = r.nat() else return null; let ?reference = r.blob() else return null; ?#rtgsReject({ redemption; reference }) };
       case _ null;
     }
   };
@@ -333,7 +351,8 @@ module {
     "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "quote", "massQuote", "settleMakers",
     "defineIndex", "reviewIndex", "corporateAction", "tripBreaker",
     "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "retire", "exercise", "valueDate",
-    "setAttestors", "attestPrice", "settleDerivatives"];
+    "setAttestors", "attestPrice", "settleDerivatives",
+    "registerBridge", "earmark", "redeem", "rtgsSettle", "rtgsReject"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -351,6 +370,7 @@ module {
       case (#setTerms(_)) "setTerms"; case (#defineNav(_)) "defineNav"; case (#issueReceipt(_)) "issueReceipt"; case (#cancelReceipt(_)) "cancelReceipt";
       case (#retire(_)) "retire"; case (#exercise(_)) "exercise"; case (#valueDate(_)) "valueDate";
       case (#setAttestors(_)) "setAttestors"; case (#attestPrice(_)) "attestPrice"; case (#settleDerivatives(_)) "settleDerivatives";
+      case (#registerBridge(_)) "registerBridge"; case (#earmark(_)) "earmark"; case (#redeem(_)) "redeem"; case (#rtgsSettle(_)) "rtgsSettle"; case (#rtgsReject(_)) "rtgsReject";
     }
   };
 

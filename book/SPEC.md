@@ -586,3 +586,27 @@ is out of the money and b × the level for a call or b × the strike for a put, 
 margin for short broad-based index options). The daily settlement marks the positions at the attested premium and recomputes the writers' margin. On the expiry
 day each option pays its intrinsic value at the index's level, max(level − strike, 0) for a call and max(strike − level,
 0) for a put, × contracts × multiplier, from its writers to its holders in the open cycle; every position closes.
+
+## 36. The cash leg
+
+The book settles against any cash ledger; what a national market needs is that ledger's money to be one a central bank
+stands behind. Three shapes, the venue's code the same for all: (a) a **reserve ledger** the central
+bank operates on the subnet: its deposits are the central bank's attestations, and a fill's cash is final on the subnet
+in central bank money; (b) a **tokenised deposit ledger** a licensed bank operates: final on the subnet in commercial
+bank money, the bank's own liability; (c) a **bridge** to the RTGS, which this section specifies.
+
+**A bridged ledger** is registered under four eyes, only while none of its units is in the book, with the principal of
+the RTGS operator. Its units are **claims** on cash the RTGS holds earmarked:
+
+- an **earmark** is the RTGS operator's attestation that it reserved an amount at the central bank for a participant
+  (its message named by hash, once); the bridge mints as many claims to the participant's account. Nothing else mints:
+  deposits of a bridged ledger are refused;
+- claims move between accounts as the cash leg of any fill, final on the subnet as claims;
+- a **redemption** is a member's request to take claims out: they are held at once; the RTGS operator then attests the
+  transfer out of the earmark (the claims are burned) or its failure (the claims return to the account). Nothing else
+  burns: withdrawals of a bridged ledger are refused.
+
+At every block a bridged ledger's claims in the book equal its **backing**: the cash earmarked less the cash transferred
+out (the claims held by pending redemptions are still backed). Either both the RTGS's cash and the claims move, or
+neither: a rejected transfer leaves the earmark and the claims as they were. The cash's finality is the RTGS's: final
+when the central bank settles the transfer.

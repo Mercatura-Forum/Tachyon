@@ -125,6 +125,11 @@ module {
     Perm.p("book.attestors.set", "price", #update, #command("setAttestors"), false, false, true),
     Perm.p("book.price.attest", "price", #create, #command("attestPrice"), false, false, false),
     Perm.p("book.derivatives.settle", "position", #update, #command("settleDerivatives"), false, false, false),
+    Perm.p("book.bridge.register", "bridge", #create, #command("registerBridge"), false, false, true),
+    Perm.p("book.rtgs.earmark", "bridge", #create, #command("earmark"), false, false, false),
+    Perm.p("book.bridge.redeem", "bridge", #create, #command("redeem"), false, false, false),
+    Perm.p("book.rtgs.settle", "bridge", #update, #command("rtgsSettle"), false, false, false),
+    Perm.p("book.rtgs.reject", "bridge", #update, #command("rtgsReject"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -162,6 +167,10 @@ module {
     ("book.maker.settle", "the scheduler closes the makers' period at the day's end; presence and rebates are the fold's, none typed"),
     ("book.breaker.trip", "the market-wide breaker, recorded by the book itself in the block after the one that moved an index; no principal submits it"),
     ("book.certificate.retire", "a trader of the account's member retires certificates the account holds free; they leave circulation and nothing else moves"),
+    ("book.rtgs.earmark", "the RTGS operator attests cash it earmarked at the central bank, by its message's hash, once; the claims minted are that cash"),
+    ("book.bridge.redeem", "a trader of the account's member asks the RTGS for claims the account holds free; they are held until the RTGS answers"),
+    ("book.rtgs.settle", "the RTGS operator attests the transfer out of the earmark for a held redemption; the claims are burned, nothing else moves"),
+    ("book.rtgs.reject", "the RTGS operator attests that a redemption's transfer failed; the held claims return to the account, nothing else moves"),
     ("book.price.attest", "an attestor records its own price for a derivative on the market day, once; the daily price is the median of the three"),
     ("book.derivatives.settle", "the scheduler settles a closed derivative's positions at the attested price or, at expiry, the index's level; every amount is the fold's"),
     ("book.bond.valuedate", "the scheduler records a bond's value date for the market day, the day the exchange's calendar gives; it moves nothing"),
@@ -719,6 +728,35 @@ module {
     decode = func(a : [Nat8]) : MemberIm { { im = R.getNat(a, 0, 8) } };
     indexes = [];
   };
+  // ── the cash leg's bridge to the RTGS (SPEC §36) ──
+  /// A bridged cash ledger: the RTGS operator's principal, the cash earmarked and not yet transferred out (the claims'
+  /// backing), and what pending redemptions hold.
+  public type Bridge = { ledger : Principal; rtgs : Principal; backing : Nat; redeeming : Nat };
+  public let BRIDGE_ROW_BYTES = 76;   // the ledger 30, the operator 30, backing 8, redeeming 8
+  public let bridgeRows : RS.Decl<Bridge> = {
+    table = "bridges"; idBytes = 8; rowBytes = BRIDGE_ROW_BYTES;
+    encode = func(x : Bridge) : Blob { let b = R.buf(); putPrincipal(b, x.ledger); putPrincipal(b, x.rtgs); R.putNat(b, x.backing, 8); R.putNat(b, x.redeeming, 8); R.done(b, BRIDGE_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Bridge { { ledger = getPrincipal(a, 0); rtgs = getPrincipal(a, 30); backing = R.getNat(a, 60, 8); redeeming = R.getNat(a, 68, 8) } };
+    indexes = [{ name = "byLedger"; keyBytes = 30; keyOf = func(_ : Nat, x : Bridge) : ?Blob { ?ledgerKey(x.ledger) } }];
+  };
+  /// An earmark: the bridge, the account credited, the amount, the RTGS message's hash.
+  public type Earmark = { bridge : Nat; account : Nat; amount : Nat; reference : Blob };
+  public let earmarkRows : RS.Decl<Earmark> = {
+    table = "earmarks"; idBytes = 8; rowBytes = 56;
+    encode = func(x : Earmark) : Blob { let b = R.buf(); for (v in [x.bridge, x.account, x.amount].vals()) R.putNat(b, v, 8); R.putBlob(b, x.reference, 32); R.done(b, 56) };
+    decode = func(a : [Nat8]) : Earmark { { bridge = R.getNat(a, 0, 8); account = R.getNat(a, 8, 8); amount = R.getNat(a, 16, 8); reference = R.getBlob(a, 24, 32) } };
+    indexes = [{ name = "byRef"; keyBytes = 32; keyOf = func(_ : Nat, x : Earmark) : ?Blob { ?x.reference } }];
+  };
+  /// A redemption: the bridge, the account, its member, the amount, its state (1 held, 2 settled, 3 rejected), the RTGS
+  /// message's hash once answered.
+  public type Redemption = { bridge : Nat; account : Nat; member : Nat; amount : Nat; state : Nat; reference : Blob };
+  public let REDEMPTION_ROW_BYTES = 65;   // four figures of 8, the state 1, the message 32
+  public let redemptionRows : RS.Decl<Redemption> = {
+    table = "redemptions"; idBytes = 8; rowBytes = REDEMPTION_ROW_BYTES;
+    encode = func(x : Redemption) : Blob { let b = R.buf(); for (v in [x.bridge, x.account, x.member, x.amount].vals()) R.putNat(b, v, 8); R.putNat(b, x.state, 1); R.putBlob(b, x.reference, 32); R.done(b, REDEMPTION_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Redemption { { bridge = R.getNat(a, 0, 8); account = R.getNat(a, 8, 8); member = R.getNat(a, 16, 8); amount = R.getNat(a, 24, 8); state = R.getNat(a, 32, 1); reference = R.getBlob(a, 33, 32) } };
+    indexes = [];
+  };
   func ledgerKey(p : Principal) : Blob { let b = R.buf(); putPrincipal(b, p); R.done(b, PRINCIPAL_BYTES) };
   public let E18 = 1_000_000_000_000_000_000;
   public let E9 = 1_000_000_000;
@@ -776,7 +814,7 @@ module {
     and 8 + 8 + 1 <= KILL_ROW_BYTES and 8 * 5 == LIMIT_ROW_BYTES
     and 32 <= REF_ROW_BYTES and 1 <= DUE_ROW_BYTES
     and 8 * 4 + 32 + 8 * 2 + 1 == INDEX_ROW_BYTES
-    and 1 + 7 * 8 + 1 + T.MAX_WAREHOUSES * 8 + 32 == TERMS_ROW_BYTES and 8 * 4 + 1 + 32 == RECEIPT_ROW_BYTES and PRINCIPAL_BYTES + 8 == SUPPLY_ROW_BYTES and 8 * 3 + 1 + 8 * 3 == POSITION_ROW_BYTES
+    and 1 + 7 * 8 + 1 + T.MAX_WAREHOUSES * 8 + 32 == TERMS_ROW_BYTES and 8 * 4 + 1 + 32 == RECEIPT_ROW_BYTES and PRINCIPAL_BYTES + 8 == SUPPLY_ROW_BYTES and 8 * 3 + 1 + 8 * 3 == POSITION_ROW_BYTES and PRINCIPAL_BYTES * 2 + 8 * 2 == BRIDGE_ROW_BYTES and 8 * 4 + 1 + 32 == REDEMPTION_ROW_BYTES
     and 1 + 4 * (8 + 4) == FEE_ROW_BYTES and 9 * 8 + 2 + 8 * 3 == MAKER_ROW_BYTES
     and 8 * 12 + 1 == CLEARING_ROW_BYTES and 1 + PRINCIPAL_BYTES + 8 * 4 == LEG_ROW_BYTES and 8 + 8 + PRINCIPAL_BYTES + 8 * 6 == TERMS_BYTES
   };
@@ -829,6 +867,8 @@ module {
     /// each member's positions' margin.
     attestorStore : RS.Store; attestationStore : RS.Store; var nextAttestation : Nat; positionStore : RS.Store; var nextPosition : Nat;
     derivStore : RS.Store; memberImStore : RS.Store;
+    /// The cash leg's bridges to the RTGS (SPEC §36): the bridges, the earmarks, the redemptions.
+    bridgeStore : RS.Store; var nextBridge : Nat; earmarkStore : RS.Store; var nextEarmark : Nat; redemptionStore : RS.Store; var nextRedemption : Nat;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -866,6 +906,7 @@ module {
       supplyStore = RS.newStore(supplyRows); var nextSupply = 1; valueDateStore = RS.newStore(valueDateRows);
       attestorStore = RS.newStore(attestorRows); attestationStore = RS.newStore(attestationRows); var nextAttestation = 1; positionStore = RS.newStore(positionRows); var nextPosition = 1;
       derivStore = RS.newStore(derivRows); memberImStore = RS.newStore(memberImRows);
+      bridgeStore = RS.newStore(bridgeRows); var nextBridge = 1; earmarkStore = RS.newStore(earmarkRows); var nextEarmark = 1; redemptionStore = RS.newStore(redemptionRows); var nextRedemption = 1;
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -1317,6 +1358,21 @@ module {
   public func receiptOf(s : State, id : Nat) : ?Receipt { RS.get(s.receiptStore, receiptRows, id) };
   public func retirementOf(s : State, id : Nat) : ?Retirement { RS.get(s.retireStore, retireRows, id) };
   public func entitlementOf(s : State, id : Nat) : ?Entitlement { RS.get(s.entitlementStore, entitlementRows, id) };
+
+  // ─── the cash leg's bridge (SPEC §36) ───────────────────────────────────────────────────────
+  public func bridgeOf(s : State, ledger : Principal) : ?(Nat, Bridge) { one(s.bridgeStore, bridgeRows, "byLedger", ledgerKey(ledger)) };
+  public func bridgeRow(s : State, id : Nat) : ?Bridge { RS.get(s.bridgeStore, bridgeRows, id) };
+  public func earmarkOf(s : State, id : Nat) : ?Earmark { RS.get(s.earmarkStore, earmarkRows, id) };
+  public func redemptionOf(s : State, id : Nat) : ?Redemption { RS.get(s.redemptionStore, redemptionRows, id) };
+  /// The RTGS's answer to a redemption (§36): the redemption held and the caller the bridge's operator.
+  func rtgsRefusal(s : State, caller : Principal, id : Nat, reference : Blob) : ?T.Error {
+    let ?r = redemptionOf(s, id) else return ?#InvalidTerms({ reason = "no such redemption" });
+    if (r.state != 1) return ?#InvalidTerms({ reason = "a redemption held" });
+    let ?b = bridgeRow(s, r.bridge) else return ?#InvalidTerms({ reason = "no such redemption" });   // kept: a redemption names its bridge
+    if (not Principal.equal(caller, b.rtgs)) return ?#InvalidTerms({ reason = "the RTGS operator's answer" });
+    if (reference.size() != 32) return ?#InvalidTerms({ reason = "the RTGS message's 32-byte hash" });
+    null
+  };
 
   // ─── derivatives (SPEC §33 to §35) ─────────────────────────────────────────────────────────
   public type Future = { index : Nat; multiplier : Nat; expiry : Nat; imBps : Nat };
@@ -1808,6 +1864,7 @@ module {
         if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
         if (one(s.refRows, refs, "byRef", x.reference) != null) return ?#DuplicateReference;
         if (receiptLedger(s, x.ledger)) return ?#InvalidTerms({ reason = "a receipt's units come only from its warehouse" });
+        if (bridgeOf(s, x.ledger) != null) return ?#InvalidTerms({ reason = "a bridged ledger's claims come only from an earmark" });
         null
       };
       case (#withdraw(x)) {
@@ -1818,6 +1875,7 @@ module {
         let b = balance(s, x.account, x.ledger);
         if (b.available < x.amount) return ?#InsufficientFunds({ ledger = x.ledger; available = b.available; wanted = x.amount });
         if (receiptLedger(s, x.ledger)) return ?#InvalidTerms({ reason = "a receipt's units leave only by its cancellation" });
+        if (bridgeOf(s, x.ledger) != null) return ?#InvalidTerms({ reason = "a bridged ledger's claims leave only by a settled redemption" });
         null
       };
       case (#placeOrder(x)) {
@@ -2397,6 +2455,37 @@ module {
         } else if (d.runDay == 0 and attestedPrice(s, x.instrument, x.day) == null) return ?#InvalidTerms({ reason = "three attestations for the day" });
         null
       };
+      case (#registerBridge(x)) {
+        if (bridgeOf(s, x.ledger) != null) return ?#InvalidTerms({ reason = "a ledger bridged once" });
+        if (supplyOf(s, x.ledger) != 0) return ?#InvalidTerms({ reason = "a ledger with no unit in the book" });
+        null
+      };
+      case (#earmark(x)) {
+        let ?(_, b) = bridgeOf(s, x.ledger) else return ?#InvalidTerms({ reason = "a bridged ledger" });
+        if (not Principal.equal(caller, b.rtgs)) return ?#InvalidTerms({ reason = "the RTGS operator's earmark" });
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (a.status != #open) return ?#AccountClosed({ account = x.account });
+        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
+        if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
+        if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "the RTGS message's 32-byte hash" });
+        if (one(s.earmarkStore, earmarkRows, "byRef", x.reference) != null) return ?#DuplicateReference;
+        null
+      };
+      case (#redeem(x)) {
+        switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
+        switch (X.account(xs, x.account), X.traderByPrincipal(xs, caller)) {
+          case (?a, ?(tid, _)) { if (a.member != x.member or tid != x.trader) return ?#NotYourAccount({ account = x.account }) };
+          case (_) return ?#NotYourAccount({ account = x.account });
+        };
+        if (bridgeOf(s, x.ledger) == null) return ?#InvalidTerms({ reason = "a bridged ledger" });
+        if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
+        let b = balance(s, x.account, x.ledger);
+        if (b.available < x.amount) return ?#InsufficientFunds({ ledger = x.ledger; available = b.available; wanted = x.amount });
+        null
+      };
+      case (#rtgsSettle(x)) rtgsRefusal(s, caller, x.redemption, x.reference);
+      case (#rtgsReject(x)) rtgsRefusal(s, caller, x.redemption, x.reference);
       case (#valueDate(x)) {
         let ?b = bondOf(s, x.instrument) else return ?#InvalidTerms({ reason = "a bond" });
         let day = settlementDay(xs, X.marketTime(xs, now).0, b.settleDays);
@@ -3038,6 +3127,39 @@ module {
         [60, x.instrument, x.day, x.attestor, switch (attestedPrice(s, x.instrument, x.day)) { case (?m) m; case null 0 }]
       };
       case (#settleDerivatives(x)) settleDerivatives(s, x.instrument, x.day, x.limit);
+      // SPEC §36
+      case (#registerBridge(x)) {
+        let id = s.nextBridge; s.nextBridge += 1;
+        RS.put(s.bridgeStore, bridgeRows, id, { ledger = x.ledger; rtgs = x.rtgs; backing = 0; redeeming = 0 });
+        [62, id]
+      };
+      case (#earmark(x)) {
+        let ?(bid, b) = bridgeOf(s, x.ledger) else Runtime.trap("apply: a bridge vanished");
+        let id = s.nextEarmark; s.nextEarmark += 1;
+        RS.put(s.earmarkStore, earmarkRows, id, { bridge = bid; account = x.account; amount = x.amount; reference = x.reference });
+        credit(s, x.account, x.ledger, x.amount);
+        moveSupply(s, x.ledger, x.amount, 0);
+        RS.put(s.bridgeStore, bridgeRows, bid, { b with backing = b.backing + x.amount });
+        [63, id, x.account, x.amount]
+      };
+      case (#redeem(x)) {
+        let ?(bid, b) = bridgeOf(s, x.ledger) else Runtime.trap("apply: a bridge vanished");
+        hold(s, x.account, x.ledger, x.amount);
+        let id = s.nextRedemption; s.nextRedemption += 1;
+        RS.put(s.redemptionStore, redemptionRows, id, { bridge = bid; account = x.account; member = x.member; amount = x.amount; state = 1; reference = zero32() });
+        RS.put(s.bridgeStore, bridgeRows, bid, { b with redeeming = b.redeeming + x.amount });
+        [64, id, x.amount]
+      };
+      case (#rtgsSettle(x) or #rtgsReject(x)) {
+        let settled = switch (c) { case (#rtgsSettle(_)) true; case (_) false };
+        let ?r = redemptionOf(s, x.redemption) else Runtime.trap("apply: a redemption vanished");
+        let ?b = bridgeRow(s, r.bridge) else Runtime.trap("apply: a bridge vanished");
+        // settled: the claims burned against the cash the RTGS moved out of the earmark; rejected: returned, nothing moved
+        if (settled) { spendHeld(s, r.account, b.ledger, r.amount); moveSupply(s, b.ledger, 0, r.amount) } else release(s, r.account, b.ledger, r.amount);
+        RS.put(s.bridgeStore, bridgeRows, r.bridge, { b with backing = if (settled) b.backing - r.amount else b.backing; redeeming = b.redeeming - r.amount });
+        RS.put(s.redemptionStore, redemptionRows, x.redemption, { r with state = if (settled) 2 else 3; reference = x.reference });
+        [if (settled) 65 else 66, x.redemption, r.amount]
+      };
       case (#tripBreaker(x)) {
         let ?row = indexRowOf(s, x.index) else Runtime.trap("apply: an index vanished");
         let move = if (row.level > row.reference) row.level - row.reference else row.reference - row.level;
@@ -3799,6 +3921,9 @@ module {
           case (#retire(c)) own(c.member);
           case (#exercise(c)) { own(c.member); switch (termsOf(s, c.instrument)) { case (?#right(r)) mentioned(r.issuerMember); case (_) {} } };
           case (#settleDerivatives(_)) { for (j in Nat.range(0, e[5])) mentioned(e[7 + 4 * j]) };
+          case (#earmark(c)) mentioned(c.member);
+          case (#redeem(c)) own(c.member);
+          case (#rtgsSettle(c) or #rtgsReject(c)) { switch (redemptionOf(s, c.redemption)) { case (?r) mentioned(r.member); case null {} } };
           case (#registerMaker(c)) own(c.member);
           case (#quote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
           case (#massQuote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
@@ -4019,6 +4144,9 @@ module {
     table<Attestation>("attestations", s.attestationStore, attestationRows, s.nextAttestation);
     table<Position>("positions", s.positionStore, positionRows, s.nextPosition);
     Fold.section(f, "positionmargin", func(w : C.Writer) { positionMargins(s, w) });
+    table<Bridge>("bridges", s.bridgeStore, bridgeRows, s.nextBridge);
+    table<Earmark>("earmarks", s.earmarkStore, earmarkRows, s.nextEarmark);
+    table<Redemption>("redemptions", s.redemptionStore, redemptionRows, s.nextRedemption);
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
@@ -4063,7 +4191,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 90) {
+    while (left > 0 and run.part < 96) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -4155,12 +4283,19 @@ module {
         case 86 tableHead(w, run, "positions", s.nextPosition, 87);
         case 87 tableStep<Position>(w, run, s.positionStore, positionRows, s.nextPosition, 88);
         case 88 { w.text("positionmargin"); positionMargins(s, w); run.part := 89 };
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 90 };
+        case 89 tableHead(w, run, "bridges", s.nextBridge, 90);
+        case 90 tableStep<Bridge>(w, run, s.bridgeStore, bridgeRows, s.nextBridge, 91);
+        case 91 tableHead(w, run, "earmarks", s.nextEarmark, 92);
+        case 92 tableStep<Earmark>(w, run, s.earmarkStore, earmarkRows, s.nextEarmark, 93);
+        case 93 tableHead(w, run, "redemptions", s.nextRedemption, 94);
+        case 94 tableStep<Redemption>(w, run, s.redemptionStore, redemptionRows, s.nextRedemption, 95);
+        // the log's section is the last part: the loop runs to its part and stops past it
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 96 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 90) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 96) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };
@@ -4169,7 +4304,7 @@ module {
      s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode,
      s.nextPayable, s.nextFeeTotal, s.nextStatement, s.nextStatementSeal, s.lastStatementDay, s.nextRecon, s.nextMaker, s.nextMakerDay, s.lastMakerDay,
      s.nextConstituent, s.nextPath, s.breakerDue, Nat64.toNat(s.suspendedAt),
-     s.nextBasket, s.nextNavPath, s.nextReceipt, s.nextRetire, s.nextEntitlement, s.nextSupply, s.nextAttestation, s.nextPosition]
+     s.nextBasket, s.nextNavPath, s.nextReceipt, s.nextRetire, s.nextEntitlement, s.nextSupply, s.nextAttestation, s.nextPosition, s.nextBridge, s.nextEarmark, s.nextRedemption]
   };
   /// The order indexes whose entries leave as orders change (the reference index's keys never move).
   public let churnIndexes : [Text] = ["book", "stops", "own", "day", "gtd", "immediate", "trailing", "member", "trader"];

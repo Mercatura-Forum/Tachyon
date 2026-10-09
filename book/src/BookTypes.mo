@@ -208,6 +208,17 @@ module {
     /// The scheduler's daily settlement of a derivative's positions (§34, §35), `limit` positions a message from the run's
     /// cursor: before the expiry at the attested price, on the expiry day at the index's level, the positions then closed.
     #settleDerivatives : { instrument : InstrumentId; day : Day; limit : Nat };
+    /// A cash ledger bridged to the RTGS (SPEC §36; four eyes): its claims exist only against cash the RTGS has earmarked,
+    /// and the RTGS operator's principal attests every earmark and every transfer.
+    #registerBridge : { ledger : Principal; rtgs : Principal };
+    /// The RTGS operator's earmark (§36): cash reserved at the central bank for an account's participant; the bridge mints
+    /// as many claims to the account, naming the RTGS message by its hash.
+    #earmark : { ledger : Principal; account : AccountId; member : Nat; amount : Nat; reference : Blob };
+    /// A member's redemption of claims (§36): held until the RTGS transfers the cash out of the earmark.
+    #redeem : { account : AccountId; member : Nat; trader : Nat; ledger : Principal; amount : Nat };
+    /// The RTGS operator's outcome of a redemption (§36): settled (the claims burned) or rejected (the claims returned).
+    #rtgsSettle : { redemption : Nat; reference : Blob };
+    #rtgsReject : { redemption : Nat; reference : Blob };
   };
 
   /// A levy of a fee schedule (SPEC §22): its recipient account and its rate in parts per million of a fill's value.
