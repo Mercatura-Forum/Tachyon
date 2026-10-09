@@ -78,6 +78,10 @@ that a ledger `Duplicate` reply is not trusted until the named escrow is verifie
   records it on a four-validator test chain running that binary and environment on one machine. The chain harness
   that drove that run is not part of this repository; its rows are recorded below.
 - **The listing registry on the production binary.**
+- **The exchange (§7) on a subnet of validators in diverse locations.** Its batteries are judged on a four-validator
+  test chain on one machine running the production node binary and environment. The harnesses that drove the chain
+  runs of §7 other than the chain judge are not part of this repository; their rows are recorded below.
+- **A Rejected ExecutionReport from the log.** A refused order writes no block; the report is the venue's reply.
 
 
 ## 6. The matching engine's fixes and the custody guard (AU-01 to AU-05, AU-08 to AU-10)
@@ -120,4 +124,53 @@ Each run from a checkout of the commit that introduced it.
 | `matching/tools/stable_compat.sh` from the previous release | Compatible; its control (a stored field's type changed) refused |
 | `matching/tools/mutation_test.py` | Baseline green; 6 of 6 mutants red, each on its own rule |
 | `custody/tools/check.sh`, `custody/test/run.sh` | Green, with the AU-10 regression; the same battery against the previous `CustodyCore.mo` fails on the two AU-10 checks |
+
+## 7. The exchange: foundation, book, surveillance, venue and gateway
+
+### Batteries, oracles, controls and mutants (2026-10-09)
+
+Run from a checkout of each series' last commit; the figures below are the last commit's.
+
+| Part | Battery | Independent check | Planted-fault controls | Mutants |
+|---|---|---|---|---|
+| Exchange foundation | `exchange/test/run.sh`: the catalogue in both directions, 22 command families round-tripped, 34 refusal codes with both texts, 30 acts under four eyes, a year of scheduler acts (1,785 executed, 3,325 unchanged, 21 refused for a second not the chain's), 1,886 blocks replayed | the Python twin recomputes every phase decision, ISIN check digit and tick decision | 3 of 3 red | 10 of 10 red |
+| Order book | `book/test/run.sh`: 42 processes, each under a memory cap; cases computed by hand per part (clearing 98, instrument classes 63, markets 39, derivatives 30, cash leg 26, indices 23, gateway 7, and the base and phase batteries); 10,080 random episodes in 24 parts; random streams per part | the reference book replays the commands alone: VERIFIED in all 42 processes, 305,856 commands and 217,731 blocks; the regulator's replay refolds every certified log to the book's fingerprint; the feed's consumer holds the visible book from the feed alone in all 42 | reference 17, clearing 10, markets 9, indices 8, classes 10, derivatives 8, cash leg 7, gateway 6: every planted fault red | 158 of 158 red |
+| Surveillance | `surveillance/test/run.sh`: every rule's alert computed by hand (15 scenarios), cases, the sealed report; 4,500 random commands of clean books scanned | the oracle applies the rules again to the logs | 4 of 4 red | |
+| Gateway | `gateway/test/run.sh`: framing over a stream split at every byte; QuickFIX/J 2.3.1's ten-step session in FIX 4.4 and in FIX 5.0 SP2, 12 checks each, through `gateway.Gateway` with a stand-in venue | QuickFIX/J validates every message against its own dictionaries | reports without LeavesQty, a resend without PossDupFlag: red in both versions | |
+| Custody (with the settlement leg) | `custody/test/run.sh`, with `custody/tools/check.sh` | the Python twin | 6 of 6 red | 23 of 23 red |
+
+### The chain judge on a four-validator test chain running the production node binary (2026-10-08 and 2026-10-09)
+
+Four validators on one machine running the production node binary (`3c5353ab`) under the production environment; the
+judge actor built with `custody/tools/build_contracts.sh`. Every battery's transcript made again call by call from the
+role's signer, with an in-place upgrade half-way; every reply the battery's, every domain's fingerprint the battery's
+at the end, and the chain's own replay of its logs reproducing every fingerprint. **12 of 12 green.**
+
+| Battery | Calls | Executions | Refusals by name |
+|---|---|---|---|
+| Book | 3,377 | 1,674 | 1,615 |
+| BookClearing | 290 | 156 | 77 |
+| BookMarkets | 168 | 102 | 29 |
+| BookIndex | 110 | 67 | 16 |
+| BookInstruments | 196 | 99 | 53 |
+| BookDerivatives | 185 | 107 | 27 |
+| BookCashLeg | 115 | 63 | 24 |
+| BookGateway | 80 | 48 | 12 |
+| Surv | 212 | 168 | 21 |
+| Exchange | 5,335 | 1,822 | 3,481 |
+| Custody | 149 | 36 | 96 |
+| Offering | 4,246 | 3,187 | 35 |
+
+With twenty calls in flight the BookClearing judge stopped at call 261: the chain executed later calls of the same
+window before it, so the proposal it opened took a later number than the battery's. At one call in flight it is
+green, and that run is the one recorded above; Exchange and Offering are recorded at one call in flight.
+
+### Runs on the same chain whose harnesses are not in this repository (2026-10-08 and 2026-10-09)
+
+| Run | What was shown |
+|---|---|
+| Scoping | 58 venue methods, 126 cases: no read or refusal answers one member with another's orders, balances, positions, legs, receipts, redemptions or drop copy, and no answer names another member's client reference or principal; each of six reads unscoped in a copy of the venue is caught on its own method |
+| Derivatives | A future's daily price the median of three attestations (1,005.00); its final price the index's level (1,010.00); at the cycle member 1 received exactly the +50,900 computed, member 2 paid it; every node the same state; the regulator's replay of the chain's log verified |
+| Cash leg | The same row settled at the fill in reserves, in tokenised deposits and in claims; claims only by the RTGS operator's earmark; the claims equal to the backing at every step on every node; a rejected transfer returned the claims, a settled one burned them and lowered the backing; the regulator's replay verified |
+| Gateway | QuickFIX/J 2.3.1 through a member's gateway against the venue: 12 of 12 checks in FIX 4.4 and in FIX 5.0 SP2, the venue upgraded in place in the middle of the session; the 12 reports of accepted orders rebuilt field for field from the regulator's copy of the log, and a journal with one LastPx altered found different; the drop-copy session carried the same 12 reports; a gateway signing with an unregistered key and one signing with another member's trader's key each answered Rejected (`NoGrant`, `NotYourAccount`), the log the same length before and after; the regulator's replay verified |
 
