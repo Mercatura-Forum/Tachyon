@@ -31,6 +31,9 @@ module {
   public func statusCode(s : T.Status) : Nat8 { switch (s) { case (#waiting) 1; case (#live) 2; case (#filled) 3; case (#cancelled) 4 } };
   public func statusOf(c : Nat8) : ?T.Status { switch (c) { case 1 ?#waiting; case 2 ?#live; case 3 ?#filled; case 4 ?#cancelled; case _ null } };
 
+  public func phaseCode(p : T.Phase) : Nat8 { switch (p) { case (#closed) 1; case (#continuous) 2; case (#auction) 3; case (#closingAuction) 4; case (#tradeAtClose) 5; case (#halted) 6 } };
+  public func phaseOf(c : Nat8) : ?T.Phase { switch (c) { case 1 ?#closed; case 2 ?#continuous; case 3 ?#auction; case 4 ?#closingAuction; case 5 ?#tradeAtClose; case 6 ?#halted; case _ null } };
+
   func writeBands(w : C.Writer, bs : [T.Band]) { w.len16(bs.size()); for (b in bs.vals()) { w.nat(b.fromPrice); w.nat(b.tick) } };
   func readBands(r : C.Reader) : ?[T.Band] {
     let ?n = r.len16() else return null;
@@ -42,14 +45,17 @@ module {
 
   func writeV1(w : C.Writer, c : T.Command) : Bool {
     switch (c) {
-      case (#openInstrument(x)) { w.byte(1); w.nat(x.instrument); w.principal(x.assetLedger); w.principal(x.cashLedger); w.nat(x.lot); w.nat(x.referencePrice); writeBands(w, x.bands); w.nat(x.collarBps) };
+      case (#openInstrument(x)) {
+        w.byte(1); w.nat(x.instrument); w.principal(x.assetLedger); w.principal(x.cashLedger); w.nat(x.lot); w.nat(x.referencePrice); writeBands(w, x.bands); w.nat(x.collarBps);
+        w.nat(x.staticBps); w.nat(x.dynamicBps); w.nat(x.interruptSecs)
+      };
       case (#setTrading(x)) { w.byte(2); w.nat(x.instrument); w.bool(x.open) };
       case (#setReference(x)) { w.byte(3); w.nat(x.instrument); w.nat(x.price) };
       case (#deposit(x)) { w.byte(4); w.nat(x.account); w.principal(x.ledger); w.nat(x.amount); w.blob(x.reference) };
       case (#withdraw(x)) { w.byte(5); w.nat(x.account); w.principal(x.ledger); w.nat(x.amount) };
       case (#placeOrder(x)) {
         w.byte(6); w.nat(x.account); w.nat(x.instrument); w.byte(sideCode(x.side)); w.byte(kindCode(x.kind)); w.nat(x.qty); w.nat(x.price); w.nat(x.stopPrice); w.nat(x.peak);
-        w.byte(validityCode(x.validity)); w.nat(x.gtdDay); w.byte(selfTradeCode(x.selfTrade)); w.byte(capacityCode(x.capacity)); w.bool(x.shortSale); w.text(x.clientRef); w.nat(x.oco); w.nat(x.trail)
+        w.byte(validityCode(x.validity)); w.nat(x.gtdDay); w.byte(selfTradeCode(x.selfTrade)); w.byte(capacityCode(x.capacity)); w.bool(x.shortSale); w.text(x.clientRef); w.nat(x.oco); w.nat(x.trail); w.nat(x.member); w.nat(x.trader)
       };
       case (#cancelOrder(x)) { w.byte(7); w.nat(x.order) };
       case (#amendOrder(x)) { w.byte(8); w.nat(x.order); w.nat(x.qty); w.nat(x.price) };
@@ -58,6 +64,14 @@ module {
       case (#endOfDay(x)) { w.byte(11); w.nat(x.limit) };
       case (#expireGtd(x)) { w.byte(12); w.nat(x.day); w.nat(x.limit) };
       case (#clear(x)) { w.byte(13); w.nat64(x.time) };
+      case (#setPhase(x)) { w.byte(14); w.nat(x.instrument); w.byte(phaseCode(x.phase)); w.nat64(x.endFrom); w.nat64(x.endTo) };
+      case (#uncross(x)) { w.byte(15); w.nat(x.instrument); w.byte(phaseCode(x.next)) };
+      case (#halt(x)) { w.byte(16); w.nat(x.instrument); w.text(x.reason) };
+      case (#resume(x)) { w.byte(17); w.nat(x.instrument) };
+      case (#kill(x)) { w.byte(18); w.nat(x.member); w.nat(x.trader); w.text(x.reason) };
+      case (#killSweep(x)) { w.byte(19); w.nat(x.kill); w.nat(x.limit) };
+      case (#revive(x)) { w.byte(20); w.nat(x.kill) };
+      case (#setLimits(x)) { w.byte(21); w.nat(x.member); w.nat(x.maxOrderQty); w.nat(x.maxOrderValue); w.nat(x.creditLimit) };
     };
     true
   };
@@ -67,7 +81,8 @@ module {
       case 1 {
         let ?instrument = r.nat() else return null; let ?assetLedger = r.principal() else return null; let ?cashLedger = r.principal() else return null;
         let ?lot = r.nat() else return null; let ?referencePrice = r.nat() else return null; let ?bands = readBands(r) else return null; let ?collarBps = r.nat() else return null;
-        ?#openInstrument({ instrument; assetLedger; cashLedger; lot; referencePrice; bands; collarBps })
+        let ?staticBps = r.nat() else return null; let ?dynamicBps = r.nat() else return null; let ?interruptSecs = r.nat() else return null;
+        ?#openInstrument({ instrument; assetLedger; cashLedger; lot; referencePrice; bands; collarBps; staticBps; dynamicBps; interruptSecs })
       };
       case 2 { let ?instrument = r.nat() else return null; let ?open = r.bool() else return null; ?#setTrading({ instrument; open }) };
       case 3 { let ?instrument = r.nat() else return null; let ?price = r.nat() else return null; ?#setReference({ instrument; price }) };
@@ -80,7 +95,8 @@ module {
         let ?gtdDay = r.nat() else return null; let ?tc = r.byte() else return null; let ?selfTrade = selfTradeOf(tc) else return null;
         let ?cc = r.byte() else return null; let ?capacity = capacityOf(cc) else return null; let ?shortSale = r.bool() else return null;
         let ?clientRef = r.text() else return null; let ?oco = r.nat() else return null; let ?trail = r.nat() else return null;
-        ?#placeOrder({ account; instrument; side; kind; qty; price; stopPrice; peak; validity; gtdDay; selfTrade; capacity; shortSale; clientRef; oco; trail })
+        let ?member = r.nat() else return null; let ?trader = r.nat() else return null;
+        ?#placeOrder({ account; instrument; side; kind; qty; price; stopPrice; peak; validity; gtdDay; selfTrade; capacity; shortSale; clientRef; oco; trail; member; trader })
       };
       case 7 { let ?order = r.nat() else return null; ?#cancelOrder({ order }) };
       case 8 { let ?order = r.nat() else return null; let ?qty = r.nat() else return null; let ?price = r.nat() else return null; ?#amendOrder({ order; qty; price }) };
@@ -89,18 +105,29 @@ module {
       case 11 { let ?limit = r.nat() else return null; ?#endOfDay({ limit }) };
       case 12 { let ?day = r.nat() else return null; let ?limit = r.nat() else return null; ?#expireGtd({ day; limit }) };
       case 13 { let ?time = r.nat64() else return null; ?#clear({ time }) };
+      case 14 { let ?instrument = r.nat() else return null; let ?pc = r.byte() else return null; let ?phase = phaseOf(pc) else return null; let ?endFrom = r.nat64() else return null; let ?endTo = r.nat64() else return null; ?#setPhase({ instrument; phase; endFrom; endTo }) };
+      case 15 { let ?instrument = r.nat() else return null; let ?pc = r.byte() else return null; let ?next = phaseOf(pc) else return null; ?#uncross({ instrument; next }) };
+      case 16 { let ?instrument = r.nat() else return null; let ?reason = r.text() else return null; ?#halt({ instrument; reason }) };
+      case 17 { let ?instrument = r.nat() else return null; ?#resume({ instrument }) };
+      case 18 { let ?member = r.nat() else return null; let ?trader = r.nat() else return null; let ?reason = r.text() else return null; ?#kill({ member; trader; reason }) };
+      case 19 { let ?kill = r.nat() else return null; let ?limit = r.nat() else return null; ?#killSweep({ kill; limit }) };
+      case 20 { let ?kill = r.nat() else return null; ?#revive({ kill }) };
+      case 21 { let ?member = r.nat() else return null; let ?maxOrderQty = r.nat() else return null; let ?maxOrderValue = r.nat() else return null; let ?creditLimit = r.nat() else return null; ?#setLimits({ member; maxOrderQty; maxOrderValue; creditLimit }) };
       case _ null;
     }
   };
 
   public let registry : E.Registry<T.Command> = { domainPrefix = "tachyon-book-command"; current = 1; encoders = [{ version = 1; write = writeV1; read = readV1 }] };
 
-  public let families : [Text] = ["openInstrument", "setTrading", "setReference", "deposit", "withdraw", "placeOrder", "cancelOrder", "amendOrder", "massCancel", "flush", "endOfDay", "expireGtd", "clear"];
+  public let families : [Text] = ["openInstrument", "setTrading", "setReference", "deposit", "withdraw", "placeOrder", "cancelOrder", "amendOrder", "massCancel", "flush", "endOfDay", "expireGtd", "clear",
+    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
       case (#withdraw(_)) "withdraw"; case (#placeOrder(_)) "placeOrder"; case (#cancelOrder(_)) "cancelOrder"; case (#amendOrder(_)) "amendOrder";
       case (#massCancel(_)) "massCancel"; case (#flush) "flush"; case (#endOfDay(_)) "endOfDay"; case (#expireGtd(_)) "expireGtd"; case (#clear(_)) "clear";
+      case (#setPhase(_)) "setPhase"; case (#uncross(_)) "uncross"; case (#halt(_)) "halt"; case (#resume(_)) "resume"; case (#kill(_)) "kill"; case (#killSweep(_)) "killSweep";
+      case (#revive(_)) "revive"; case (#setLimits(_)) "setLimits";
     }
   };
 

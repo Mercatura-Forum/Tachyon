@@ -148,9 +148,50 @@ module {
     })
   };
 
-  func once(bids : [Bid], asks : [Bid], lot : Nat) : (?Nat, Nat, Map.Map<T.OrderId, Nat>) {
+  /// A band around `r` of `b` basis points (SPEC §10): ⌈r(10,000 − b)/10,000⌉ to ⌊r(10,000 + b)/10,000⌋.
+  public func band(r : Nat, b : Nat) : (Nat, Nat) {
+    let lowNum = r * (if (b >= 10_000) 0 else (10_000 - b : Nat));
+    ((lowNum + 9_999) / 10_000, r * (10_000 + b) / 10_000)
+  };
+  public func within(p : Nat, r : Nat, b : Nat) : Bool { let (lo, hi) = band(r, b); p >= lo and p <= hi };
+
+  /// SPEC §9: the uncross price. Among the orders' prices, the most executable volume; then the least surplus; then, if
+  /// every remaining price has more demand, the highest, if every one has more supply, the lowest; otherwise the
+  /// reference if it lies in the range (with surpluses on both sides, from the highest price with a buy surplus to the
+  /// lowest with a sell surplus; with none, the whole remaining range), else the nearer end.
+  public func uncrossPrice(bids : [Bid], asks : [Bid], reference : Nat) : ?Nat {
+    var bestEx = 0;
+    let cand = List.empty<(Nat, Nat, Int)>();   // (price, |surplus|, demand − supply)
+    func consider(p : Nat) {
+      let d = demand(bids, p); let s = supply(asks, p);
+      let ex = Nat.min(d, s);
+      if (ex == 0 or ex < bestEx) return;
+      if (ex > bestEx) { bestEx := ex; List.clear(cand) };
+      if (List.find<(Nat, Nat, Int)>(cand, func(c) { c.0 == p }) == null) List.add(cand, (p, if (d > s) d - s else s - d, (d : Int) - s));
+    };
+    for (b in bids.vals()) consider(b.price);
+    for (a in asks.vals()) consider(a.price);
+    if (List.size(cand) == 0) return null;
+    var least = List.toArray(cand)[0].1;
+    for (c in List.values(cand)) { if (c.1 < least) least := c.1 };
+    let rest = Array.filter<(Nat, Nat, Int)>(List.toArray(cand), func(c) { c.1 == least });
+    var lo = rest[0].0; var hi = rest[0].0;
+    for (c in rest.vals()) { if (c.0 < lo) lo := c.0; if (c.0 > hi) hi := c.0 };
+    if (rest.size() == 1) return ?rest[0].0;
+    if (Array.all<(Nat, Nat, Int)>(rest, func(c) { c.2 > 0 })) return ?hi;
+    if (Array.all<(Nat, Nat, Int)>(rest, func(c) { c.2 < 0 })) return ?lo;
+    if (least > 0) {
+      // surpluses on both sides: the highest price with a buy surplus and the lowest with a sell surplus bound the range
+      var buyTop = 0; var sellBottom = hi;
+      for (c in rest.vals()) { if (c.2 > 0 and c.0 > buyTop) buyTop := c.0; if (c.2 < 0 and c.0 < sellBottom) sellBottom := c.0 };
+      lo := buyTop; hi := sellBottom;
+    };
+    ?(if (reference >= lo and reference <= hi) reference else if (reference < lo) lo else hi)
+  };
+
+  func once(bids : [Bid], asks : [Bid], lot : Nat, pricer : ([Bid], [Bid]) -> ?Nat) : (?Nat, Nat, Map.Map<T.OrderId, Nat>) {
     let fills = Map.empty<T.OrderId, Nat>();
-    switch (clearingPrice(bids, asks)) {
+    switch (pricer(bids, asks)) {
       case null (null, 0, fills);
       case (?p) {
         let eb = Array.filter<Bid>(bids, func(b) { b.price >= p });
@@ -171,11 +212,26 @@ module {
   };
 
   /// One instrument's auction over its live orders (§3), with the fill-or-kill fixpoint (§3.4).
-  public func auction(bids0 : [Bid], asks0 : [Bid], lot : Nat) : Result {
+  public func auction(bids0 : [Bid], asks0 : [Bid], lot : Nat) : Result { auctionWith(bids0, asks0, lot, clearingPrice) };
+  /// The uncross (§9): the same allocation and pairs at the uncross price.
+  public func uncross(bids0 : [Bid], asks0 : [Bid], lot : Nat, reference : Nat) : Result {
+    auctionWith(bids0, asks0, lot, func(b : [Bid], a : [Bid]) : ?Nat { uncrossPrice(b, a, reference) })
+  };
+  /// SPEC §9: the indicative auction price: the price and volume an uncross of these orders would trade, and the
+  /// surplus at that price (demand − supply: above zero a buy surplus, below a sell surplus); null when nothing crosses.
+  public func indicative(bids : [Bid], asks : [Bid], lot : Nat, reference : Nat) : ?(Nat, Nat, Int) {
+    let r = uncross(bids, asks, lot, reference);
+    switch (r.price) { case (?p) ?(p, r.volume, (demand(bids, p) : Int) - supply(asks, p)); case null null }
+  };
+  /// Trading at a fixed price (trade at close, §8): the eligible orders at `price`, if both sides have any.
+  public func auctionAt(bids0 : [Bid], asks0 : [Bid], lot : Nat, price : Nat) : Result {
+    auctionWith(bids0, asks0, lot, func(b : [Bid], a : [Bid]) : ?Nat { if (Nat.min(demand(b, price), supply(a, price)) > 0) ?price else null })
+  };
+  func auctionWith(bids0 : [Bid], asks0 : [Bid], lot : Nat, pricer : ([Bid], [Bid]) -> ?Nat) : Result {
     var bids = bids0; var asks = asks0;
     let killed = List.empty<T.OrderId>();
     loop {
-      let (p, v, fills) = once(bids, asks, lot);
+      let (p, v, fills) = once(bids, asks, lot, pricer);
       // a fill-or-kill order that does not fill entirely: remove the latest-priority one (greatest key on a tie)
       var victim : ?Bid = null;
       for (o in Array.concat(bids, asks).vals()) {

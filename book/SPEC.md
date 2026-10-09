@@ -126,10 +126,85 @@ the batch it is made in, a smaller quantity at the same price keeps the order's 
 A market order's price is its collar price: for a buy the highest price on the tick at or below the reference price ×
 (1 + collar), for a sell the lowest price on the tick at or above the reference price × (1 − collar); it holds and
 trades as immediate-or-cancel at that price. The collar is the instrument's, in basis points, recorded when the book
-opens the instrument. Every refusal leaves every row, counter and the log
+opens the instrument, within its static band (§10). Every refusal leaves every row, counter and the log
 unmoved, once the due clear (§1) is recorded.
 
 ## 7. What is recorded
 
 Every order, cancel, amend, deposit, withdrawal and clear is a block of the book's log. A clear records its price and
 its pairs. The book's state is the fold of the log; a replay reproduces every row.
+
+## 8. Phases
+
+Each instrument is in one phase: **closed**, **continuous**, **auction** (a call: the opening auction, a volatility
+interruption, the resumption after a halt), **closing auction**, **trade at close**, or **halted**. The scheduler moves an
+instrument between the scheduled phases (closed, continuous, auction, closing auction, trade at close) with `setPhase`,
+from its segment's schedule; `setTrading` remains as continuous (open) and closed. A phase it is already in is refused.
+A halt and a resumption are acts under four eyes (§11); a halted instrument takes no `setPhase`.
+
+- **Continuous:** §1 to §7.
+- **Closed:** no clear trades; a batch's immediate orders are cancelled at its clear (§5).
+- **Auction and closing auction (call phases):** orders are accepted and wait; nothing trades until the uncross; market
+  orders wait at their collar price; immediate-or-cancel and fill-or-kill orders are refused (they cannot wait); stops
+  do not trigger (no trade sets a price).
+- **Trade at close:** each batch trades at the closing price only: buys at or above it, sells at or below it, the volume
+  the lesser of the two, allocated as §3.2 at that price; the batch's immediate orders end with its clear.
+- **Halted:** no order is accepted and none amended (cancels are); no clear trades; a batch's immediate orders are
+  cancelled at its clear.
+
+The scheduler opens an auction with an optional random end window (`endFrom`, `endTo`): its uncross is refused before
+`endFrom`. The moment within the window is drawn by the venue from the chain's randomness in the block that ends the
+auction, after every order it admits; the book records the uncross with its block like any act.
+
+## 9. The uncross
+
+`uncross` (the scheduler's, or the venue's at the drawn end) is accepted only in a call phase, not before its window's
+start or the end of an interruption (§10). It computes the auction over every live order of the instrument at one price:
+
+1. the price, among the live orders' prices, that maximises the executable volume min(demand, supply);
+2. among those, the least surplus |demand − supply|;
+3. if every remaining price has more demand than supply, the highest; if every one has more supply than demand, the
+   lowest;
+4. otherwise the reference, the last trade's price (the reference price if the instrument has not traded), against a
+   range: with surpluses on both sides, from the highest remaining price with more demand to the lowest remaining price
+   with more supply; with no surplus at any remaining price, from the lowest to the highest of them. The reference if it
+   lies in the range, else the nearer end.
+
+The allocation and the pairs are §3.2 and §3.3 at that price. Market orders left unexecuted are cancelled. The price
+becomes the last price; an uncross in the closing auction sets the closing price (the last price if nothing traded).
+Trailing stops follow it (§2) and stops it reaches are due. The instrument moves to the phase the uncross names
+(continuous, trade at close or closed); the window and the interruption are cleared. An uncross whose price lies outside
+the static band (§10) trades nothing and the auction continues.
+
+## 10. Price bands, volatility interruptions, circuit breakers
+
+An instrument carries a **static band** (`staticBps`) around its reference price and a **dynamic band** (`dynamicBps`,
+0 for none) around its last price (the reference price before its first trade), with an interruption length
+(`interruptSecs`). A band around r of b basis points runs from ⌈r × (10,000 − b) / 10,000⌉ to ⌊r × (10,000 + b) /
+10,000⌋. The market collar lies within the static band (`collarBps` ≤ `staticBps`).
+
+- **At entry:** a limit price (of a limit, immediate-or-cancel, fill-or-kill or stop-limit order) or an amended price
+  outside the static band is refused.
+- **At a continuous clear:** a batch whose price lies outside either band trades nothing; the instrument enters a
+  **volatility interruption**: an auction whose uncross is refused until `interruptSecs` after the clear's time. The
+  clear records the interruption.
+- The EGX's 10% move halting a share for ten minutes is the dynamic band at 1,000 basis points with an interruption of
+  600 seconds; its daily limit is the static band.
+
+## 11. Halts, the kill switch, risk limits
+
+- **Halt and resume** (four eyes, with a reason): a halt takes the instrument to halted from any phase; a resumption
+  takes it to an auction (no window), uncrossed by the scheduler.
+- **Kill switch:** the operator, or a trader of the member, kills a member or one trader of it: from that act no order
+  of the target is accepted or amended. `killSweep` cancels its open orders, up to 500 an act, in order number order,
+  until none is left. The block holds until a `revive` under four eyes, refused while any order of the target is open.
+  Every order records its member and the trader that entered it (both checked against the exchange's rows at entry).
+- **Risk limits per member** (four eyes): a maximum order quantity, a maximum order value and a credit limit (0 for
+  none). A member's **use** is the value (price × remaining quantity) of its open orders, live or waiting, kept exact
+  as orders change. An order whose quantity, value, or value added to the use exceeds a limit is refused; an amendment
+  is judged on its new value in place of the old.
+
+## 12. The first day
+
+An instrument opens in the book with the exchange's reference price for it (the offering's hand-off): an opening that
+names another is refused, so its first auction's reference and bands are the hand-off's.

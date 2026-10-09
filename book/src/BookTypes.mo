@@ -28,6 +28,9 @@ module {
   /// `#waiting`: a stop not yet triggered. `#live`: in the book (or in the batch about to clear).
   public type Status = { #waiting; #live; #filled; #cancelled };
   public type Band = { fromPrice : Nat; tick : Nat };
+  /// An instrument's phase in the book (SPEC §8). `#auction` is a call: the opening auction, a volatility
+  /// interruption or the resumption after a halt.
+  public type Phase = { #closed; #continuous; #auction; #closingAuction; #tradeAtClose; #halted };
 
   public type Order = {
     account : AccountId;
@@ -51,6 +54,9 @@ module {
     oco : OrderId;
     /// A trailing stop's distance from the last clear's price; 0 for every other order.
     trail : Nat;
+    /// The member whose account it is and the trader that entered it (the exchange's ids, checked at entry).
+    member : Nat;
+    trader : Nat;
     /// The batch (a block's time) its priority dates from: entry, trigger or an iceberg's last refresh.
     prio : Nat64;
     /// SHA-256 of account, side, price, quantity and client reference: the tie-break no arrival order can change.
@@ -69,15 +75,30 @@ module {
     referencePrice : Nat;
     bands : [Band];
     collarBps : Nat;
-    open : Bool;
+    phase : Phase;
     lastPrice : Nat;   // 0 before the first clear that crossed
+    /// The static band around the reference price and the dynamic band around the last price, in basis points
+    /// (dynamic 0 for none), and the length of a volatility interruption (SPEC §10).
+    staticBps : Nat;
+    dynamicBps : Nat;
+    interruptSecs : Nat;
+    /// A call phase's random end window and an interruption's end, chain times (0 for none); the closing price.
+    endFrom : Nat64;
+    endTo : Nat64;
+    interruptUntil : Nat64;
+    closePrice : Nat;
   };
+  /// A kill switch (SPEC §11): a member, or one trader (the other 0); active until revived.
+  public type Kill = { member : Nat; trader : Nat; active : Bool };
+  /// A member's risk limits (0 for none) and its use: the value of its open orders (SPEC §11).
+  public type Limits = { maxOrderQty : Nat; maxOrderValue : Nat; creditLimit : Nat; used : Nat };
 
   public type Balance = { account : AccountId; ledger : Principal; available : Nat; held : Nat };
 
   // ─── the commands, in the frozen family order (a family's tag is its position; append only) ───────────────────
   public type Command = {
-    #openInstrument : { instrument : InstrumentId; assetLedger : Principal; cashLedger : Principal; lot : Nat; referencePrice : Nat; bands : [Band]; collarBps : Nat };
+    #openInstrument : { instrument : InstrumentId; assetLedger : Principal; cashLedger : Principal; lot : Nat; referencePrice : Nat; bands : [Band]; collarBps : Nat;
+      staticBps : Nat; dynamicBps : Nat; interruptSecs : Nat };
     #setTrading : { instrument : InstrumentId; open : Bool };
     #setReference : { instrument : InstrumentId; price : Nat };
     /// The depository's attestation that `amount` reached the venue's account on `ledger` for `account`, by the
@@ -87,6 +108,7 @@ module {
     #placeOrder : {
       account : AccountId; instrument : InstrumentId; side : Side; kind : Kind; qty : Nat; price : Nat; stopPrice : Nat; peak : Nat;
       validity : Validity; gtdDay : Day; selfTrade : SelfTrade; capacity : Capacity; shortSale : Bool; clientRef : Text; oco : OrderId; trail : Nat;
+      member : Nat; trader : Nat;
     };
     #cancelOrder : { order : OrderId };
     #amendOrder : { order : OrderId; qty : Nat; price : Nat };
@@ -97,6 +119,15 @@ module {
     #expireGtd : { day : Day; limit : Nat };
     /// The clear of the batch of `time`: recorded by the book itself (no principal submits it).
     #clear : { time : Nat64 };
+    // phases, auctions, halts, the kill switch, risk limits (SPEC §8 to §11)
+    #setPhase : { instrument : InstrumentId; phase : Phase; endFrom : Nat64; endTo : Nat64 };
+    #uncross : { instrument : InstrumentId; next : Phase };
+    #halt : { instrument : InstrumentId; reason : Text };
+    #resume : { instrument : InstrumentId };
+    #kill : { member : Nat; trader : Nat; reason : Text };
+    #killSweep : { kill : Nat; limit : Nat };
+    #revive : { kill : Nat };
+    #setLimits : { member : Nat; maxOrderQty : Nat; maxOrderValue : Nat; creditLimit : Nat };
   };
 
   /// Effects: a flat list of numbers, the family tag first (`BookCore.apply` gives each family's layout).
@@ -126,5 +157,13 @@ module {
     #NothingToClear;
     #NotTheChainsDay : { day : Day };
     #ClearNotSubmittable;
+    #InstrumentHalted : { instrument : InstrumentId };
+    #PriceOutsideBand : { price : Nat; low : Nat; high : Nat };
+    #NotInAuction : { instrument : InstrumentId };
+    #AuctionNotEnded : { until : Nat64 };
+    #Killed : { kill : Nat };
+    #UnknownKill : { kill : Nat };
+    #OrdersStillOpen : { kill : Nat };
+    #RiskLimit : { figure : Text; limit : Nat; wanted : Nat };
   };
 };
