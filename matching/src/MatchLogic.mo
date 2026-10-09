@@ -235,6 +235,43 @@ module {
     };
   };
 
+  // ── Self-trade prevention (AU-03) ────────────────────────────────────────────────────────────
+  // Cancel-incoming: an incoming order is refused when
+  // it would cross a live order of the same owner on the other side, so no window ever holds two orders of one
+  // owner that can fill each other. `ownBestOpposite` is the owner's best live opposite limit: for an incoming buy
+  // the lowest live sell, for an incoming sell the highest live buy; null when the owner has none.
+  public func crossesOwn(side : T.Side, limitPrice : Nat, ownBestOpposite : ?Nat) : Bool {
+    switch (ownBestOpposite) {
+      case null false;
+      case (?opp) switch (side) { case (#buy) limitPrice >= opp; case (#sell) limitPrice <= opp };
+    }
+  };
+
+  // ── The lot rule (AU-08) ─────────────────────────────────────────────────────────────────────
+  // The core refuses a settlement whose asset amount does not exceed the asset ledger's fee or whose cash amount does
+  // not exceed the cash ledger's fee. Every quantity a whole number of lots keeps every fill a whole number of lots
+  // (a fill is the least of two remainders and the volume left, all multiples of the lot), so a lot above the asset
+  // fee makes every fill's asset amount settleable; and a clearing price is always one of the window's limit prices,
+  // so every limit price times the lot above the cash fee makes every fill's cash amount settleable.
+  public func lotRefusal(qty : Nat, limitPrice : Nat, lot : Nat, assetFee : Nat, cashFee : Nat) : ?Text {
+    if (lot == 0) return ?"the lot size is not configured";
+    if (lot <= assetFee) return ?"the lot does not exceed the asset ledger fee";
+    if (qty % lot != 0) return ?("the quantity is not a whole number of lots of " # Nat.toText(lot));
+    if (limitPrice * lot <= cashFee) return ?"the price of one lot does not exceed the cash ledger fee";
+    null
+  };
+
+  // ── A bid's reservation, released exactly (AU-02) ────────────────────────────────────────────────
+  // A bid reserves limit × quantity plus one cash fee. A fill of `fill` releases limit × fill; the step that leaves
+  // nothing to fill (the last fill, a cancel, a kill) releases everything still reserved, the fee included. Returns
+  // (released now, still reserved). Over any life of fills ending in a terminal step the releases sum to the
+  // reservation exactly.
+  public func bidRelease(stillReserved : Nat, limitPrice : Nat, fill : Nat, remainingAfter : Nat) : (Nat, Nat) {
+    if (remainingAfter == 0) return (stillReserved, 0);
+    let r = Nat.min(limitPrice * fill, stillReserved);
+    (r, stillReserved - r)
+  };
+
   // ── Conservation predicate (M4) ────────────────────────────────────────────────────────────
   // Across a fill schedule at uniform price p*: total shares moved == Σ qty == V, and total cash
   // moved == V·p*. Per buyer/seller the share and cash legs net exactly (q shares ⇄ q·p* cash).
