@@ -96,12 +96,14 @@ module {
       // halted in this block
       case (#tripBreaker(_)) { w.byte(12); w.nat(e[1]); w.nat(e[2]); w.byte(Nat8.fromNat(e[3])); list(w, slice(e, 5, e[4])) };
       // private: funds, kills, limits, insider lists, securities loans, clearing members' terms, margins and obligations,
-      // fee schedules, statements, reconciliations, makers' registrations and periods
+      // fee schedules, statements, reconciliations, makers' registrations and periods, an instrument's class terms, funds'
+      // baskets, receipts, retirements, exercises and value dates (an iNAV and a bond's terms are read through the venue)
       case (#deposit(_) or #withdraw(_) or #flush or #kill(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #borrow(_) or #returnBorrow(_)
         or #setClearing(_) or #setMargin(_) or #admitClearing(_) or #designateClearing(_) or #postCollateral(_) or #withdrawCollateral(_) or #cutCycle(_)
         or #settleCycle(_) or #callFund or #contributeFund(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_)
         or #setFeeSchedule(_) or #sealStatements(_) or #reconcileMember(_) or #registerMaker(_) or #settleMakers(_)
-        or #defineIndex(_) or #reviewIndex(_) or #corporateAction(_)) w.byte(0);
+        or #defineIndex(_) or #reviewIndex(_) or #corporateAction(_)
+        or #setTerms(_) or #defineNav(_) or #issueReceipt(_) or #cancelReceipt(_) or #retire(_) or #exercise(_) or #valueDate(_)) w.byte(0);
     }
   };
 

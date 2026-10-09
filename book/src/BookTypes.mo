@@ -184,6 +184,23 @@ module {
     #corporateAction : { instrument : InstrumentId; action : Action; reference : Blob };
     /// The market-wide breaker (§27): the book's own act, in the block straight after the one that moved an index.
     #tripBreaker : { index : Nat };
+    /// An instrument's class terms (SPEC §28; four eyes, the instrument closed with no open order): a bond's coupon and
+    /// day count, a receipt's licensed warehouses, a certificate's registry, a right's subscription.
+    #setTerms : { instrument : InstrumentId; terms : Terms };
+    /// A fund's indicative net asset value (§29; four eyes): the units of a creation, its cash and its basket.
+    #defineNav : { instrument : InstrumentId; units : Nat; cash : Nat; basket : [Constituent] };
+    /// A warehouse receipt (§30; four eyes): issued by a licensed warehouse to an account for a quantity of the graded
+    /// commodity the instrument is, naming the warehouse's document by its hash; cancelled when the goods leave, out of
+    /// the account presenting it.
+    #issueReceipt : { warehouse : Nat; instrument : InstrumentId; account : AccountId; member : Nat; qty : Nat; reference : Blob };
+    #cancelReceipt : { receipt : Nat; account : AccountId; member : Nat };
+    /// A certificate's retirement by its holder (§31): the units leave circulation for the beneficiary the hash names.
+    #retire : { account : AccountId; member : Nat; trader : Nat; instrument : InstrumentId; qty : Nat; beneficiary : Blob };
+    /// A right's exercise by its holder (§32): the subscription paid to the issuer, the entitlement recorded.
+    #exercise : { account : AccountId; member : Nat; trader : Nat; instrument : InstrumentId; qty : Nat };
+    /// A bond's value date for the market day (§28): the day its trades settle and accrue to, the calendar's T+n, recorded
+    /// by the scheduler before the day's first order (the fold reads no calendar).
+    #valueDate : { instrument : InstrumentId; day : Day };
   };
 
   /// A levy of a fee schedule (SPEC §22): its recipient account and its rate in parts per million of a fill's value.
@@ -198,6 +215,20 @@ module {
   /// A corporate action (§26): a split of `num` new for `den` old, or a cash dividend per share.
   public type Action = { #split : { num : Nat; den : Nat }; #dividend : { amount : Nat } };
   public let MAX_INDICES = 8;
+  /// An instrument's class (SPEC §28). A bond's quantity is in units of 100,000 minor units of face and its price in
+  /// thousandths of a percent of face, so price × quantity is its clean value in minor units, as for any instrument.
+  public type Terms = {
+    #bond : { couponBps : Nat; perYear : Nat; basis : DayBasis; maturity : Day; settleDays : Nat };
+    #receipt : { warehouses : [Nat] };
+    #certificate : { registry : Blob };
+    #right : { underlying : InstrumentId; price : Nat; num : Nat; den : Nat; deadline : Day; issuer : AccountId; issuerMember : Nat };
+  };
+  /// A bond's day count (ISO 20022 InterestComputationMethod4Code): A004 ACT/365 fixed, A006 30/360 bond basis, A001
+  /// ACT/ACT ICMA.
+  public type DayBasis = { #act365; #thirty360; #actActIcma };
+  public let BOND_FACE = 100_000;
+  public let MAX_WAREHOUSES = 8;
+  public let MAX_BASKET = 50;
   public let MAX_CONSTITUENTS = 50;
   public let MAX_LEVIES = 4;
   public let MAX_ATTESTED = 64;

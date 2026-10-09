@@ -35,6 +35,42 @@ module {
   public func phaseCode(p : T.Phase) : Nat8 { switch (p) { case (#closed) 1; case (#continuous) 2; case (#auction) 3; case (#closingAuction) 4; case (#tradeAtClose) 5; case (#halted) 6 } };
   public func phaseOf(c : Nat8) : ?T.Phase { switch (c) { case 1 ?#closed; case 2 ?#continuous; case 3 ?#auction; case 4 ?#closingAuction; case 5 ?#tradeAtClose; case 6 ?#halted; case _ null } };
 
+  /// An instrument's terms (SPEC §28): a class byte, then its fields; a day count by its byte (1 ACT/365 fixed, 2 30/360,
+  /// 3 ACT/ACT ICMA).
+  func writeTerms(w : C.Writer, t : T.Terms) {
+    switch (t) {
+      case (#bond(b)) { w.byte(1); w.nat(b.couponBps); w.nat(b.perYear); w.byte(basisCode(b.basis)); w.nat(b.maturity); w.nat(b.settleDays) };
+      case (#receipt(x)) { w.byte(2); w.len16(x.warehouses.size()); for (h in x.warehouses.vals()) w.nat(h) };
+      case (#certificate(x)) { w.byte(3); w.blob(x.registry) };
+      case (#right(x)) { w.byte(4); w.nat(x.underlying); w.nat(x.price); w.nat(x.num); w.nat(x.den); w.nat(x.deadline); w.nat(x.issuer); w.nat(x.issuerMember) };
+    }
+  };
+  public func basisCode(b : T.DayBasis) : Nat8 { switch (b) { case (#act365) 1; case (#thirty360) 2; case (#actActIcma) 3 } };
+  public func basisOf(c : Nat8) : ?T.DayBasis { switch (c) { case 1 ?#act365; case 2 ?#thirty360; case 3 ?#actActIcma; case _ null } };
+  func readTerms(r : C.Reader) : ?T.Terms {
+    let ?k = r.byte() else return null;
+    switch (k) {
+      case 1 {
+        let ?couponBps = r.nat() else return null; let ?perYear = r.nat() else return null; let ?bc = r.byte() else return null;
+        let ?basis = basisOf(bc) else return null; let ?maturity = r.nat() else return null; let ?settleDays = r.nat() else return null;
+        ?#bond({ couponBps; perYear; basis; maturity; settleDays })
+      };
+      case 2 {
+        let ?n = r.len16() else return null;
+        let out = List.empty<Nat>();
+        for (_ in Nat.range(0, n)) { let ?h = r.nat() else return null; List.add(out, h) };
+        ?#receipt({ warehouses = List.toArray(out) })
+      };
+      case 3 { let ?registry = r.blob() else return null; ?#certificate({ registry }) };
+      case 4 {
+        let ?underlying = r.nat() else return null; let ?price = r.nat() else return null; let ?num = r.nat() else return null;
+        let ?den = r.nat() else return null; let ?deadline = r.nat() else return null; let ?issuer = r.nat() else return null;
+        let ?issuerMember = r.nat() else return null;
+        ?#right({ underlying; price; num; den; deadline; issuer; issuerMember })
+      };
+      case _ null;
+    }
+  };
   func writeConstituents(w : C.Writer, cs : [T.Constituent]) { w.len16(cs.size()); for (c in cs.vals()) { w.nat(c.instrument); w.nat(c.shares) } };
   func readConstituents(r : C.Reader) : ?[T.Constituent] {
     let ?n = r.len16() else return null;
@@ -120,6 +156,13 @@ module {
         w.blob(x.reference)
       };
       case (#tripBreaker(x)) { w.byte(51); w.nat(x.index) };
+      case (#setTerms(x)) { w.byte(52); w.nat(x.instrument); writeTerms(w, x.terms) };
+      case (#defineNav(x)) { w.byte(53); w.nat(x.instrument); w.nat(x.units); w.nat(x.cash); writeConstituents(w, x.basket) };
+      case (#issueReceipt(x)) { w.byte(54); w.nat(x.warehouse); w.nat(x.instrument); w.nat(x.account); w.nat(x.member); w.nat(x.qty); w.blob(x.reference) };
+      case (#cancelReceipt(x)) { w.byte(55); w.nat(x.receipt); w.nat(x.account); w.nat(x.member) };
+      case (#retire(x)) { w.byte(56); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.nat(x.instrument); w.nat(x.qty); w.blob(x.beneficiary) };
+      case (#exercise(x)) { w.byte(57); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.nat(x.instrument); w.nat(x.qty) };
+      case (#valueDate(x)) { w.byte(58); w.nat(x.instrument); w.nat(x.day) };
     };
     true
   };
@@ -228,6 +271,29 @@ module {
         ?#corporateAction({ instrument; action; reference })
       };
       case 51 { let ?index = r.nat() else return null; ?#tripBreaker({ index }) };
+      case 52 { let ?instrument = r.nat() else return null; let ?terms = readTerms(r) else return null; ?#setTerms({ instrument; terms }) };
+      case 53 {
+        let ?instrument = r.nat() else return null; let ?units = r.nat() else return null; let ?cash = r.nat() else return null;
+        let ?basket = readConstituents(r) else return null;
+        ?#defineNav({ instrument; units; cash; basket })
+      };
+      case 54 {
+        let ?warehouse = r.nat() else return null; let ?instrument = r.nat() else return null; let ?account = r.nat() else return null;
+        let ?member = r.nat() else return null; let ?qty = r.nat() else return null; let ?reference = r.blob() else return null;
+        ?#issueReceipt({ warehouse; instrument; account; member; qty; reference })
+      };
+      case 55 { let ?receipt = r.nat() else return null; let ?account = r.nat() else return null; let ?member = r.nat() else return null; ?#cancelReceipt({ receipt; account; member }) };
+      case 56 {
+        let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?trader = r.nat() else return null;
+        let ?instrument = r.nat() else return null; let ?qty = r.nat() else return null; let ?beneficiary = r.blob() else return null;
+        ?#retire({ account; member; trader; instrument; qty; beneficiary })
+      };
+      case 57 {
+        let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?trader = r.nat() else return null;
+        let ?instrument = r.nat() else return null; let ?qty = r.nat() else return null;
+        ?#exercise({ account; member; trader; instrument; qty })
+      };
+      case 58 { let ?instrument = r.nat() else return null; let ?day = r.nat() else return null; ?#valueDate({ instrument; day }) };
       case _ null;
     }
   };
@@ -239,7 +305,8 @@ module {
     "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle", "settleCycle", "closeOut", "callFund",
     "contributeFund", "fundSkin", "declareDefault", "closeDefault",
     "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "quote", "massQuote", "settleMakers",
-    "defineIndex", "reviewIndex", "corporateAction", "tripBreaker"];
+    "defineIndex", "reviewIndex", "corporateAction", "tripBreaker",
+    "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "retire", "exercise", "valueDate"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -254,6 +321,8 @@ module {
       case (#setFeeSchedule(_)) "setFeeSchedule"; case (#sealStatements(_)) "sealStatements"; case (#reconcileMember(_)) "reconcileMember";
       case (#registerMaker(_)) "registerMaker"; case (#quote(_)) "quote"; case (#massQuote(_)) "massQuote"; case (#settleMakers(_)) "settleMakers";
       case (#defineIndex(_)) "defineIndex"; case (#reviewIndex(_)) "reviewIndex"; case (#corporateAction(_)) "corporateAction"; case (#tripBreaker(_)) "tripBreaker";
+      case (#setTerms(_)) "setTerms"; case (#defineNav(_)) "defineNav"; case (#issueReceipt(_)) "issueReceipt"; case (#cancelReceipt(_)) "cancelReceipt";
+      case (#retire(_)) "retire"; case (#exercise(_)) "exercise"; case (#valueDate(_)) "valueDate";
     }
   };
 

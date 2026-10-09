@@ -38,6 +38,8 @@ import R "mo:kernel/rows/StableRows";
 import MP "mo:kernel/proof/MmrProof";
 import Cal "mo:kernel/time/Calendar";
 import Rounding "mo:kernel/num/Rounding";
+import CivilDate "mo:kernel/num/CivilDate";
+import DayCount "mo:kernel/num/DayCount";
 
 import X "../../exchange/src/ExchangeCore";
 import XText "../../exchange/src/ExchangeText";
@@ -113,6 +115,13 @@ module {
     Perm.p("book.index.review", "index", #update, #command("reviewIndex"), false, false, true),
     Perm.p("book.action.apply", "instrument", #update, #command("corporateAction"), false, false, true),
     Perm.p("book.breaker.trip", "index", #update, #command("tripBreaker"), false, false, false),
+    Perm.p("book.terms.set", "instrument", #update, #command("setTerms"), false, false, true),
+    Perm.p("book.nav.define", "fund", #create, #command("defineNav"), false, false, true),
+    Perm.p("book.receipt.issue", "receipt", #create, #command("issueReceipt"), false, false, true),
+    Perm.p("book.receipt.cancel", "receipt", #close, #command("cancelReceipt"), false, false, true),
+    Perm.p("book.certificate.retire", "certificate", #close, #command("retire"), false, false, false),
+    Perm.p("book.right.exercise", "right", #update, #command("exercise"), false, false, false),
+    Perm.p("book.bond.valuedate", "instrument", #update, #command("valueDate"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -149,6 +158,9 @@ module {
     ("book.maker.massquote", "a registered maker's trader replaces up to sixteen quotes at once, each as a quote, all or nothing"),
     ("book.maker.settle", "the scheduler closes the makers' period at the day's end; presence and rebates are the fold's, none typed"),
     ("book.breaker.trip", "the market-wide breaker, recorded by the book itself in the block after the one that moved an index; no principal submits it"),
+    ("book.certificate.retire", "a trader of the account's member retires certificates the account holds free; they leave circulation and nothing else moves"),
+    ("book.bond.valuedate", "the scheduler records a bond's value date for the market day, the day the exchange's calendar gives; it moves nothing"),
+    ("book.right.exercise", "a trader of the account's member exercises rights the account holds free by the deadline, paying the subscription from its own cash"),
   ] };
   public let commandNames : [Text] = K.families;
   public let methodNames : [Text] = ["approve", "reject"];
@@ -543,6 +555,107 @@ module {
     decode = func(a : [Nat8]) : PathRow { { index = R.getNat(a, 0, 8); block = R.getNat(a, 8, 8); level = R.getNat(a, 16, 8) } };
     indexes = [];
   };
+  // ── instrument classes (SPEC §28 to §32) ──
+  /// An instrument's class terms, by its instrument id: the class byte, seven figures (a bond's coupon, coupons a year, day
+  /// count, maturity and settlement days; a right's underlying, price, ratio, deadline, issuer and the issuer's member),
+  /// the receipt's licensed warehouses with their count, the certificate's registry hash.
+  public let TERMS_ROW_BYTES = 154;   // class 1, seven figures of 8, a count 1, eight warehouses of 8, a hash 32
+  public let termsRows : RS.Decl<T.Terms> = {
+    table = "terms"; idBytes = 8; rowBytes = TERMS_ROW_BYTES;
+    encode = func(x : T.Terms) : Blob {
+      let b = R.buf();
+      let (k, f, hs, h) : (Nat, [Nat], [Nat], Blob) = switch (x) {
+        case (#bond(t)) (1, [t.couponBps, t.perYear, Nat8.toNat(K.basisCode(t.basis)), t.maturity, t.settleDays, 0, 0], [], zero32());
+        case (#receipt(t)) (2, [0, 0, 0, 0, 0, 0, 0], t.warehouses, zero32());
+        case (#certificate(t)) (3, [0, 0, 0, 0, 0, 0, 0], [], t.registry);
+        case (#right(t)) (4, [t.underlying, t.price, t.num, t.den, t.deadline, t.issuer, t.issuerMember], [], zero32());
+      };
+      R.putNat(b, k, 1); for (v in f.vals()) R.putNat(b, v, 8); R.putNat(b, hs.size(), 1);
+      for (j in Nat.range(0, T.MAX_WAREHOUSES)) R.putNat(b, if (j < hs.size()) hs[j] else 0, 8);
+      R.putBlob(b, h, 32); R.done(b, TERMS_ROW_BYTES)
+    };
+    decode = func(a : [Nat8]) : T.Terms {
+      let f = Array.tabulate<Nat>(7, func(j) { R.getNat(a, 1 + 8 * j, 8) });
+      switch (R.getNat(a, 0, 1)) {
+        case 1 { #bond({ couponBps = f[0]; perYear = f[1]; basis = switch (K.basisOf(Nat8.fromNat(f[2]))) { case (?x) x; case null Runtime.trap("terms: a day count") }; maturity = f[3]; settleDays = f[4] }) };
+        case 2 { #receipt({ warehouses = Array.tabulate<Nat>(R.getNat(a, 57, 1), func(j) { R.getNat(a, 58 + 8 * j, 8) }) }) };
+        case 3 { #certificate({ registry = R.getBlob(a, 122, 32) }) };
+        case _ { #right({ underlying = f[0]; price = f[1]; num = f[2]; den = f[3]; deadline = f[4]; issuer = f[5]; issuerMember = f[6] }) };
+      }
+    };
+    indexes = [];
+  };
+  func zero32() : Blob { Blob.fromArray(Array.tabulate<Nat8>(32, func(_) { 0 })) };
+  /// A fund's indicative value (SPEC §29), by the fund's instrument id: the units of a creation, its cash, and the iNAV a
+  /// unit in minor units.
+  public type NavRow = { units : Nat; cash : Nat; inav : Nat };
+  public let navRows : RS.Decl<NavRow> = {
+    table = "navs"; idBytes = 8; rowBytes = 24;
+    encode = func(x : NavRow) : Blob { let b = R.buf(); for (v in [x.units, x.cash, x.inav].vals()) R.putNat(b, v, 8); R.done(b, 24) };
+    decode = func(a : [Nat8]) : NavRow { { units = R.getNat(a, 0, 8); cash = R.getNat(a, 8, 8); inav = R.getNat(a, 16, 8) } };
+    indexes = [];
+  };
+  /// A fund's basket line: the instrument and its shares in a creation unit.
+  public type BasketRow = { fund : Nat; instrument : Nat; shares : Nat };
+  public let basketRows : RS.Decl<BasketRow> = {
+    table = "baskets"; idBytes = 8; rowBytes = 24;
+    encode = func(x : BasketRow) : Blob { let b = R.buf(); for (v in [x.fund, x.instrument, x.shares].vals()) R.putNat(b, v, 8); R.done(b, 24) };
+    decode = func(a : [Nat8]) : BasketRow { { fund = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); shares = R.getNat(a, 16, 8) } };
+    indexes = [{ name = "byFund"; keyBytes = 16; keyOf = func(_ : Nat, x : BasketRow) : ?Blob { ?R.key2(x.fund, 8, x.instrument, 8) } }];
+  };
+  /// The iNAV's path: every value it took, with the block (as the index's path, §26).
+  public let navPathRows : RS.Decl<PathRow> = {
+    table = "navpath"; idBytes = 8; rowBytes = 24;
+    encode = func(x : PathRow) : Blob { let b = R.buf(); for (v in [x.index, x.block, x.level].vals()) R.putNat(b, v, 8); R.done(b, 24) };
+    decode = func(a : [Nat8]) : PathRow { { index = R.getNat(a, 0, 8); block = R.getNat(a, 8, 8); level = R.getNat(a, 16, 8) } };
+    indexes = [];
+  };
+  /// A warehouse receipt (SPEC §30): the warehouse, the instrument (the graded commodity), the account it was issued to,
+  /// the quantity, whether it is live, the warehouse's document hash.
+  public type Receipt = { warehouse : Nat; instrument : Nat; account : Nat; qty : Nat; live : Bool; reference : Blob };
+  public let RECEIPT_ROW_BYTES = 65;   // four figures of 8, live 1, the document hash 32
+  public let receiptRows : RS.Decl<Receipt> = {
+    table = "receipts"; idBytes = 8; rowBytes = RECEIPT_ROW_BYTES;
+    encode = func(x : Receipt) : Blob { let b = R.buf(); for (v in [x.warehouse, x.instrument, x.account, x.qty].vals()) R.putNat(b, v, 8); R.putBool(b, x.live); R.putBlob(b, x.reference, 32); R.done(b, RECEIPT_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Receipt { { warehouse = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); account = R.getNat(a, 16, 8); qty = R.getNat(a, 24, 8); live = R.getBool(a, 32); reference = R.getBlob(a, 33, 32) } };
+    indexes = [{ name = "byRef"; keyBytes = 32; keyOf = func(_ : Nat, x : Receipt) : ?Blob { ?x.reference } }];
+  };
+  /// A certificate's retirement (SPEC §31): the account, the instrument, the quantity, the beneficiary's hash.
+  public type Retirement = { account : Nat; instrument : Nat; qty : Nat; beneficiary : Blob };
+  public let retireRows : RS.Decl<Retirement> = {
+    table = "retirements"; idBytes = 8; rowBytes = 56;
+    encode = func(x : Retirement) : Blob { let b = R.buf(); for (v in [x.account, x.instrument, x.qty].vals()) R.putNat(b, v, 8); R.putBlob(b, x.beneficiary, 32); R.done(b, 56) };
+    decode = func(a : [Nat8]) : Retirement { { account = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); qty = R.getNat(a, 16, 8); beneficiary = R.getBlob(a, 24, 32) } };
+    indexes = [];
+  };
+  /// A right's exercise (SPEC §32): the account, the right, the rights given up, the new shares it is entitled to, the
+  /// subscription it paid.
+  public type Entitlement = { account : Nat; instrument : Nat; rights : Nat; shares : Nat; paid : Nat };
+  public let entitlementRows : RS.Decl<Entitlement> = {
+    table = "entitlements"; idBytes = 8; rowBytes = 40;
+    encode = func(x : Entitlement) : Blob { let b = R.buf(); for (v in [x.account, x.instrument, x.rights, x.shares, x.paid].vals()) R.putNat(b, v, 8); R.done(b, 40) };
+    decode = func(a : [Nat8]) : Entitlement { { account = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); rights = R.getNat(a, 16, 8); shares = R.getNat(a, 24, 8); paid = R.getNat(a, 32, 8) } };
+    indexes = [];
+  };
+  /// The units of a ledger the book holds (SPEC §28): moved by deposits, withdrawals, loans, receipts, retirements and
+  /// exercises, never by a fill; equal to the sum of the ledger's balances.
+  public type Supply = { ledger : Principal; units : Nat };
+  public let SUPPLY_ROW_BYTES = 38;   // the ledger 30, the units 8
+  public let supplyRows : RS.Decl<Supply> = {
+    table = "supply"; idBytes = 8; rowBytes = SUPPLY_ROW_BYTES;
+    encode = func(x : Supply) : Blob { let b = R.buf(); putPrincipal(b, x.ledger); R.putNat(b, x.units, 8); R.done(b, SUPPLY_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Supply { { ledger = getPrincipal(a, 0); units = R.getNat(a, PRINCIPAL_BYTES, 8) } };
+    indexes = [{ name = "byLedger"; keyBytes = PRINCIPAL_BYTES; keyOf = func(_ : Nat, x : Supply) : ?Blob { ?ledgerKey(x.ledger) } }];
+  };
+  /// A bond's value date, by its instrument id (§28).
+  public type ValueDate = { day : Nat };
+  public let valueDateRows : RS.Decl<ValueDate> = {
+    table = "valuedates"; idBytes = 8; rowBytes = 8;
+    encode = func(x : ValueDate) : Blob { let b = R.buf(); R.putNat(b, x.day, 8); R.done(b, 8) };
+    decode = func(a : [Nat8]) : ValueDate { { day = R.getNat(a, 0, 8) } };
+    indexes = [];
+  };
+  func ledgerKey(p : Principal) : Blob { let b = R.buf(); putPrincipal(b, p); R.done(b, PRINCIPAL_BYTES) };
   public let E18 = 1_000_000_000_000_000_000;
   public let E9 = 1_000_000_000;
   /// A drop-copy row (SPEC §14): a block that concerns a member, and whether it is the member's own act.
@@ -599,6 +712,7 @@ module {
     and 8 + 8 + 1 <= KILL_ROW_BYTES and 8 * 5 == LIMIT_ROW_BYTES
     and 32 <= REF_ROW_BYTES and 1 <= DUE_ROW_BYTES
     and 8 * 4 + 32 + 8 * 2 + 1 == INDEX_ROW_BYTES
+    and 1 + 7 * 8 + 1 + T.MAX_WAREHOUSES * 8 + 32 == TERMS_ROW_BYTES and 8 * 4 + 1 + 32 == RECEIPT_ROW_BYTES and PRINCIPAL_BYTES + 8 == SUPPLY_ROW_BYTES
     and 1 + 4 * (8 + 4) == FEE_ROW_BYTES and 9 * 8 + 2 + 8 * 3 == MAKER_ROW_BYTES
     and 8 * 12 + 1 == CLEARING_ROW_BYTES and 1 + PRINCIPAL_BYTES + 8 * 4 == LEG_ROW_BYTES and 8 + 8 + PRINCIPAL_BYTES + 8 * 6 == TERMS_BYTES
   };
@@ -642,6 +756,11 @@ module {
     /// whose breaker is due (0 none); the time of the last suspension to the close.
     indexStore : RS.Store; constituentStore : RS.Store; var nextConstituent : Nat; pathStore : RS.Store; var nextPath : Nat;
     var pricesMoved : Bool; var breakerDue : Nat; var suspendedAt : Nat64;
+    /// Instrument classes (SPEC §28 to §32): terms by instrument, funds' iNAVs, baskets and path, receipts, retirements,
+    /// entitlements, and every ledger's units in the book.
+    termsStore : RS.Store; navStore : RS.Store; basketStore : RS.Store; var nextBasket : Nat; navPathStore : RS.Store; var nextNavPath : Nat;
+    receiptStore : RS.Store; var nextReceipt : Nat; retireStore : RS.Store; var nextRetire : Nat; entitlementStore : RS.Store; var nextEntitlement : Nat;
+    supplyStore : RS.Store; var nextSupply : Nat; valueDateStore : RS.Store;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -674,6 +793,9 @@ module {
       makerStore = RS.newStore(makerRows); var nextMaker = 1; makerDayStore = RS.newStore(makerDayRows); var nextMakerDay = 1; var lastMakerDay = 0;
       indexStore = RS.newStore(indexRows); constituentStore = RS.newStore(constituentRows); var nextConstituent = 1; pathStore = RS.newStore(pathRows); var nextPath = 1;
       var pricesMoved = false; var breakerDue = 0; var suspendedAt = 0;
+      termsStore = RS.newStore(termsRows); navStore = RS.newStore(navRows); basketStore = RS.newStore(basketRows); var nextBasket = 1; navPathStore = RS.newStore(navPathRows); var nextNavPath = 1;
+      receiptStore = RS.newStore(receiptRows); var nextReceipt = 1; retireStore = RS.newStore(retireRows); var nextRetire = 1; entitlementStore = RS.newStore(entitlementRows); var nextEntitlement = 1;
+      supplyStore = RS.newStore(supplyRows); var nextSupply = 1; valueDateStore = RS.newStore(valueDateRows);
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -846,7 +968,9 @@ module {
   /// most a fill's half-even rounding can take); the value alone without a schedule.
   func buyHold(s : State, i : T.Instrument, inst : Nat, price : Nat, qty : Nat) : Nat {
     let ppm = feePpm(s, inst);
-    if (ppm == 0) price * qty else price * qty + ceilDiv(price * qty * ppm, PPM) + qty / i.lot
+    // a bond's buy also holds the most its fill can accrue (SPEC §28); the fee is on the clean value
+    let bound = accrualBound(s, inst, qty);
+    if (ppm == 0) price * qty + bound else price * qty + ceilDiv(price * qty * ppm, PPM) + qty / i.lot + bound
   };
   func holdNeed(s : State, i : T.Instrument, inst : Nat, side : T.Side, price : Nat, qty : Nat) : Nat {
     switch (side) { case (#buy) buyHold(s, i, inst, price, qty); case (#sell) qty }
@@ -1003,6 +1127,113 @@ module {
   };
   public func pathOf(s : State, id : Nat) : ?PathRow { RS.get(s.pathStore, pathRows, id) };
 
+  // ─── instrument classes (SPEC §28 to §32) ──────────────────────────────────────────────────
+  public func termsOf(s : State, inst : Nat) : ?T.Terms { RS.get(s.termsStore, termsRows, inst) };
+  public type Bond = { couponBps : Nat; perYear : Nat; basis : T.DayBasis; maturity : Nat; settleDays : Nat };
+  func bondOf(s : State, inst : Nat) : ?Bond { switch (termsOf(s, inst)) { case (?#bond(b)) ?b; case (_) null } };
+  public func valueDateOf(s : State, inst : Nat) : Nat { switch (RS.get(s.valueDateStore, valueDateRows, inst)) { case (?v) v.day; case null 0 } };
+  /// The day `months` whole months before (year, month, day), a day past that month's end taken as its last day.
+  func monthsBack(y : Nat, m : Nat, d : Nat, months : Nat) : Nat {
+    let total = y * 12 + (m - 1) - months;
+    let y2 = total / 12; let m2 = total % 12 + 1;
+    switch (CivilDate.fromCivil(y2, m2, Nat.min(d, CivilDate.daysInMonth(y2, m2)))) { case (?x) x; case null Runtime.trap("monthsBack: a civil date") }
+  };
+  /// A bond's coupon dates around `day` (SPEC §28): the last on or before it and the next after it, stepping back from
+  /// the maturity a coupon period at a time. `day` is before the maturity (an order is refused past it).
+  public func couponAround(maturity : Nat, perYear : Nat, day : Nat) : (Nat, Nat) {
+    let (y, m, d) = CivilDate.toCivil(maturity);
+    let step = 12 / perYear;
+    var next = maturity; var k = 1;
+    loop {
+      let c = monthsBack(y, m, d, k * step);
+      if (c <= day) return (c, next);
+      next := c; k += 1;
+    }
+  };
+  /// The interest accrued on `qty` units of a bond for value `day` (SPEC §28): the face × the coupon × the day count's
+  /// fraction from the last coupon date, in one division, half-even. ACT/365 fixed and 30/360 are the kernel's (ISO
+  /// 20022 A004, A006); ACT/ACT ICMA within a period is the days elapsed over the coupons a year × the period's days
+  /// (ICMA Rule 251), composed here because the kernel's A001 fraction is the whole period's.
+  public func accruedOn(b : Bond, qty : Nat, day : Nat) : Nat {
+    let (last, next) = couponAround(b.maturity, b.perYear, day);
+    let (num, den) = switch (b.basis) {
+      case (#act365) { let f = DayCount.fraction(#a004_Act365Fixed, last, day); (f.numerator, f.denominator) };
+      case (#thirty360) { let f = DayCount.fraction(#a006_Thirty360Isda, last, day); (f.numerator, f.denominator) };
+      case (#actActIcma) (day - last, b.perYear * (next - last));
+    };
+    if (num == 0) 0 else halfEvenDiv(T.BOND_FACE * qty * b.couponBps * num, 10_000 * den)
+  };
+  /// The most a fill of `qty` units can accrue whatever its value date (a coupon period's interest under the most a period
+  /// can count: 31 days a month over 360), rounded up: what a buy holds and the CCP commits to beyond the clean value.
+  func accrualBound(s : State, inst : Nat, qty : Nat) : Nat {
+    switch (bondOf(s, inst)) { case (?b) ceilDiv(T.BOND_FACE * qty * b.couponBps * 31 * (12 / b.perYear), 10_000 * 360); case null 0 }
+  };
+  /// An order's value: its clean value and, for a bond, the most it can accrue.
+  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty + accrualBound(s, inst, qty) };
+  /// A ledger's units in the book (SPEC §28), and their change.
+  public func supplyOf(s : State, ledger : Principal) : Nat { switch (one(s.supplyStore, supplyRows, "byLedger", ledgerKey(ledger))) { case (?(_, r)) r.units; case null 0 } };
+  func moveSupply(s : State, ledger : Principal, up : Nat, down : Nat) {
+    switch (one(s.supplyStore, supplyRows, "byLedger", ledgerKey(ledger))) {
+      case (?(id, r)) RS.put(s.supplyStore, supplyRows, id, { r with units = r.units + up - down });
+      case null { let id = s.nextSupply; s.nextSupply += 1; RS.put(s.supplyStore, supplyRows, id, { ledger; units = up - down }) };
+    }
+  };
+  /// Whether an instrument's units exist only by receipts (§30).
+  func isReceipt(s : State, inst : Nat) : Bool { switch (termsOf(s, inst)) { case (?#receipt(_)) true; case (_) false } };
+  /// Whether a ledger is a receipt instrument's units.
+  func receiptLedger(s : State, ledger : Principal) : Bool {
+    for (inst in s.instrumentList.vals()) { switch (instrument(s, inst)) { case (?i) { if (Principal.equal(i.assetLedger, ledger) and isReceipt(s, inst)) return true }; case null {} } };
+    false
+  };
+  /// What refuses an order or a quote on an instrument for its class on market day `today` (§28, §32).
+  func classRefusal(s : State, inst : Nat, today : Nat) : ?T.Error {
+    switch (termsOf(s, inst)) {
+      case (?#bond(b)) {
+        if (today >= b.maturity) return ?#InvalidTerms({ reason = "a bond before its maturity" });
+        let v = valueDateOf(s, inst);
+        if (v == 0 or v < today or v >= b.maturity) return ?#InvalidTerms({ reason = "the bond's value date for the day recorded first" });
+        null
+      };
+      case (?#right(r)) { if (today > r.deadline) ?#InvalidTerms({ reason = "rights past their deadline" }) else null };
+      case (_) null;
+    }
+  };
+  public func navOf(s : State, fund : Nat) : ?NavRow { RS.get(s.navStore, navRows, fund) };
+  public func basketOf(s : State, fund : Nat) : [BasketRow] {
+    let out = List.empty<BasketRow>();
+    var cursor : ?Page.Cursor = null;
+    label pages loop {
+      switch (RS.page(s.basketStore, basketRows, "byFund", R.key2(fund, 8, 0, 8), R.key2(fund, 8, MAXP, 8), cursor, 100)) {
+        case (#ok(p)) { for ((_, r) in p.rows.vals()) List.add(out, r); switch (p.next) { case (?n) cursor := ?n; case null break pages } };
+        case (#err(e)) Runtime.trap("basketOf: " # debug_show(e));
+      };
+    };
+    List.toArray(out)
+  };
+  /// A fund's iNAV a unit (§29): the basket at its marks and the cash over the units of a creation, half-even.
+  func inavOf(s : State, fund : Nat, units : Nat, cash : Nat) : Nat {
+    var m = cash;
+    for (b in basketOf(s, fund).vals()) m += instrumentMark(s, b.instrument) * b.shares;
+    halfEvenDiv(m, units)
+  };
+  /// After an act that moved a price: every fund's iNAV again, a changed one recorded on its path.
+  func recomputeNavs(s : State) {
+    for (fund in s.instrumentList.vals()) {
+      switch (navOf(s, fund)) {
+        case (?n) {
+          let v = inavOf(s, fund, n.units, n.cash);
+          if (v != n.inav) { RS.put(s.navStore, navRows, fund, { n with inav = v }); addNavPath(s, fund, v) };
+        };
+        case null {};
+      };
+    };
+  };
+  func addNavPath(s : State, fund : Nat, v : Nat) { RS.put(s.navPathStore, navPathRows, s.nextNavPath, { index = fund; block = s.applying; level = v }); s.nextNavPath += 1 };
+  public func navPathOf(s : State, id : Nat) : ?PathRow { RS.get(s.navPathStore, navPathRows, id) };
+  public func receiptOf(s : State, id : Nat) : ?Receipt { RS.get(s.receiptStore, receiptRows, id) };
+  public func retirementOf(s : State, id : Nat) : ?Retirement { RS.get(s.retireStore, retireRows, id) };
+  public func entitlementOf(s : State, id : Nat) : ?Entitlement { RS.get(s.entitlementStore, entitlementRows, id) };
+
   // ─── market makers (SPEC §25) ──────────────────────────────────────────────────────────────
   public func makerOf(s : State, member : Nat, inst : Nat) : ?(Nat, Maker) { one(s.makerStore, makerRows, "byKey", R.key2(member, 8, inst, 8)) };
   public func makerDayOf(s : State, id : Nat) : ?MakerDay { RS.get(s.makerDayStore, makerDayRows, id) };
@@ -1058,6 +1289,7 @@ module {
       switch (X.mayTrade(xs, caller, q.instrument)) { case (?e) return ?#MayNotTrade({ code = XText.code(e) }); case null {} };
       let ?i = instrument(s, q.instrument) else return ?#UnknownInstrument({ instrument = q.instrument });
       if (i.phase == #halted) return ?#InstrumentHalted({ instrument = q.instrument });
+      switch (classRefusal(s, q.instrument, X.marketTime(xs, now).0)) { case (?e) return ?e; case null {} };
       if (blackedOut(s, xs, account, q.instrument, now)) return ?#InsiderBlackout({ instrument = q.instrument });
       if (q.qty == 0 or q.qty % i.lot != 0) return ?#NotALot({ qty = q.qty; lot = i.lot });
       let n = Text.encodeUtf8(q.ref).size();
@@ -1074,12 +1306,12 @@ module {
         case true {
           let bh = switch (order(s, mk.bid)) { case (?o) (if (isLiveish(o)) o.held else 0); case null 0 };
           let ah = switch (order(s, mk.ask)) { case (?o) (if (isLiveish(o)) o.held else 0); case null 0 };
-          let ov = (switch (order(s, mk.bid)) { case (?o) openValue(o); case null 0 }) + (switch (order(s, mk.ask)) { case (?o) openValue(o); case null 0 });
+          let ov = (switch (order(s, mk.bid)) { case (?o) openValue(s, o); case null 0 }) + (switch (order(s, mk.ask)) { case (?o) openValue(s, o); case null 0 });
           (bh, ah, ov)
         };
         case false (0, 0, 0);
       };
-      let value = (q.bidPrice + q.askPrice) * q.qty;
+      let value = valueOf(s, q.instrument, q.bidPrice, q.qty) + valueOf(s, q.instrument, q.askPrice, q.qty);
       switch (riskRefusal(s, member, q.qty, value, oldValue)) { case (?e) return ?e; case null {} };
       // the earlier quotes of a mass quote count against the member's credit with this one
       netAdded += value - oldValue;
@@ -1423,6 +1655,7 @@ module {
         if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
         if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
         if (one(s.refRows, refs, "byRef", x.reference) != null) return ?#DuplicateReference;
+        if (receiptLedger(s, x.ledger)) return ?#InvalidTerms({ reason = "a receipt's units come only from its warehouse" });
         null
       };
       case (#withdraw(x)) {
@@ -1432,6 +1665,7 @@ module {
         if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
         let b = balance(s, x.account, x.ledger);
         if (b.available < x.amount) return ?#InsufficientFunds({ ledger = x.ledger; available = b.available; wanted = x.amount });
+        if (receiptLedger(s, x.ledger)) return ?#InvalidTerms({ reason = "a receipt's units leave only by its cancellation" });
         null
       };
       case (#placeOrder(x)) {
@@ -1445,6 +1679,7 @@ module {
         switch (X.mayTrade(xs, caller, x.instrument)) { case (?e) return ?#MayNotTrade({ code = XText.code(e) }); case null {} };
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
         if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });
+        switch (classRefusal(s, x.instrument, X.marketTime(xs, now).0)) { case (?e) return ?e; case null {} };
         switch (killedFor(s, x.member, x.trader)) { case (?k) return ?#Killed({ kill = k }); case null {} };
         if (blackedOut(s, xs, x.account, x.instrument, now)) return ?#InsiderBlackout({ instrument = x.instrument });
         if (x.qty == 0 or x.qty % i.lot != 0) return ?#NotALot({ qty = x.qty; lot = i.lot });
@@ -1493,7 +1728,7 @@ module {
           };
         };
         let price = effectivePrice(i, x.side, x.kind, x.price);
-        switch (riskRefusal(s, x.member, x.qty, price * x.qty, 0)) { case (?e) return ?e; case null {} };
+        switch (riskRefusal(s, x.member, x.qty, valueOf(s, x.instrument, price, x.qty), 0)) { case (?e) return ?e; case null {} };
         let need = holdNeed(s, i, x.instrument, x.side, price, x.qty);
         let ledger = holdingLedger(i, x.side);
         // self-trade prevention (§3.5), judged with the account's own live orders now: cancel-incoming refuses;
@@ -1529,12 +1764,12 @@ module {
           if (o.shortSale) { if (x.price < shortFloor(i)) return ?#ShortSalePrice({ price = x.price; floor = shortFloor(i) }) }
           else if (x.qty > o.remaining) { let free = sellableFree(s, o.account, i, o.instrument); if (x.qty - o.remaining > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty - o.remaining }) };
         };
-        switch (riskRefusal(s, o.member, x.qty, x.price * x.qty, openValue(o))) { case (?e) return ?e; case null {} };
+        switch (riskRefusal(s, o.member, x.qty, valueOf(s, o.instrument, x.price, x.qty), openValue(s, o))) { case (?e) return ?e; case null {} };
         let need = holdNeed(s, i, o.instrument, o.side, x.price, x.qty);
         let ledger = holdingLedger(i, o.side);
         switch (clearingOf(s, o.account)) {
           case null { let b = balance(s, o.account, ledger); if (need > o.held and b.available < need - o.held) return ?#InsufficientFunds({ ledger; available = b.available; wanted = need - o.held }) };
-          case (?m) { switch (clearingRefusal(s, m, i, o.instrument, o.side, o.shortSale, x.price, x.qty, o.held, openValue(o))) { case (?e) return ?e; case null {} } };
+          case (?m) { switch (clearingRefusal(s, m, i, o.instrument, o.side, o.shortSale, x.price, x.qty, o.held, openValue(s, o))) { case (?e) return ?e; case null {} } };
         };
         let crossing = crossingOwn(s, o.account, o.instrument, o.side, x.price, 1);
         if (crossing.size() > 0) return ?#SelfTradePrevented({ resting = crossing[0].0 });
@@ -1629,6 +1864,7 @@ module {
         if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
         if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
         if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (isReceipt(s, x.instrument)) return ?#InvalidTerms({ reason = "a receipt's units come only from its warehouse" });
         if (x.qty == 0) return ?#InvalidTerms({ reason = "a quantity above zero" });
         if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
         if (one(s.refRows, refs, "byRef", x.reference) != null) return ?#DuplicateReference;
@@ -1638,6 +1874,7 @@ module {
         switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
         if (memberOf(xs, x.account) != x.member) return ?#InvalidTerms({ reason = "the account's member" });
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        // kept: a receipt's units are never lent (`borrow` refuses them), so nothing of one is owed and this refuses first
         if (x.qty == 0 or x.qty > owedOf(s, x.account, x.instrument)) return ?#InvalidTerms({ reason = "no more than is owed" });
         let b = balance(s, x.account, i.assetLedger);
         if (b.available < x.qty) return ?#InsufficientFunds({ ledger = i.assetLedger; available = b.available; wanted = x.qty });
@@ -1858,6 +2095,119 @@ module {
         null
       };
       case (#tripBreaker(_)) ?#ClearNotSubmittable;
+      // SPEC §28 to §32
+      case (#setTerms(x)) {
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        if (termsOf(s, x.instrument) != null) return ?#InvalidTerms({ reason = "an instrument's class is set once" });
+        if (i.phase != #closed) return ?#InvalidTerms({ reason = "an instrument closed" });
+        if (openOrder(s, x.instrument)) return ?#InvalidTerms({ reason = "an instrument with no open order" });
+        let today = X.marketTime(xs, now).0;
+        switch (x.terms) {
+          case (#bond(b)) {
+            if (b.couponBps > 10_000) return ?#InvalidTerms({ reason = "a coupon of at most 100 per cent" });
+            if (b.perYear != 1 and b.perYear != 2 and b.perYear != 4 and b.perYear != 12) return ?#InvalidTerms({ reason = "1, 2, 4 or 12 coupons a year" });
+            if (b.maturity <= today or b.maturity > today + 50 * 366) return ?#InvalidTerms({ reason = "a maturity after today, within fifty years" });
+            if (b.settleDays > 5) return ?#InvalidTerms({ reason = "settlement within five business days" });
+          };
+          case (#receipt(r)) {
+            if (r.warehouses.size() == 0 or r.warehouses.size() > T.MAX_WAREHOUSES) return ?#InvalidTerms({ reason = "one to eight licensed warehouses" });
+            for (k in Nat.range(0, r.warehouses.size())) {
+              if (r.warehouses[k] == 0) return ?#InvalidTerms({ reason = "a warehouse numbered above zero" });
+              for (j in Nat.range(0, k)) { if (r.warehouses[j] == r.warehouses[k]) return ?#InvalidTerms({ reason = "a warehouse once" }) };
+            };
+            // the units exist only by receipts: none in the book yet, and a ledger no other instrument uses
+            if (supplyOf(s, i.assetLedger) != 0) return ?#InvalidTerms({ reason = "no unit of the instrument in the book" });
+            for (other in s.instrumentList.vals()) {
+              if (other != x.instrument) { switch (instrument(s, other)) { case (?o) { if (Principal.equal(o.assetLedger, i.assetLedger) or Principal.equal(o.cashLedger, i.assetLedger)) return ?#InvalidTerms({ reason = "a ledger of its own" }) }; case null {} } };
+            };
+          };
+          case (#certificate(c)) { if (c.registry.size() != 32) return ?#InvalidTerms({ reason = "the registry's 32-byte hash" }) };
+          case (#right(r)) {
+            if (r.underlying == x.instrument or instrument(s, r.underlying) == null) return ?#InvalidTerms({ reason = "an underlying instrument the book trades" });
+            if (r.price == 0 or r.num == 0 or r.den == 0) return ?#InvalidTerms({ reason = "a subscription price and ratio above zero" });
+            if (r.deadline < today) return ?#InvalidTerms({ reason = "a deadline not past" });
+            let ?a = X.account(xs, r.issuer) else return ?#UnknownAccount({ account = r.issuer });
+            if (a.status != #open or isCcp(s, r.issuer)) return ?#InvalidTerms({ reason = "the issuer's open account" });
+            if (a.member != r.issuerMember) return ?#InvalidTerms({ reason = "the issuer account's member" });
+          };
+        };
+        null
+      };
+      case (#defineNav(x)) {
+        if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (navOf(s, x.instrument) != null) return ?#InvalidTerms({ reason = "already defined" });
+        if (x.units == 0) return ?#InvalidTerms({ reason = "a creation unit above zero" });
+        if (x.basket.size() == 0 or x.basket.size() > T.MAX_BASKET) return ?#InvalidTerms({ reason = "one to fifty lines" });
+        for (k in Nat.range(0, x.basket.size())) {
+          if (x.basket[k].instrument == x.instrument) return ?#InvalidTerms({ reason = "a fund not in its own basket" });
+          if (instrument(s, x.basket[k].instrument) == null) return ?#UnknownInstrument({ instrument = x.basket[k].instrument });
+          if (x.basket[k].shares == 0) return ?#InvalidTerms({ reason = "shares above zero" });
+          for (j in Nat.range(0, k)) { if (x.basket[j].instrument == x.basket[k].instrument) return ?#InvalidTerms({ reason = "a line once" }) };
+        };
+        null
+      };
+      case (#issueReceipt(x)) {
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        let ws = switch (termsOf(s, x.instrument)) { case (?#receipt(r)) r.warehouses; case (_) return ?#InvalidTerms({ reason = "an instrument of receipts" }) };
+        if (Array.find<Nat>(ws, func(h) { h == x.warehouse }) == null) return ?#InvalidTerms({ reason = "a warehouse licensed for the instrument" });
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (a.status != #open) return ?#AccountClosed({ account = x.account });
+        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
+        if (x.qty == 0 or x.qty % i.lot != 0) return ?#NotALot({ qty = x.qty; lot = i.lot });
+        if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "the warehouse document's 32-byte hash" });
+        if (one(s.receiptStore, receiptRows, "byRef", x.reference) != null) return ?#DuplicateReference;
+        null
+      };
+      case (#cancelReceipt(x)) {
+        let ?r = receiptOf(s, x.receipt) else return ?#InvalidTerms({ reason = "no such receipt" });
+        if (not r.live) return ?#InvalidTerms({ reason = "a live receipt" });
+        let ?i = instrument(s, r.instrument) else return ?#UnknownInstrument({ instrument = r.instrument });   // kept: a receipt names an instrument the book trades
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        let b = balance(s, x.account, i.assetLedger);
+        if (b.available < r.qty) return ?#InsufficientFunds({ ledger = i.assetLedger; available = b.available; wanted = r.qty });
+        null
+      };
+      case (#retire(x)) {
+        switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
+        switch (X.account(xs, x.account), X.traderByPrincipal(xs, caller)) {
+          case (?a, ?(tid, _)) { if (a.member != x.member or tid != x.trader) return ?#NotYourAccount({ account = x.account }) };
+          case (_) return ?#NotYourAccount({ account = x.account });
+        };
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        switch (termsOf(s, x.instrument)) { case (?#certificate(_)) {}; case (_) return ?#InvalidTerms({ reason = "an instrument of certificates" }) };
+        if (x.qty == 0) return ?#InvalidTerms({ reason = "a quantity above zero" });
+        if (x.beneficiary.size() != 32) return ?#InvalidTerms({ reason = "the beneficiary's 32-byte hash" });
+        let b = balance(s, x.account, i.assetLedger);
+        if (b.available < x.qty) return ?#InsufficientFunds({ ledger = i.assetLedger; available = b.available; wanted = x.qty });
+        null
+      };
+      case (#exercise(x)) {
+        switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
+        switch (X.account(xs, x.account), X.traderByPrincipal(xs, caller)) {
+          case (?a, ?(tid, _)) { if (a.member != x.member or tid != x.trader) return ?#NotYourAccount({ account = x.account }) };
+          case (_) return ?#NotYourAccount({ account = x.account });
+        };
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        let r = switch (termsOf(s, x.instrument)) { case (?#right(r)) r; case (_) return ?#InvalidTerms({ reason = "an instrument of rights" }) };
+        if (X.marketTime(xs, now).0 > r.deadline) return ?#InvalidTerms({ reason = "rights past their deadline" });
+        if (x.qty == 0 or x.qty % r.den != 0) return ?#InvalidTerms({ reason = "rights for whole new shares" });
+        if (x.account == r.issuer) return ?#InvalidTerms({ reason = "an account other than the issuer's" });
+        let rb = balance(s, x.account, i.assetLedger);
+        if (rb.available < x.qty) return ?#InsufficientFunds({ ledger = i.assetLedger; available = rb.available; wanted = x.qty });
+        let pay = r.price * (x.qty / r.den) * r.num;
+        let cb = balance(s, x.account, i.cashLedger);
+        if (cb.available < pay) return ?#InsufficientFunds({ ledger = i.cashLedger; available = cb.available; wanted = pay });
+        null
+      };
+      case (#valueDate(x)) {
+        let ?b = bondOf(s, x.instrument) else return ?#InvalidTerms({ reason = "a bond" });
+        let day = settlementDay(xs, X.marketTime(xs, now).0, b.settleDays);
+        if (x.day != day) return ?#InvalidTerms({ reason = "the value date the calendar gives" });
+        if (x.day >= b.maturity) return ?#InvalidTerms({ reason = "a value date before the maturity" });
+        null
+      };
       case (#settleMakers(x)) {
         if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day of the act" });
         if (x.day <= s.lastMakerDay) return ?#InvalidTerms({ reason = "a day later than the last settled" });
@@ -1926,7 +2276,7 @@ module {
     switch (side) {
       case (#buy) {
         let ?bps = marginOf(s, inst) else return ?#InvalidTerms({ reason = "an instrument with a margin rate" });
-        let value = price * qty;
+        let value = valueOf(s, inst, price, qty);
         let im = imFor(bps, value);
         if (im > heldBefore) { switch (marginRefusal(s, r, im, heldBefore, 0)) { case (?e) return ?e; case null {} } };
         let free = ccpFree(s);
@@ -1988,7 +2338,9 @@ module {
   // ═══════════════════════════════════════════════════════
 
   /// An order's open value (SPEC §11): price × remaining while it is live or waiting, else nothing.
-  func openValue(o : T.Order) : Nat { if (isLiveish(o)) o.price * o.remaining else 0 };
+  /// An order's open value as the risk limits count it (SPEC §11, §28): a bond's with the most it can accrue.
+  public func openValueOf(s : State, o : T.Order) : Nat { openValue(s, o) };
+  func openValue(s : State, o : T.Order) : Nat { if (isLiveish(o)) valueOf(s, o.instrument, o.price, o.remaining) else 0 };
   public func limitsOf(s : State, member : Nat) : ?(Nat, LimitRow) { one(s.limitStore, limitRows, "byMember", R.key(member, 8)) };
   func putLimits(s : State, member : Nat, f : T.Limits -> T.Limits) {
     switch (limitsOf(s, member)) {
@@ -2002,10 +2354,10 @@ module {
   public func kill(s : State, id : Nat) : ?T.Kill { RS.get(s.killRows, kills, id) };
 
   func putOrder(s : State, id : Nat, o : T.Order) {
-    let (before, heldBefore) = switch (RS.get(s.orderRows, orders, id)) { case (?p) (openValue(p), p.held); case null (0, 0) };
+    let (before, heldBefore) = switch (RS.get(s.orderRows, orders, id)) { case (?p) (openValue(s, p), p.held); case null (0, 0) };
     RS.put(s.orderRows, orders, id, o);
     // the member's use moves by the change in the order's open value
-    let after = openValue(o);
+    let after = openValue(s, o);
     if (after != before) putLimits(s, o.member, func(l : T.Limits) : T.Limits { { l with used = l.used + after - before } });
     // a clearing order's margin, the CCP's commitment, and pledged shares move with it (SPEC §18)
     if (after != before or o.held != heldBefore) clearingMove(s, id, o, before, after, heldBefore);
@@ -2054,7 +2406,7 @@ module {
   public func apply(s : State, now : Nat64, c : T.Command) : T.Effects {
     let e = applyCommand(s, now, c);
     // the indices follow the prices this act moved (SPEC §26)
-    if (s.pricesMoved) { s.pricesMoved := false; recomputeIndices(s) };
+    if (s.pricesMoved) { s.pricesMoved := false; recomputeIndices(s); recomputeNavs(s) };
     accrueMakers(s, now);
     e
   };
@@ -2082,11 +2434,13 @@ module {
         let id = s.nextRef; s.nextRef += 1;
         RS.put(s.refRows, refs, id, { reference = x.reference });
         credit(s, x.account, x.ledger, x.amount);
+        moveSupply(s, x.ledger, x.amount, 0);
         [4, x.account, x.amount]
       };
       case (#withdraw(x)) {
         let b = balance(s, x.account, x.ledger);
         putBalance(s, { b with available = b.available - x.amount });
+        moveSupply(s, x.ledger, 0, x.amount);
         [5, x.account, x.amount]
       };
       case (#placeOrder(x)) {
@@ -2109,7 +2463,7 @@ module {
         // a pre-funded order holds what it needs; a clearing buy its initial margin, a clearing sale its pledged shares
         let held = if (incomingCancelled) 0 else switch (clearingOf(s, x.account)) {
           case null { hold(s, x.account, holdingLedger(i, x.side), need); need };
-          case (?m) { switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, price * x.qty); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } } };
+          case (?m) { switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, valueOf(s, x.instrument, price, x.qty)); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } } };
         };
         putOrder(s, id, { account = x.account; instrument = x.instrument; side = x.side; kind = x.kind; qty = x.qty; remaining = x.qty; price; stopPrice = x.stopPrice;
           peak = x.peak; validity = x.validity; gtdDay = x.gtdDay; selfTrade = x.selfTrade; capacity = x.capacity; shortSale = x.shortSale; clientRef = x.clientRef;
@@ -2136,7 +2490,7 @@ module {
         let need = holdNeed(s, i, o.instrument, o.side, x.price, x.qty);
         let held = switch (clearingOf(s, o.account)) {
           case null { if (need > o.held) hold(s, o.account, ledger, need - o.held) else release(s, o.account, ledger, o.held - need); need };
-          case (?m) { switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, x.price * x.qty); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } } };
+          case (?m) { switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, valueOf(s, o.instrument, x.price, x.qty)); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } } };
         };
         let qty = o.filled + x.qty;
         putOrder(s, x.order, { o with remaining = x.qty; qty; price = x.price; held; prio = if (keeps) o.prio else now;
@@ -2219,6 +2573,7 @@ module {
         let id = s.nextRef; s.nextRef += 1;
         RS.put(s.refRows, refs, id, { reference = x.reference });
         credit(s, x.account, i.assetLedger, x.qty);
+        moveSupply(s, i.assetLedger, x.qty, 0);
         putOwed(s, x.account, x.instrument, owedOf(s, x.account, x.instrument) + x.qty);
         [25, x.account, x.qty]
       };
@@ -2226,6 +2581,7 @@ module {
         let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
         let b = balance(s, x.account, i.assetLedger);
         putBalance(s, { b with available = b.available - x.qty });
+        moveSupply(s, i.assetLedger, 0, x.qty);
         putOwed(s, x.account, x.instrument, owedOf(s, x.account, x.instrument) - x.qty);
         [26, x.account, x.qty]
       };
@@ -2406,6 +2762,59 @@ module {
           };
         };
         [50, x.instrument, ref, touched]
+      };
+      // SPEC §28 to §32
+      case (#setTerms(x)) {
+        RS.put(s.termsStore, termsRows, x.instrument, x.terms);
+        [52, x.instrument, switch (x.terms) { case (#bond(_)) 1; case (#receipt(_)) 2; case (#certificate(_)) 3; case (#right(_)) 4 }]
+      };
+      case (#defineNav(x)) {
+        for (b in x.basket.vals()) { let id = s.nextBasket; s.nextBasket += 1; RS.put(s.basketStore, basketRows, id, { fund = x.instrument; instrument = b.instrument; shares = b.shares }) };
+        let v = inavOf(s, x.instrument, x.units, x.cash);
+        RS.put(s.navStore, navRows, x.instrument, { units = x.units; cash = x.cash; inav = v });
+        addNavPath(s, x.instrument, v);
+        [53, x.instrument, v]
+      };
+      case (#issueReceipt(x)) {
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        let id = s.nextReceipt; s.nextReceipt += 1;
+        RS.put(s.receiptStore, receiptRows, id, { warehouse = x.warehouse; instrument = x.instrument; account = x.account; qty = x.qty; live = true; reference = x.reference });
+        credit(s, x.account, i.assetLedger, x.qty);
+        moveSupply(s, i.assetLedger, x.qty, 0);
+        [54, id, x.account, x.qty]
+      };
+      case (#cancelReceipt(x)) {
+        let ?r = receiptOf(s, x.receipt) else Runtime.trap("apply: a receipt vanished");
+        let ?i = instrument(s, r.instrument) else Runtime.trap("apply: instrument vanished");
+        debit(s, x.account, i.assetLedger, r.qty);
+        moveSupply(s, i.assetLedger, 0, r.qty);
+        RS.put(s.receiptStore, receiptRows, x.receipt, { r with live = false });
+        [55, x.receipt, x.account, r.qty]
+      };
+      case (#retire(x)) {
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        debit(s, x.account, i.assetLedger, x.qty);
+        moveSupply(s, i.assetLedger, 0, x.qty);
+        let id = s.nextRetire; s.nextRetire += 1;
+        RS.put(s.retireStore, retireRows, id, { account = x.account; instrument = x.instrument; qty = x.qty; beneficiary = x.beneficiary });
+        [56, id, x.qty]
+      };
+      case (#exercise(x)) {
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        let r = switch (termsOf(s, x.instrument)) { case (?#right(r)) r; case (_) Runtime.trap("apply: a right's terms vanished") };
+        let shares = x.qty / r.den * r.num;
+        let pay = r.price * shares;
+        debit(s, x.account, i.assetLedger, x.qty);
+        moveSupply(s, i.assetLedger, 0, x.qty);
+        move(s, x.account, r.issuer, i.cashLedger, pay);
+        appendLeg(s, 7, i.cashLedger, x.account, r.issuer, pay);
+        let id = s.nextEntitlement; s.nextEntitlement += 1;
+        RS.put(s.entitlementStore, entitlementRows, id, { account = x.account; instrument = x.instrument; rights = x.qty; shares; paid = pay });
+        [57, id, shares, pay]
+      };
+      case (#valueDate(x)) {
+        RS.put(s.valueDateStore, valueDateRows, x.instrument, { day = x.day });
+        [58, x.instrument, x.day]
       };
       case (#tripBreaker(x)) {
         let ?row = indexRowOf(s, x.index) else Runtime.trap("apply: an index vanished");
@@ -2757,6 +3166,8 @@ module {
   /// paid, delivers or receives. Every movement of a pre-funded party is a leg of the settlement range.
   func settlePair(s : State, inst : Nat, i0 : T.Instrument, b : Nat, bo : T.Order, a : Nat, ao : T.Order, p : Nat, q : Nat) {
     let v = p * q;
+    // a bond's interest accrued to its value date, paid by the buyer to the seller beside the clean value (SPEC §28)
+    let ai = switch (bondOf(s, inst)) { case (?bd) accruedOn(bd, q, valueDateOf(s, inst)); case null 0 };
     let bm = clearingOf(s, bo.account); let am = clearingOf(s, ao.account);
     let ccp = switch (s.clearing) { case (?t) t.ccpAccount; case null 0 };
     // each side's fee on the fill's value (SPEC §22)
@@ -2767,26 +3178,26 @@ module {
         let after = buyHold(s, i0, inst, bo.price, bo.remaining - q);
         spendHeld(s, bo.account, i0.cashLedger, bo.held - after);
         // the fee stays with the buyer here and is paid to the levies below, as a leg
-        credit(s, bo.account, i0.cashLedger, bo.held - after - v);
+        credit(s, bo.account, i0.cashLedger, bo.held - after - v - ai);
         credit(s, bo.account, i0.assetLedger, q);
       };
-      case (?m) { owe(s, m, s.cycleNo, 0, v + feeB); owePayable(s, inst, feeB); addBought(s, m, inst, s.cycleNo, q); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty + q }) };
+      case (?m) { owe(s, m, s.cycleNo, 0, v + ai + feeB); owePayable(s, inst, feeB); addBought(s, m, inst, s.cycleNo, q); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty + q }) };
     };
     switch (am) {
-      case null { spendHeld(s, ao.account, i0.assetLedger, q); credit(s, ao.account, i0.cashLedger, v) };
-      case (?m) { owe(s, m, s.cycleNo, v, feeS); owePayable(s, inst, feeS); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty - q }) };
+      case null { spendHeld(s, ao.account, i0.assetLedger, q); credit(s, ao.account, i0.cashLedger, v + ai) };
+      case (?m) { owe(s, m, s.cycleNo, v + ai, feeS); owePayable(s, inst, feeS); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty - q }) };
     };
     switch (bm, am) {
-      case (null, null) { appendLeg(s, 1, i0.cashLedger, bo.account, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, bo.account, q) };
+      case (null, null) { appendLeg(s, 1, i0.cashLedger, bo.account, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, bo.account, q); accruedLeg(s, i0, bo.account, ao.account, ai) };
       case (null, ?_) {
         // the CCP is paid by the buyer and delivers out of the shares it holds
-        credit(s, ccp, i0.cashLedger, v); debit(s, ccp, i0.assetLedger, q);
-        appendLeg(s, 1, i0.cashLedger, bo.account, ccp, v); appendLeg(s, 1, i0.assetLedger, ccp, bo.account, q);
+        credit(s, ccp, i0.cashLedger, v + ai); debit(s, ccp, i0.assetLedger, q);
+        appendLeg(s, 1, i0.cashLedger, bo.account, ccp, v); appendLeg(s, 1, i0.assetLedger, ccp, bo.account, q); accruedLeg(s, i0, bo.account, ccp, ai);
       };
       case (?_, null) {
         // the CCP pays the seller out of the cash committed at the buy's entry and receives the shares
-        debit(s, ccp, i0.cashLedger, v); credit(s, ccp, i0.assetLedger, q);
-        appendLeg(s, 1, i0.cashLedger, ccp, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, ccp, q);
+        debit(s, ccp, i0.cashLedger, v + ai); credit(s, ccp, i0.assetLedger, q);
+        appendLeg(s, 1, i0.cashLedger, ccp, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, ccp, q); accruedLeg(s, i0, ccp, ao.account, ai);
       };
       case (?_, ?_) {};
     };
@@ -2801,7 +3212,7 @@ module {
         case (?(_, co)) {
           let c = custodyOf(s, co.member, inst); putCustody(s, { c with qty = c.qty - q });
           let ?(_, r) = clearingMember(s, co.member) else Runtime.trap("close-out: a member vanished");
-          let net = v - feeS;
+          let net = v + ai - feeS;
           let paid = Nat.min(r.debt, net);
           updateMember(s, co.member, func(x : ClearingMember) : ClearingMember { { x with debt = x.debt - paid } });
           if (net > paid) owe(s, co.member, s.cycleNo, net - paid, 0);
@@ -2810,6 +3221,8 @@ module {
       };
     };
   };
+  /// A bond fill's accrued interest as its own leg (kind 6), when there is any.
+  func accruedLeg(s : State, i0 : T.Instrument, from : Nat, to : Nat, ai : Nat) { if (ai > 0) appendLeg(s, 6, i0.cashLedger, from, to, ai) };
   /// The quantity an order shows (SPEC §2, §13): an iceberg its peak, or what remains when less; any other order what
   /// remains.
   public func shownOf(o : T.Order) : Nat { if (o.peak == 0) o.remaining else Nat.min(o.peak, o.remaining) };
@@ -3079,6 +3492,10 @@ module {
           case (#closeOut(c)) own(c.member);
           case (#callFund) { for (j in Nat.range(0, e[1])) mentioned(e[2 + 2 * j]) };
           case (#reconcileMember(c)) own(c.member);
+          case (#issueReceipt(c)) own(c.member);
+          case (#cancelReceipt(c)) own(c.member);
+          case (#retire(c)) own(c.member);
+          case (#exercise(c)) { own(c.member); switch (termsOf(s, c.instrument)) { case (?#right(r)) mentioned(r.issuerMember); case (_) {} } };
           case (#registerMaker(c)) own(c.member);
           case (#quote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
           case (#massQuote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
@@ -3288,6 +3705,13 @@ module {
     table<ConstituentRow>("constituents", s.constituentStore, constituentRows, s.nextConstituent);
     table<PathRow>("indexpath", s.pathStore, pathRows, s.nextPath);
     Fold.section(f, "breaker", func(w : C.Writer) { w.nat(s.breakerDue); w.nat64(s.suspendedAt) });
+    Fold.section(f, "classes", func(w : C.Writer) { classScalars(s, w) });
+    table<BasketRow>("baskets", s.basketStore, basketRows, s.nextBasket);
+    table<PathRow>("navpath", s.navPathStore, navPathRows, s.nextNavPath);
+    table<Receipt>("receipts", s.receiptStore, receiptRows, s.nextReceipt);
+    table<Retirement>("retirements", s.retireStore, retireRows, s.nextRetire);
+    table<Entitlement>("entitlements", s.entitlementStore, entitlementRows, s.nextEntitlement);
+    table<Supply>("supply", s.supplyStore, supplyRows, s.nextSupply);
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
@@ -3299,6 +3723,14 @@ module {
   func feeScalars(s : State, w : C.Writer) {
     for (i in s.instrumentList.vals()) { switch (RS.get(s.feeStore, feeRows, i)) { case (?r) { w.nat(i); w.blob(feeRows.encode(r)) }; case null {} } };
     w.nat(s.lastStatementDay); w.nat(s.lastMakerDay)
+  };
+  /// The instruments' terms, funds' iNAV rows and bonds' value dates, by instrument (SPEC §28 to §32).
+  func classScalars(s : State, w : C.Writer) {
+    for (i in s.instrumentList.vals()) {
+      switch (termsOf(s, i)) { case (?t) { w.nat(i); w.byte(1); w.blob(termsRows.encode(t)) }; case null {} };
+      switch (navOf(s, i)) { case (?n) { w.nat(i); w.byte(2); w.blob(navRows.encode(n)) }; case null {} };
+      switch (RS.get(s.valueDateStore, valueDateRows, i)) { case (?v) { w.nat(i); w.byte(3); w.nat(v.day) }; case null {} };
+    };
   };
   func margins(s : State, w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.marginStore, marginRows, i)) { case (?r) { w.nat(i); w.nat(r) }; case null {} } } };
   /// One step of a table in the sliced fingerprint: its next row, or on to `after` past its end.
@@ -3319,7 +3751,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 70) {
+    while (left > 0 and run.part < 83) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -3391,12 +3823,25 @@ module {
         case 66 tableHead(w, run, "indexpath", s.nextPath, 67);
         case 67 tableStep<PathRow>(w, run, s.pathStore, pathRows, s.nextPath, 68);
         case 68 { w.text("breaker"); w.nat(s.breakerDue); w.nat64(s.suspendedAt); run.part := 69 };
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 70 };
+        case 69 { w.text("classes"); classScalars(s, w); run.part := 70 };
+        case 70 tableHead(w, run, "baskets", s.nextBasket, 71);
+        case 71 tableStep<BasketRow>(w, run, s.basketStore, basketRows, s.nextBasket, 72);
+        case 72 tableHead(w, run, "navpath", s.nextNavPath, 73);
+        case 73 tableStep<PathRow>(w, run, s.navPathStore, navPathRows, s.nextNavPath, 74);
+        case 74 tableHead(w, run, "receipts", s.nextReceipt, 75);
+        case 75 tableStep<Receipt>(w, run, s.receiptStore, receiptRows, s.nextReceipt, 76);
+        case 76 tableHead(w, run, "retirements", s.nextRetire, 77);
+        case 77 tableStep<Retirement>(w, run, s.retireStore, retireRows, s.nextRetire, 78);
+        case 78 tableHead(w, run, "entitlements", s.nextEntitlement, 79);
+        case 79 tableStep<Entitlement>(w, run, s.entitlementStore, entitlementRows, s.nextEntitlement, 80);
+        case 80 tableHead(w, run, "supply", s.nextSupply, 81);
+        case 81 tableStep<Supply>(w, run, s.supplyStore, supplyRows, s.nextSupply, 82);
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 83 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 70) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 83) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };
@@ -3404,7 +3849,8 @@ module {
     [s.nextOrder, s.nextBalance, s.nextRef, Nat64.toNat(s.batchTime), s.dueCount, Nat64.toNat(s.lastTime), s.nextKill, s.nextLimit,
      s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode,
      s.nextPayable, s.nextFeeTotal, s.nextStatement, s.nextStatementSeal, s.lastStatementDay, s.nextRecon, s.nextMaker, s.nextMakerDay, s.lastMakerDay,
-     s.nextConstituent, s.nextPath, s.breakerDue, Nat64.toNat(s.suspendedAt)]
+     s.nextConstituent, s.nextPath, s.breakerDue, Nat64.toNat(s.suspendedAt),
+     s.nextBasket, s.nextNavPath, s.nextReceipt, s.nextRetire, s.nextEntitlement, s.nextSupply]
   };
   /// The order indexes whose entries leave as orders change (the reference index's keys never move).
   public let churnIndexes : [Text] = ["book", "stops", "own", "day", "gtd", "immediate", "trailing", "member", "trader"];

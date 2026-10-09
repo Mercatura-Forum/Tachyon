@@ -485,3 +485,63 @@ from its reference by at least the first threshold (as the EGX100's ±10%), the 
 the one that moved it, a `tripBreaker` that halts **every** instrument in that one block; by at least the second
 (±20%), the halt is a **suspension to the close**: no instrument may be resumed before the next market day. A tripped
 level is not tripped again until the next seal re-arms it. `tripBreaker` is the book's own act; no principal submits it.
+
+## 28. Instrument classes and bonds
+
+An instrument takes a **class** under four eyes, once, while it is closed with no open order: a bond, a warehouse
+receipt, a certificate or a right; without one it is a share. The class's terms are reference data in the fold.
+
+**Supply.** For every ledger the book keeps the units it holds: a deposit and a loan add to it, a withdrawal and a loan's
+return take from it, as do a receipt's issue and cancellation, a retirement and an exercise; a fill never changes it. The
+units of a ledger always equal the sum of its balances (available and held).
+
+**A bond's quantity and price.** Its quantity is in units of 100,000 minor units of face (1,000 pounds) and its price in
+thousandths of a percent of face (98,500 is 98.500%), so price × quantity is the clean value in minor units and every
+rule of the book (holds, fees, limits, margins, the CCP's commitment) reads it as any instrument's value.
+
+**Accrued interest.** The terms name the coupon (basis points a year), the coupons a year (1, 2, 4 or 12), the day count
+(ISO 20022 A004 ACT/365 fixed, A006 30/360 bond basis, A001 ACT/ACT ICMA), the maturity and the settlement lag (T+n
+business days by the exchange's calendar; government bonds T+1). The coupon dates step back from the maturity by
+whole months (a day past a month's end its last day). Each market day the scheduler records the bond's **value date**,
+which validation requires to be the calendar's T+n and before the maturity; an order or a quote on a bond is refused
+until it is recorded, and past the maturity. A fill of q units at value date V pays the seller
+
+  accrued = 100,000 × q × coupon × fraction(L, V) / 10,000, quantised once, half-even,
+
+L the last coupon date on or before V and N the next: the fraction is (V − L)/365 for A004, the 30/360 bond-basis
+days over 360 for A006 (the kernel's day counts) and (V − L)/(coupons a year × (N − L)) for A001 (ICMA Rule 251).
+The buyer pays it beside the clean value; it moves as its own leg (kind 6); a clearing party's share joins its
+member's obligation. A buy holds, and a clearing buy commits the CCP to, the most a fill can accrue whatever its
+value date: a coupon period's interest counted at 31 days a month over 360, rounded up. Fees are on the clean value.
+
+## 29. Funds and the indicative NAV
+
+A fund's **indicative net asset value** is defined under four eyes: the units of a creation, the cash in it and its
+basket (up to fifty instruments with the shares each in a creation). The iNAV of a unit is (cash + Σ mark × shares) /
+units, half-even, in minor units, the marks as an index's (§26). After every act that moves a price it is computed
+again and, when it changed, recorded with the block on the fund's path; both are public, as an exchange's iNAV is.
+
+## 30. Warehouse receipts
+
+A receipt instrument is one graded commodity; its terms name the warehouses licensed for it. The class
+is taken only while none of its units is in the book and only on a ledger no other instrument uses. A licensed
+warehouse's receipt is issued under four eyes to an account for a quantity, naming the warehouse's document by its
+hash (once); its units are credited. When the goods leave, the receipt is cancelled under four eyes out of the account
+presenting it, which must hold its quantity free. The book refuses deposits, withdrawals and loans of a receipt's
+units, so the units in the book always equal the live receipts' quantities, and a cancelled receipt's units cannot be
+traded.
+
+## 31. Certificates
+
+A certificate instrument names its registry by hash (the EGX's carbon certificates come from projects in an accredited registry). A trader of the holder's member retires certificates the account
+holds free, naming the beneficiary by hash: the units leave the book and the retirement is recorded. A retired unit no
+longer exists, so it can never be offered.
+
+## 32. Rights
+
+A right's terms name its underlying instrument, the subscription price, the ratio (num new shares for den rights), the
+deadline (a market day) and the issuer's account with its member. Rights trade as any instrument until the deadline;
+past it, orders and quotes are refused. By the deadline a trader of the holder's member exercises rights the account
+holds free, in multiples of den: the rights leave the book, the subscription (price × the new shares) moves from the
+holder's cash to the issuer's (a leg of kind 7), and the entitlement (the rights, the new shares, the payment) is
+recorded for the custody register, which delivers the shares.
