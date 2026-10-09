@@ -1,0 +1,13 @@
+{
+  "battery": "Custody",
+  "grants": [
+    {"role": "2vxsx-fae", "prefixes": ["custody."], "exact": []},
+    {"role": "aaaaa-aa", "prefixes": [], "exact": ["command.approve", "command.reject"]},
+    {"role": "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae", "prefixes": [], "exact": ["command.approve", "command.reject"]}
+  ],
+  "eligibleRole": "director",
+  "holders": ["aaaaa-aa", "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae"],
+  "offeringDuals": [],
+  "custodyDuals": ["custody.holder.register", "custody.asset.register", "custody.reconcile", "custody.action.announce", "custody.action.cancel", "custody.file.certify"],
+  "ttlSeconds": 3600
+}
