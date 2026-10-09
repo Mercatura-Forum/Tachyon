@@ -182,6 +182,7 @@ module {
       case (#redeem(x)) { w.byte(64); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.principal(x.ledger); w.nat(x.amount) };
       case (#rtgsSettle(x)) { w.byte(65); w.nat(x.redemption); w.blob(x.reference) };
       case (#rtgsReject(x)) { w.byte(66); w.nat(x.redemption); w.blob(x.reference) };
+      case (#replaceOrder(x)) { w.byte(67); w.nat(x.order); w.nat(x.qty); w.nat(x.price); w.text(x.clientRef) };
     };
     true
   };
@@ -338,6 +339,11 @@ module {
       };
       case 65 { let ?redemption = r.nat() else return null; let ?reference = r.blob() else return null; ?#rtgsSettle({ redemption; reference }) };
       case 66 { let ?redemption = r.nat() else return null; let ?reference = r.blob() else return null; ?#rtgsReject({ redemption; reference }) };
+      case 67 {
+        let ?order = r.nat() else return null; let ?qty = r.nat() else return null; let ?price = r.nat() else return null;
+        let ?clientRef = r.text() else return null;
+        ?#replaceOrder({ order; qty; price; clientRef })
+      };
       case _ null;
     }
   };
@@ -352,7 +358,7 @@ module {
     "defineIndex", "reviewIndex", "corporateAction", "tripBreaker",
     "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "retire", "exercise", "valueDate",
     "setAttestors", "attestPrice", "settleDerivatives",
-    "registerBridge", "earmark", "redeem", "rtgsSettle", "rtgsReject"];
+    "registerBridge", "earmark", "redeem", "rtgsSettle", "rtgsReject", "replaceOrder"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -371,6 +377,7 @@ module {
       case (#retire(_)) "retire"; case (#exercise(_)) "exercise"; case (#valueDate(_)) "valueDate";
       case (#setAttestors(_)) "setAttestors"; case (#attestPrice(_)) "attestPrice"; case (#settleDerivatives(_)) "settleDerivatives";
       case (#registerBridge(_)) "registerBridge"; case (#earmark(_)) "earmark"; case (#redeem(_)) "redeem"; case (#rtgsSettle(_)) "rtgsSettle"; case (#rtgsReject(_)) "rtgsReject";
+      case (#replaceOrder(_)) "replaceOrder";
     }
   };
 

@@ -130,6 +130,7 @@ module {
     Perm.p("book.bridge.redeem", "bridge", #create, #command("redeem"), false, false, false),
     Perm.p("book.rtgs.settle", "bridge", #update, #command("rtgsSettle"), false, false, false),
     Perm.p("book.rtgs.reject", "bridge", #update, #command("rtgsReject"), false, false, false),
+    Perm.p("book.order.replace", "order", #update, #command("replaceOrder"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -167,6 +168,7 @@ module {
     ("book.maker.settle", "the scheduler closes the makers' period at the day's end; presence and rebates are the fold's, none typed"),
     ("book.breaker.trip", "the market-wide breaker, recorded by the book itself in the block after the one that moved an index; no principal submits it"),
     ("book.certificate.retire", "a trader of the account's member retires certificates the account holds free; they leave circulation and nothing else moves"),
+    ("book.order.replace", "a trader of the account's member amends its live order and names it by a new reference of its own, as an amendment"),
     ("book.rtgs.earmark", "the RTGS operator attests cash it earmarked at the central bank, by its message's hash, once; the claims minted are that cash"),
     ("book.bridge.redeem", "a trader of the account's member asks the RTGS for claims the account holds free; they are held until the RTGS answers"),
     ("book.rtgs.settle", "the RTGS operator attests the transfer out of the earmark for a held redemption; the claims are burned, nothing else moves"),
@@ -2484,6 +2486,15 @@ module {
         if (b.available < x.amount) return ?#InsufficientFunds({ ledger = x.ledger; available = b.available; wanted = x.amount });
         null
       };
+      case (#replaceOrder(x)) {
+        // every rule of an amendment, then the new reference: 1 to 20 bytes, not naming another of the account's orders
+        switch (validate(s, xs, now, caller, #amendOrder({ order = x.order; qty = x.qty; price = x.price }))) { case (?e) return ?e; case null {} };
+        let n = Text.encodeUtf8(x.clientRef).size();
+        if (n == 0 or n > T.CLIENT_REF_BYTES) return ?#InvalidTerms({ reason = "a client reference of 1 to 20 bytes" });
+        let ?o = order(s, x.order) else return ?#UnknownOrder({ order = x.order });   // kept: the amendment's rules found it
+        if (orderByRef(s, o.account, x.clientRef) != null) return ?#DuplicateClientRef({ clientRef = x.clientRef });
+        null
+      };
       case (#rtgsSettle(x)) rtgsRefusal(s, caller, x.redemption, x.reference);
       case (#rtgsReject(x)) rtgsRefusal(s, caller, x.redemption, x.reference);
       case (#valueDate(x)) {
@@ -3127,6 +3138,13 @@ module {
         [60, x.instrument, x.day, x.attestor, switch (attestedPrice(s, x.instrument, x.day)) { case (?m) m; case null 0 }]
       };
       case (#settleDerivatives(x)) settleDerivatives(s, x.instrument, x.day, x.limit);
+      // SPEC §37: the amendment, then the order's new reference
+      case (#replaceOrder(x)) {
+        let e = applyCommand(s, now, #amendOrder({ order = x.order; qty = x.qty; price = x.price }));
+        let ?o = order(s, x.order) else Runtime.trap("apply: order vanished");
+        putOrder(s, x.order, { o with clientRef = x.clientRef });
+        [67, x.order, e[2], e[3]]
+      };
       // SPEC §36
       case (#registerBridge(x)) {
         let id = s.nextBridge; s.nextBridge += 1;
@@ -3923,6 +3941,7 @@ module {
           case (#settleDerivatives(_)) { for (j in Nat.range(0, e[5])) mentioned(e[7 + 4 * j]) };
           case (#earmark(c)) mentioned(c.member);
           case (#redeem(c)) own(c.member);
+          case (#replaceOrder(c)) { switch (order(s, c.order)) { case (?o) own(o.member); case null {} } };
           case (#rtgsSettle(c) or #rtgsReject(c)) { switch (redemptionOf(s, c.redemption)) { case (?r) mentioned(r.member); case null {} } };
           case (#registerMaker(c)) own(c.member);
           case (#quote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };

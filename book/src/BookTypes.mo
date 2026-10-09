@@ -219,6 +219,9 @@ module {
     /// The RTGS operator's outcome of a redemption (§36): settled (the claims burned) or rejected (the claims returned).
     #rtgsSettle : { redemption : Nat; reference : Blob };
     #rtgsReject : { redemption : Nat; reference : Blob };
+    /// A cancel/replace (SPEC §37): an amendment that also gives the order the client's new reference, as FIX's
+    /// OrderCancelReplaceRequest names the replacement by a new ClOrdID; the order then answers to the new reference only.
+    #replaceOrder : { order : OrderId; qty : Nat; price : Nat; clientRef : Text };
   };
 
   /// A levy of a fee schedule (SPEC §22): its recipient account and its rate in parts per million of a fill's value.

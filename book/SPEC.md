@@ -610,3 +610,26 @@ At every block a bridged ledger's claims in the book equal its **backing**: the 
 out (the claims held by pending redemptions are still backed). Either both the RTGS's cash and the claims move, or
 neither: a rejected transfer leaves the earmark and the claims as they were. The cash's finality is the RTGS's: final
 when the central bank settles the transfer.
+
+## 37. The members' FIX gateway
+
+A FIX session (TCP, sequence numbers, heartbeats, resend) cannot live in a contract. Each member runs the
+gateway (`gateway/`) at its own edge: it terminates FIX 4.4 and FIX 5.0 SP2 over FIXT.1.1 (the version a session's Logon names), translates NewOrderSingle, OrderCancelRequest and
+OrderCancelReplaceRequest into the venue's typed calls signed with the member's own trader key, and answers with
+ExecutionReports and OrderCancelRejects. The venue of record stays the contract: the gateway holds no authority the
+member's key does not, and a gateway signing with any other key is refused as any other caller is.
+
+**The cancel/replace.** FIX names a replacement by a new ClOrdID. The book's `replaceOrder` is an amendment (every rule
+of §5's amendments) that also gives the order the new client reference (1 to 20 bytes, naming no other order of the
+account); the order then answers to the new reference only, and the old one names no order of the account. To the feed
+it is an amendment.
+
+**The reports.** One rule (`gateway/er.py`) turns a member's order events into reports: a placement (New), a fill of a
+clear or an uncross (Trade: LastQty, LastPx, CumQty, LeavesQty, the exact AvgPx), a removal without filling (Canceled),
+a replacement (Replaced, with OrigClOrdID). The gateway takes the placements and replacements from the venue's replies
+and the fills and removals from the public feed, the log's projection; every identifier a report carries is the order's
+and its state's. `gateway/reconstruct.py` derives the same events from the book's log alone (the member's placements and
+replacements, and every block's feed projection) and requires every report the gateway sent for an accepted order equal,
+field by field. A refused order writes no block: its report (ExecType Rejected) is the venue's reply and is not in the
+log. **The drop copy** is the member's scoped page of the log (§14), from which the same rule gives the same
+reports.

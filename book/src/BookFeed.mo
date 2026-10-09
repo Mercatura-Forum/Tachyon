@@ -58,6 +58,10 @@ module {
       case (#amendOrder(x)) {
         if (e[3] == 0) w.byte(0) else { w.byte(6); w.nat(x.order); w.nat(x.price); w.nat(e[3]); w.bool(e[2] == 1) };
       };
+      // a replacement is an amendment to the feed (its new reference is the member's, never public)
+      case (#replaceOrder(x)) {
+        if (e[3] == 0) w.byte(0) else { w.byte(6); w.nat(x.order); w.nat(x.price); w.nat(e[3]); w.bool(e[2] == 1) };
+      };
       // effects: [tag, count, orders...]
       case (#massCancel(_)) { w.byte(5); list(w, slice(e, 2, e[1])) };
       case (#endOfDay(_)) { w.byte(5); list(w, slice(e, 2, e[1])) };
