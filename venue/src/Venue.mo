@@ -7,6 +7,11 @@
 /// accounts (the book checks the account at every act). Governance and system acts arrive as commands in their frozen
 /// bytes; a trader's acts arrive typed. The chain's time of the message is the time every command carries.
 ///
+/// The random end of a call auction (SPEC §8, §9): once an auction's window opens, a timer every second asks the
+/// chain's randomness (`raw_rand`) whether this second ends it, with probability one over the seconds left, and ends it
+/// for certain at `endTo`: the end is uniform over the window and unknown before the block that ends it. An interruption
+/// (§10) ends at the first second after `interruptUntil`. The venue's uncross is an act of the book like the scheduler's.
+///
 /// Reads that name an account or an order are updates scoped to the caller's member: a query's caller is not
 /// authenticated on this substrate. The counters are public.
 ///
@@ -19,8 +24,11 @@ import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 import Nat64 "mo:core/Nat64";
 import Principal "mo:core/Principal";
+import Map "mo:core/Map";
 import Text "mo:core/Text";
+import Sha256 "mo:sha2/Sha256";
 import Time "mo:core/Time";
+import Timer "mo:core/Timer";
 
 import C "mo:kernel/codec/Canonical";
 import DL "mo:kernel/domain/DomainLog";
@@ -33,7 +41,7 @@ import B "../../book/src/BookCore";
 import BK "../../book/src/BookCanonical";
 import T "../../book/src/BookTypes";
 
-persistent actor class Venue(init : { operator : Principal; directors : [Principal]; scheduler : Principal; depository : Principal; regulator : Principal }) {
+persistent actor class Venue(init : { operator : Principal; directors : [Principal]; scheduler : Principal; depository : Principal; regulator : Principal }) = this {
 
   let xs = X.newState();
   let bs = B.newState();
@@ -42,15 +50,17 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   X.setPolicies(xs, duals(X.catalogue()));
   B.setPolicies(bs, duals(B.catalogue()));
 
-  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire"];
-  let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel"];
+  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep"];
+  let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set"];
+  let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
     switch (X.traderByPrincipal(xs, p)) { case (?(_, t)) { if (t.status == #active) ?t.member else null }; case null null }
   };
   func hasGrant(p : Principal, perm : Text) : Bool {
-    if (Principal.equal(p, init.operator)) return (Text.startsWith(perm, #text "exchange.") and not among(schedulerActs, perm)) or perm == "book.instrument.open";
+    if (Principal.equal(p, init.operator)) return (Text.startsWith(perm, #text "exchange.") and not among(schedulerActs, perm)) or among(operatorBookActs, perm);
+    if (Principal.equal(p, Principal.fromActor(this))) return perm == "book.auction.uncross";
     if (Principal.equal(p, init.scheduler)) return among(schedulerActs, perm);
     if (isDirector(p)) return perm == "command.approve" or perm == "command.reject";
     if (Principal.equal(p, init.depository)) return perm == "book.funds.deposit";
@@ -87,8 +97,12 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     validity : T.Validity; gtdDay : Nat; selfTrade : T.SelfTrade; capacity : T.Capacity; shortSale : Bool; clientRef : Text; oco : Nat; trail : Nat;
   };
   public type Placed = { #ok : { order : Nat; status : Nat8; cancelled : [Nat]; block : Nat }; #err : Text };
+  /// The order records the account's member and the caller's trader id, as the exchange's rows hold them; the book
+  /// checks both again.
   public shared (msg) func place(o : Place) : async Placed {
-    switch (B.submit(bs, xs, auth, chainNow(), msg.caller, #placeOrder(o), null, "")) {
+    let member = switch (X.account(xs, o.account)) { case (?a) a.member; case null 0 };
+    let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
+    switch (B.submit(bs, xs, auth, chainNow(), msg.caller, #placeOrder({ o with member; trader }), null, "")) {
       case (#ok(#executed(x))) #ok({ order = x.effects[1]; status = Nat8.fromNat(x.effects[2]); cancelled = Array.sliceToArray<Nat>(x.effects, 3, x.effects.size()); block = x.block });
       case (#ok(#proposed(_))) #err("Proposed");
       case (#err(e)) #err(debug_show(e));
@@ -96,6 +110,59 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   };
   public shared (msg) func cancel(order : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #cancelOrder({ order }), null, "")) };
   public shared (msg) func amend(order : Nat, qty : Nat, price : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #amendOrder({ order; qty; price }), null, "")) };
+  /// A trader's kill switch (SPEC §11): its own member (`trader` 0) or one trader of its member (`member` 0).
+  public shared (msg) func kill(member : Nat, trader : Nat, reason : Text) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #kill({ member; trader; reason }), null, "")) };
+
+  // ─── the random end of call auctions ───────────────────────────────────────────────────────
+  transient let ic : actor { raw_rand : () -> async Blob } = actor "aaaaa-aa";
+  transient var ending = false;
+  /// An instrument whose auction is past its window's end with nothing to trade inside the static band is tried again a
+  /// minute on, not every second.
+  transient let retryAt = Map.empty<Nat, Nat64>();
+  /// Where the next tick's read of the instruments in a call phase starts: past the last one read when a tick read the
+  /// most it may, so every instrument in a call phase is reached however many there are.
+  transient var callFrom = 0;
+  func inWindow(x : T.Instrument, now : Nat64) : Bool {
+    if (x.interruptUntil != 0) return now >= x.interruptUntil;
+    x.endTo != 0 and now >= x.endFrom
+  };
+  func endAuctions() : async () {
+    if (ending) return;
+    let calling = B.inCallPhase(bs, callFrom, B.MAX_CALLING);
+    callFrom := if (calling.size() == B.MAX_CALLING) calling[calling.size() - 1].0 + 1 else 0;
+    let open = Array.filter<(Nat, T.Instrument)>(calling, func((id, x)) {
+      inWindow(x, chainNow()) and (switch (Map.get(retryAt, Nat.compare, id)) { case (?t) chainNow() >= t; case null true })
+    });
+    if (open.size() == 0) return;
+    ending := true;
+    let seed = try { Blob.toArray(await ic.raw_rand()) } catch (_) { ending := false; return };
+    ending := false;
+    for ((id, _) in open.vals()) {
+      let now = chainNow();
+      switch (B.instrument(bs, id)) {
+        case (?x) {
+          if ((x.phase == #auction or x.phase == #closingAuction) and inWindow(x, now)) {
+            let ends = if (x.interruptUntil != 0 or now >= x.endTo) true else {
+              let left = Nat64.toNat((x.endTo - now) / 1_000_000_000) + 1;
+              // each instrument's draw: the first four bytes of SHA-256(the block's randomness ‖ the instrument's id)
+              let h = Blob.toArray(Sha256.fromArray(#sha256, Array.concat<Nat8>(seed, Array.tabulate<Nat8>(8, func(i) { Nat8.fromNat((id / (256 ** (7 - i : Nat))) % 256) }))));
+              let draw = ((Nat8.toNat(h[0]) * 256 + Nat8.toNat(h[1])) * 256 + Nat8.toNat(h[2])) * 256 + Nat8.toNat(h[3]);
+              draw % left == 0
+            };
+            if (ends) {
+              let next : T.Phase = if (x.phase == #closingAuction) #tradeAtClose else #continuous;
+              switch (B.submit(bs, xs, auth, now, Principal.fromActor(this), #uncross({ instrument = id; next }), null, "the drawn end")) {
+                case (#ok(#executed(e))) { if (e.effects.size() == 7 and e.effects[2] == 0 and e.effects[6] != Nat8.toNat(BK.phaseCode(next))) Map.add(retryAt, Nat.compare, id, now + 60_000_000_000) else Map.remove(retryAt, Nat.compare, id) };
+                case (_) Map.add(retryAt, Nat.compare, id, now + 60_000_000_000);
+              };
+            };
+          };
+        };
+        case null {};
+      };
+    };
+  };
+  transient let endTimer = Timer.recurringTimer<system>(#seconds 1, endAuctions);
 
   // ─── reads scoped to the caller's member (updates) ─────────────────────────────────────────
   func ownsAccount(p : Principal, account : Nat) : Bool {
@@ -126,6 +193,12 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   public query func counts() : async { orders : Nat; bookBlocks : Nat; exchangeBlocks : Nat } {
     { orders = bs.nextOrder - 1; bookBlocks = B.counts(bs).blocks; exchangeBlocks = X.counts(xs).blocks }
   };
+  /// An instrument's row in the book (reference data: its phase, bands, reference, last and closing prices, window).
+  public query func instrument(id : Nat) : async ?T.Instrument { B.instrument(bs, id) };
+  /// The indicative auction price of an instrument in a call phase (SPEC §9): the price, volume and surplus its uncross
+  /// would give now, and whether the price lies within the static band. An update: it walks the crossing orders in stable
+  /// memory, which a query may not do on this substrate.
+  public func indicative(id : Nat) : async ?{ price : Nat; volume : Nat; surplus : Int; withinBand : Bool } { B.indicative(bs, id) };
   public func exchangeFingerprint() : async Blob { X.fingerprint(xs) };
   /// The book's fingerprint in slices of at most 5,000 rows a call (a large book cannot be fingerprinted in one message):
   /// call again while it answers `#more`; a block appended meanwhile starts the run again.
