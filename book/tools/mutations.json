@@ -1384,5 +1384,41 @@
   "old": "{ b with backing = if (settled) b.backing - r.amount else b.backing; redeeming = b.redeeming - r.amount }",
   "new": "{ b with redeeming = b.redeeming - r.amount }",
   "test": "BookCashLeg"
+ },
+ {
+  "id": "Q01",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the old reference kept",
+  "old": "        putOrder(s, x.order, { o with clientRef = x.clientRef });\n        [67, x.order, e[2], e[3]]",
+  "new": "        ignore o;\n        [67, x.order, e[2], e[3]]",
+  "test": "BookGateway",
+  "property": "a replaced order answers to its new reference only"
+ },
+ {
+  "id": "Q02",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a reference the account uses accepted",
+  "old": "        if (orderByRef(s, o.account, x.clientRef) != null) return ?#DuplicateClientRef({ clientRef = x.clientRef });\n        null\n      };\n      case (#rtgsSettle(x))",
+  "new": "        null\n      };\n      case (#rtgsSettle(x))",
+  "test": "BookGateway",
+  "property": "a replacement's reference names no other order of the account"
+ },
+ {
+  "id": "Q03",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a replace without the amendment's rules",
+  "old": "        switch (validate(s, xs, now, caller, #amendOrder({ order = x.order; qty = x.qty; price = x.price }))) { case (?e) return ?e; case null {} };\n",
+  "new": "",
+  "test": "BookGateway",
+  "property": "a replacement is an amendment first"
+ },
+ {
+  "id": "Q04",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a reference of any length",
+  "old": "        let n = Text.encodeUtf8(x.clientRef).size();\n        if (n == 0 or n > T.CLIENT_REF_BYTES) return ?#InvalidTerms({ reason = \"a client reference of 1 to 20 bytes\" });\n        let ?o = order(s, x.order) else return ?#UnknownOrder({ order = x.order });   // kept",
+  "new": "        let n = Text.encodeUtf8(x.clientRef).size();\n        ignore n;\n        let ?o = order(s, x.order) else return ?#UnknownOrder({ order = x.order });   // kept",
+  "test": "BookGateway",
+  "property": "a replacement's reference is 1 to 20 bytes"
  }
 ]
