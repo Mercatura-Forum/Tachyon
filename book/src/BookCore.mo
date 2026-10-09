@@ -109,6 +109,10 @@ module {
     Perm.p("book.maker.quote", "order", #create, #command("quote"), false, false, false),
     Perm.p("book.maker.massquote", "order", #create, #command("massQuote"), false, false, false),
     Perm.p("book.maker.settle", "maker", #update, #command("settleMakers"), false, false, false),
+    Perm.p("book.index.define", "index", #create, #command("defineIndex"), false, false, true),
+    Perm.p("book.index.review", "index", #update, #command("reviewIndex"), false, false, true),
+    Perm.p("book.action.apply", "instrument", #update, #command("corporateAction"), false, false, true),
+    Perm.p("book.breaker.trip", "index", #update, #command("tripBreaker"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -144,6 +148,7 @@ module {
     ("book.maker.quote", "a registered maker's trader replaces its quote on one of its member's pre-funded accounts, both sides within its funds"),
     ("book.maker.massquote", "a registered maker's trader replaces up to sixteen quotes at once, each as a quote, all or nothing"),
     ("book.maker.settle", "the scheduler closes the makers' period at the day's end; presence and rebates are the fold's, none typed"),
+    ("book.breaker.trip", "the market-wide breaker, recorded by the book itself in the block after the one that moved an index; no principal submits it"),
   ] };
   public let commandNames : [Text] = K.families;
   public let methodNames : [Text] = ["approve", "reject"];
@@ -504,6 +509,42 @@ module {
     indexes = [];
   };
   public let MAX_MAKERS = 32;
+  // ── indices (SPEC §26, §27) ──
+  /// An index by its number: its base, cap and thresholds, the divisor and the adjusted capitalisation's scale (32
+  /// bytes each), its level and reference in hundredths of a point, whether its breaker tripped (0 armed, 1 halted, 2
+  /// suspended to the close).
+  public type IndexRow = { base : Nat; capBps : Nat; haltBps : Nat; suspendBps : Nat; divisor : Nat; level : Nat; reference : Nat; tripped : Nat };
+  public let INDEX_ROW_BYTES = 81;   // four figures of 8, the divisor 32, level and reference 8 each, the trip 1
+  public let indexRows : RS.Decl<IndexRow> = {
+    table = "indices"; idBytes = 8; rowBytes = INDEX_ROW_BYTES;
+    encode = func(x : IndexRow) : Blob {
+      let b = R.buf(); for (v in [x.base, x.capBps, x.haltBps, x.suspendBps].vals()) R.putNat(b, v, 8);
+      R.putNat(b, x.divisor, 32); R.putNat(b, x.level, 8); R.putNat(b, x.reference, 8); R.putNat(b, x.tripped, 1); padded(b, INDEX_ROW_BYTES)
+    };
+    decode = func(a : [Nat8]) : IndexRow {
+      { base = R.getNat(a, 0, 8); capBps = R.getNat(a, 8, 8); haltBps = R.getNat(a, 16, 8); suspendBps = R.getNat(a, 24, 8); divisor = R.getNat(a, 32, 32);
+        level = R.getNat(a, 64, 8); reference = R.getNat(a, 72, 8); tripped = R.getNat(a, 80, 1) }
+    };
+    indexes = [];
+  };
+  /// A constituent of an index: its free-float shares and its capping factor in parts per billion.
+  public type ConstituentRow = { index : Nat; instrument : Nat; shares : Nat; factor : Nat };
+  public let constituentRows : RS.Decl<ConstituentRow> = {
+    table = "constituents"; idBytes = 8; rowBytes = 32;
+    encode = func(x : ConstituentRow) : Blob { let b = R.buf(); for (v in [x.index, x.instrument, x.shares, x.factor].vals()) R.putNat(b, v, 8); padded(b, 32) };
+    decode = func(a : [Nat8]) : ConstituentRow { { index = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); shares = R.getNat(a, 16, 8); factor = R.getNat(a, 24, 8) } };
+    indexes = [{ name = "byIndex"; keyBytes = 16; keyOf = func(_ : Nat, x : ConstituentRow) : ?Blob { ?R.key2(x.index, 8, x.instrument, 8) } }];
+  };
+  /// The index's path: every level it took, with the block.
+  public type PathRow = { index : Nat; block : Nat; level : Nat };
+  public let pathRows : RS.Decl<PathRow> = {
+    table = "indexpath"; idBytes = 8; rowBytes = 24;
+    encode = func(x : PathRow) : Blob { let b = R.buf(); for (v in [x.index, x.block, x.level].vals()) R.putNat(b, v, 8); padded(b, 24) };
+    decode = func(a : [Nat8]) : PathRow { { index = R.getNat(a, 0, 8); block = R.getNat(a, 8, 8); level = R.getNat(a, 16, 8) } };
+    indexes = [];
+  };
+  public let E18 = 1_000_000_000_000_000_000;
+  public let E9 = 1_000_000_000;
   /// A drop-copy row (SPEC §14): a block that concerns a member, and whether it is the member's own act.
   public type DropRow = { member : Nat; block : Nat; own : Bool };
   public let DROP_ROW_BYTES = 17;   // member 8, block 8, own 1
@@ -557,6 +598,7 @@ module {
     and PRINCIPAL_BYTES * 2 + 8 + 8 + 1 + T.MAX_BANDS * 16 + 4 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 8 == 390 and 390 <= INSTRUMENT_ROW_BYTES
     and 8 + 8 + 1 <= KILL_ROW_BYTES and 8 * 5 == LIMIT_ROW_BYTES
     and 32 <= REF_ROW_BYTES and 1 <= DUE_ROW_BYTES
+    and 8 * 4 + 32 + 8 * 2 + 1 == INDEX_ROW_BYTES
     and 1 + 4 * (8 + 4) == FEE_ROW_BYTES and 9 * 8 + 2 + 8 * 3 == MAKER_ROW_BYTES
     and 8 * 12 + 1 == CLEARING_ROW_BYTES and 1 + PRINCIPAL_BYTES + 8 * 4 == LEG_ROW_BYTES and 8 + 8 + PRINCIPAL_BYTES + 8 * 6 == TERMS_BYTES
   };
@@ -596,6 +638,10 @@ module {
     reconStore : RS.Store; var nextRecon : Nat;
     /// Market makers (SPEC §25).
     makerStore : RS.Store; var nextMaker : Nat; makerDayStore : RS.Store; var nextMakerDay : Nat; var lastMakerDay : Nat;
+    /// Indices (SPEC §26, §27): the rows by number, the constituents, the path; whether an act moved a price; the index
+    /// whose breaker is due (0 none); the time of the last suspension to the close.
+    indexStore : RS.Store; constituentStore : RS.Store; var nextConstituent : Nat; pathStore : RS.Store; var nextPath : Nat;
+    var pricesMoved : Bool; var breakerDue : Nat; var suspendedAt : Nat64;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -626,6 +672,8 @@ module {
       statementStore = RS.newStore(statementRows); var nextStatement = 1; statementSealStore = RS.newStore(statementSealRows); var nextStatementSeal = 1; var lastStatementDay = 0;
       reconStore = RS.newStore(reconRows); var nextRecon = 1;
       makerStore = RS.newStore(makerRows); var nextMaker = 1; makerDayStore = RS.newStore(makerDayRows); var nextMakerDay = 1; var lastMakerDay = 0;
+      indexStore = RS.newStore(indexRows); constituentStore = RS.newStore(constituentRows); var nextConstituent = 1; pathStore = RS.newStore(pathRows); var nextPath = 1;
+      var pricesMoved = false; var breakerDue = 0; var suspendedAt = 0;
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -689,6 +737,8 @@ module {
     one(s.orderRows, orders, "ref", refKey(account, clientRef))
   };
   /// Bytes `prefix` followed by `rest` bytes of 0x00 (low) or 0xFF (high): a key range over everything under a prefix.
+  /// The bytes after a side's 9-byte prefix in a key of the book (57-byte keys) or of the stops (25).
+  func sideRest(ix : Nat8) : Nat { if (ix == STOPS) 16 else 48 };
   func span(prefix : Blob, rest : Nat) : (Blob, Blob) {
     let lo = Blob.fromArray(Array.concat(Blob.toArray(prefix), Array.tabulate<Nat8>(rest, func(_) { 0 })));
     let hi = Blob.fromArray(Array.concat(Blob.toArray(prefix), Array.tabulate<Nat8>(rest, func(_) { 255 })));
@@ -733,7 +783,8 @@ module {
           };
           switch (p.next) { case (?n) cursor := ?n; case null { if (not met) Map.add(s.marks, Blob.compare, mk, hi); break w } };
         };
-        case (#err(_)) break w;
+        // a range the index refuses is a range built wrong: swallowed, it would answer "no row" for every range
+        case (#err(e)) Runtime.trap("walk: the " # indexOf(ix) # " index refused the range: " # debug_show(e));
       };
     };
   };
@@ -852,6 +903,105 @@ module {
   };
   public func statementSealOf(s : State, member : Nat, day : Nat) : ?StatementSeal { switch (one(s.statementSealStore, statementSealRows, "byMemberDay", R.key2(member, 8, day, 8))) { case (?(_, x)) ?x; case null null } };
   public func reconOf(s : State, id : Nat) : ?Recon { RS.get(s.reconStore, reconRows, id) };
+
+  // ─── indices (SPEC §26, §27) ───────────────────────────────────────────────────────────────
+  func halfEvenDiv(n : Nat, d : Nat) : Nat { let q = n / d; let r = n % d; if (2 * r > d) q + 1 else if (2 * r < d) q else q + q % 2 };
+  public func indexRowOf(s : State, index : Nat) : ?IndexRow { RS.get(s.indexStore, indexRows, index) };
+  public func constituentsOf(s : State, index : Nat) : [(Nat, ConstituentRow)] {
+    let out = List.empty<(Nat, ConstituentRow)>();
+    var cursor : ?Page.Cursor = null;
+    label reading loop {
+      switch (RS.page(s.constituentStore, constituentRows, "byIndex", R.key2(index, 8, 0, 8), R.key2(index, 8, MAXP, 8), cursor, 100)) {
+        case (#ok(p)) { for (r in p.rows.vals()) List.add(out, r); switch (p.next) { case (?n) cursor := ?n; case null break reading } };
+        case (#err(_)) break reading;
+      };
+    };
+    List.toArray(out)
+  };
+  func instrumentMark(s : State, inst : Nat) : Nat { switch (instrument(s, inst)) { case (?i) markPrice(i); case null 0 } };
+  /// The adjusted capitalisation: each constituent's mark × its free-float shares × its factor.
+  func capitalisation(s : State, index : Nat) : Nat { var m = 0; for ((_, c) in constituentsOf(s, index).vals()) m += instrumentMark(s, c.instrument) * c.shares * c.factor; m };
+  /// SPEC §26: the capping factors (parts per billion) for marks × shares `m` under a cap in basis points: those above it
+  /// fixed at it, the rest in proportion, until none is above.
+  public func capFactors(m : [Nat], capBps : Nat) : [Nat] {
+    let n = m.size();
+    let capped = VarArray.repeat<Bool>(false, n);
+    if (capBps == 0) return Array.tabulate<Nat>(n, func(_) { E9 });
+    var changed = true;
+    while (changed) {
+      changed := false;
+      var rest = 0; var k = 0;
+      for (j in Nat.range(0, n)) { if (capped[j]) k += 1 else rest += m[j] };
+      for (j in Nat.range(0, n)) {
+        // the uncapped share of the rest: m_j / rest × (10_000 - k × cap) / 10_000, above the cap when m_j × (10_000 - k cap) > cap × rest
+        if (not capped[j] and rest > 0 and k * capBps < 10_000 and m[j] * (10_000 - k * capBps) > capBps * rest) { capped[j] := true; changed := true };
+      };
+    };
+    var rest = 0; var k = 0;
+    for (j in Nat.range(0, n)) { if (capped[j]) k += 1 else rest += m[j] };
+    Array.tabulate<Nat>(n, func(j) { if (not capped[j] or m[j] == 0 or k * capBps >= 10_000) E9 else halfEvenDiv(capBps * rest * E9, m[j] * (10_000 - k * capBps)) })
+  };
+  /// The constituents written with their factors at the present marks.
+  func putConstituents(s : State, index : Nat, cs : [T.Constituent], capBps : Nat) {
+    let marks = Array.map<T.Constituent, Nat>(cs, func(c) { instrumentMark(s, c.instrument) * c.shares });
+    let factors = capFactors(marks, capBps);
+    for (k in Nat.range(0, cs.size())) {
+      let row = { index; instrument = cs[k].instrument; shares = cs[k].shares; factor = factors[k] };
+      switch (one(s.constituentStore, constituentRows, "byIndex", R.key2(index, 8, cs[k].instrument, 8))) {
+        case (?(id, _)) RS.put(s.constituentStore, constituentRows, id, row);
+        case null { let id = s.nextConstituent; s.nextConstituent += 1; RS.put(s.constituentStore, constituentRows, id, row) };
+      };
+    };
+  };
+  func addPath(s : State, index : Nat, level : Nat) { RS.put(s.pathStore, pathRows, s.nextPath, { index; block = s.applying; level }); s.nextPath += 1 };
+  /// The divisor set again so the level does not move by itself (§26, continuity).
+  func keepLevel(s : State, index : Nat) {
+    let ?x = indexRowOf(s, index) else return;
+    let m = capitalisation(s, index);
+    if (m > 0 and x.level > 0) RS.put(s.indexStore, indexRows, index, { x with divisor = halfEvenDiv(m * E18, x.level) });
+  };
+  /// After an act that moved a price: every index's level again; a changed one recorded; a breaker due when a move from
+  /// the reference crosses a threshold not yet tripped (§27).
+  func recomputeIndices(s : State) {
+    for (index in Nat.range(1, T.MAX_INDICES + 1)) {
+      switch (indexRowOf(s, index)) {
+        case (?x) {
+          let m = capitalisation(s, index);
+          let level = if (x.divisor == 0) 0 else halfEvenDiv(m * E18, x.divisor);
+          if (level != x.level) { RS.put(s.indexStore, indexRows, index, { x with level }); addPath(s, index, level) };
+          let move = if (level > x.reference) level - x.reference else x.reference - level;
+          let halt = x.tripped == 0 and move * 10_000 >= x.haltBps * x.reference;
+          let suspend = x.tripped < 2 and x.suspendBps > 0 and move * 10_000 >= x.suspendBps * x.reference;
+          if ((halt or suspend) and s.breakerDue == 0) s.breakerDue := index;
+        };
+        case null {};
+      };
+    };
+  };
+  /// A price quantised half-even to its tick, at least one tick.
+  func toTick(i : T.Instrument, p : Nat) : Nat { let t = L.tickAt(i.bands, p); Nat.max(t, halfEvenDiv(p, t) * t) };
+  /// Whether an instrument has a live or waiting order on either side.
+  func openOrder(s : State, inst : Nat) : Bool {
+    var found = false;
+    for (ix in [BOOK, STOPS].vals()) {
+      for (side in [#buy, #sell].vals()) {
+        let prefix = sidePrefix(inst, side);
+        let (lo, hi) = span(prefix, sideRest(ix));
+        walk(s, ix, prefix, lo, hi, 8, func(_ : Nat, o : T.Order) : Bool { if (isLiveish(o) and o.instrument == inst) { found := true; false } else true });
+      };
+    };
+    found
+  };
+  func constituentRefusal(s : State, cs : [T.Constituent]) : ?T.Error {
+    if (cs.size() == 0 or cs.size() > T.MAX_CONSTITUENTS) return ?#InvalidTerms({ reason = "one to fifty constituents" });
+    for (k in Nat.range(0, cs.size())) {
+      if (instrument(s, cs[k].instrument) == null) return ?#UnknownInstrument({ instrument = cs[k].instrument });
+      if (cs[k].shares == 0) return ?#InvalidTerms({ reason = "free-float shares above zero" });
+      for (j in Nat.range(0, k)) { if (cs[j].instrument == cs[k].instrument) return ?#InvalidTerms({ reason = "a constituent once" }) };
+    };
+    null
+  };
+  public func pathOf(s : State, id : Nat) : ?PathRow { RS.get(s.pathStore, pathRows, id) };
 
   // ─── market makers (SPEC §25) ──────────────────────────────────────────────────────────────
   public func makerOf(s : State, member : Nat, inst : Nat) : ?(Nat, Maker) { one(s.makerStore, makerRows, "byKey", R.key2(member, 8, inst, 8)) };
@@ -1426,6 +1576,8 @@ module {
       case (#resume(x)) {
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
         if (i.phase != #halted) return ?#InvalidTerms({ reason = "the instrument is not halted" });
+        // a market-wide suspension holds to the close: nothing resumes before the next market day (SPEC §27)
+        if (s.suspendedAt != 0 and X.marketTime(xs, now).0 <= X.marketTime(xs, s.suspendedAt).0) return ?#InvalidTerms({ reason = "suspended to the close" });
         null
       };
       case (#kill(x)) {
@@ -1677,6 +1829,35 @@ module {
       };
       case (#quote(x)) quoteRefusal(s, xs, now, caller, x.account, x.member, x.trader, [x.side]);
       case (#massQuote(x)) quoteRefusal(s, xs, now, caller, x.account, x.member, x.trader, x.sides);
+      case (#defineIndex(x)) {
+        if (x.index == 0 or x.index > T.MAX_INDICES) return ?#InvalidTerms({ reason = "an index numbered one to eight" });
+        if (indexRowOf(s, x.index) != null) return ?#InvalidTerms({ reason = "already defined" });
+        if (x.base == 0) return ?#InvalidTerms({ reason = "a base above zero" });
+        switch (constituentRefusal(s, x.constituents)) { case (?e) return ?e; case null {} };
+        if (x.capBps > 10_000 or (x.capBps > 0 and x.capBps * x.constituents.size() <= 10_000)) return ?#InvalidTerms({ reason = "a cap the constituents can meet" });
+        if (x.haltBps == 0 or x.haltBps > 10_000 or (x.suspendBps != 0 and (x.suspendBps <= x.haltBps or x.suspendBps > 10_000))) return ?#InvalidTerms({ reason = "a halt threshold, and a suspension's above it" });
+        null
+      };
+      case (#reviewIndex(x)) {
+        let ?_ = indexRowOf(s, x.index) else return ?#InvalidTerms({ reason = "no such index" });
+        switch (constituentRefusal(s, x.constituents)) { case (?e) return ?e; case null {} };
+        let now_ = constituentsOf(s, x.index);
+        if (now_.size() != x.constituents.size()) return ?#InvalidTerms({ reason = "the same constituents" });
+        for (c in x.constituents.vals()) { if (one(s.constituentStore, constituentRows, "byIndex", R.key2(x.index, 8, c.instrument, 8)) == null) return ?#InvalidTerms({ reason = "the same constituents" }) };
+        null
+      };
+      case (#corporateAction(x)) {
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        if (i.phase != #closed) return ?#InvalidTerms({ reason = "an instrument closed" });
+        if (openOrder(s, x.instrument)) return ?#InvalidTerms({ reason = "an instrument with no open order" });
+        if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "the custody action's 32-byte hash" });
+        switch (x.action) {
+          case (#split(a)) { if (a.num == 0 or a.den == 0 or a.num == a.den) return ?#InvalidTerms({ reason = "a split of two different counts" }) };
+          case (#dividend(a)) { if (a.amount == 0 or a.amount >= markPrice(i)) return ?#InvalidTerms({ reason = "a dividend below the price" }) };
+        };
+        null
+      };
+      case (#tripBreaker(_)) ?#ClearNotSubmittable;
       case (#settleMakers(x)) {
         if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day of the act" });
         if (x.day <= s.lastMakerDay) return ?#InvalidTerms({ reason = "a day later than the last settled" });
@@ -1691,7 +1872,7 @@ module {
     var found = false;
     for (ix in [BOOK, STOPS].vals()) {
       let prefix = sidePrefix(inst, #buy);
-      let (lo, hi) = span(prefix, 48);
+      let (lo, hi) = span(prefix, sideRest(ix));
       walk(s, ix, prefix, lo, hi, 8, func(_ : Nat, o : T.Order) : Bool { if (isLiveish(o) and o.instrument == inst and o.side == #buy) { found := true; false } else true });
     };
     found
@@ -1872,6 +2053,8 @@ module {
   /// A command applied, then every market maker's presence accrued to its time (SPEC §25).
   public func apply(s : State, now : Nat64, c : T.Command) : T.Effects {
     let e = applyCommand(s, now, c);
+    // the indices follow the prices this act moved (SPEC §26)
+    if (s.pricesMoved) { s.pricesMoved := false; recomputeIndices(s) };
     accrueMakers(s, now);
     e
   };
@@ -1892,6 +2075,7 @@ module {
       case (#setReference(x)) {
         let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
         RS.put<T.Instrument>(s.instrumentRows, instruments, x.instrument, { i with referencePrice = x.price });
+        s.pricesMoved := true;
         [3, x.instrument]
       };
       case (#deposit(x)) {
@@ -2189,6 +2373,56 @@ module {
       case (#quote(x)) enterQuotes(s, now, x.account, x.member, x.trader, [x.side], 45);
       case (#massQuote(x)) enterQuotes(s, now, x.account, x.member, x.trader, x.sides, 46);
       case (#settleMakers(x)) settleMakers(s, now, x.day);
+      case (#defineIndex(x)) {
+        putConstituents(s, x.index, x.constituents, x.capBps);
+        let m = capitalisation(s, x.index);
+        let divisor = halfEvenDiv(m * E18, x.base * 100);
+        let level = halfEvenDiv(m * E18, divisor);
+        RS.put(s.indexStore, indexRows, x.index, { base = x.base; capBps = x.capBps; haltBps = x.haltBps; suspendBps = x.suspendBps; divisor; level; reference = level; tripped = 0 });
+        addPath(s, x.index, level);
+        [48, x.index, level]
+      };
+      case (#reviewIndex(x)) {
+        let ?row = indexRowOf(s, x.index) else Runtime.trap("apply: an index vanished");
+        putConstituents(s, x.index, x.constituents, row.capBps);
+        keepLevel(s, x.index);
+        [49, x.index, row.level]
+      };
+      case (#corporateAction(x)) {
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        let (ref, last) = switch (x.action) {
+          case (#split(a)) (toTick(i, halfEvenDiv(i.referencePrice * a.den, a.num)), if (i.lastPrice == 0) 0 else toTick(i, halfEvenDiv(i.lastPrice * a.den, a.num)));
+          case (#dividend(a)) (toTick(i, i.referencePrice - Nat.min(i.referencePrice - 1, a.amount)), if (i.lastPrice == 0) 0 else toTick(i, i.lastPrice - Nat.min(i.lastPrice - 1, a.amount)));
+        };
+        RS.put<T.Instrument>(s.instrumentRows, instruments, x.instrument, { i with referencePrice = ref; lastPrice = last });
+        var touched = 0;
+        for (index in Nat.range(1, T.MAX_INDICES + 1)) {
+          switch (one(s.constituentStore, constituentRows, "byIndex", R.key2(index, 8, x.instrument, 8))) {
+            case (?(id, c)) {
+              switch (x.action) { case (#split(a)) RS.put(s.constituentStore, constituentRows, id, { c with shares = halfEvenDiv(c.shares * a.num, a.den) }); case (#dividend(_)) {} };
+              keepLevel(s, index); touched += 1;
+            };
+            case null {};
+          };
+        };
+        [50, x.instrument, ref, touched]
+      };
+      case (#tripBreaker(x)) {
+        let ?row = indexRowOf(s, x.index) else Runtime.trap("apply: an index vanished");
+        let move = if (row.level > row.reference) row.level - row.reference else row.reference - row.level;
+        let kind = if (row.suspendBps > 0 and move * 10_000 >= row.suspendBps * row.reference) 2 else 1;
+        RS.put(s.indexStore, indexRows, x.index, { row with tripped = kind });
+        if (kind == 2) s.suspendedAt := now;
+        s.breakerDue := 0;
+        let halted = List.empty<Nat>();
+        for (inst in s.instrumentList.vals()) {
+          switch (instrument(s, inst)) {
+            case (?i) { if (i.phase != #halted) { RS.put<T.Instrument>(s.instrumentRows, instruments, inst, { i with phase = (#halted : T.Phase); endFrom = 0; endTo = 0; interruptUntil = 0 }); markDue(s, inst, true); List.add(halted, inst) } };
+            case null {};
+          };
+        };
+        Array.concat<Nat>([51, x.index, row.level, kind, List.size(halted)], List.toArray(halted))
+      };
     }
   };
 
@@ -2620,6 +2854,8 @@ module {
     s.lastSealed := day;
     let hash = Sha256.fromBlob(#sha256, dayFileOf(day, rows));
     RS.put(s.sealStore, sealRows, s.nextSeal, { day; rows = rows.size(); hash }); s.nextSeal += 1;
+    // every index's reference is its level at the close, its breaker armed again (SPEC §27)
+    for (index in Nat.range(1, T.MAX_INDICES + 1)) { switch (indexRowOf(s, index)) { case (?x) RS.put(s.indexStore, indexRows, index, { x with reference = x.level; tripped = 0 }); case null {} } };
     (rows.size(), hash)
   };
   /// A day's seal, if it was sealed.
@@ -2655,6 +2891,7 @@ module {
   };
   /// After a trade at `price`: the last price, trailing stops follow it, and stops it reaches are due (§2).
   func afterTrade(s : State, inst : Nat, price : Nat) {
+    s.pricesMoved := true;
     let ?i1 = instrument(s, inst) else Runtime.trap("clear: instrument vanished");
     RS.put<T.Instrument>(s.instrumentRows, instruments, inst, { i1 with lastPrice = price });
     trailStops(s, inst, i1.bands, price);
@@ -2778,6 +3015,8 @@ module {
     let effects = apply(s, now, c);
     let b = DL.append(s.log, K.codec, now, caller, #executed({ proposal; version; command = c; effects }), null);
     s.lastTime := now;
+    // an index moved past a threshold: the breaker in the next block, every instrument halted in it (SPEC §27)
+    if (s.breakerDue != 0) ignore appendExecuted(s, now, caller, null, K.registry.current, #tripBreaker({ index = s.breakerDue }));
     (b.index, effects)
   };
 
@@ -3045,6 +3284,10 @@ module {
     table<Recon>("memberrecons", s.reconStore, reconRows, s.nextRecon);
     table<Maker>("makers", s.makerStore, makerRows, s.nextMaker);
     table<MakerDay>("makerdays", s.makerDayStore, makerDayRows, s.nextMakerDay);
+    table<IndexRow>("indices", s.indexStore, indexRows, T.MAX_INDICES + 1);
+    table<ConstituentRow>("constituents", s.constituentStore, constituentRows, s.nextConstituent);
+    table<PathRow>("indexpath", s.pathStore, pathRows, s.nextPath);
+    Fold.section(f, "breaker", func(w : C.Writer) { w.nat(s.breakerDue); w.nat64(s.suspendedAt) });
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
@@ -3076,7 +3319,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 63) {
+    while (left > 0 and run.part < 70) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -3141,19 +3384,27 @@ module {
         case 59 tableStep<Maker>(w, run, s.makerStore, makerRows, s.nextMaker, 60);
         case 60 tableHead(w, run, "makerdays", s.nextMakerDay, 61);
         case 61 tableStep<MakerDay>(w, run, s.makerDayStore, makerDayRows, s.nextMakerDay, 62);
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 63 };
+        case 62 tableHead(w, run, "indices", T.MAX_INDICES + 1, 63);
+        case 63 tableStep<IndexRow>(w, run, s.indexStore, indexRows, T.MAX_INDICES + 1, 64);
+        case 64 tableHead(w, run, "constituents", s.nextConstituent, 65);
+        case 65 tableStep<ConstituentRow>(w, run, s.constituentStore, constituentRows, s.nextConstituent, 66);
+        case 66 tableHead(w, run, "indexpath", s.nextPath, 67);
+        case 67 tableStep<PathRow>(w, run, s.pathStore, pathRows, s.nextPath, 68);
+        case 68 { w.text("breaker"); w.nat(s.breakerDue); w.nat64(s.suspendedAt); run.part := 69 };
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 70 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 63) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 70) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };
   public func counters(s : State) : [Nat] {
     [s.nextOrder, s.nextBalance, s.nextRef, Nat64.toNat(s.batchTime), s.dueCount, Nat64.toNat(s.lastTime), s.nextKill, s.nextLimit,
      s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode,
-     s.nextPayable, s.nextFeeTotal, s.nextStatement, s.nextStatementSeal, s.lastStatementDay, s.nextRecon, s.nextMaker, s.nextMakerDay, s.lastMakerDay]
+     s.nextPayable, s.nextFeeTotal, s.nextStatement, s.nextStatementSeal, s.lastStatementDay, s.nextRecon, s.nextMaker, s.nextMakerDay, s.lastMakerDay,
+     s.nextConstituent, s.nextPath, s.breakerDue, Nat64.toNat(s.suspendedAt)]
   };
   /// The order indexes whose entries leave as orders change (the reference index's keys never move).
   public let churnIndexes : [Text] = ["book", "stops", "own", "day", "gtd", "immediate", "trailing", "member", "trader"];

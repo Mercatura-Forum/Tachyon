@@ -452,3 +452,36 @@ to the continuous session. The scheduler's `settleMakers` for a market day recor
 presence, the session's length and whether the obligation was met, then resets both; a maker that met it is paid its
 rebate from the exchange's fee account. The rebate is the fees its fills paid on that instrument that day × the rebate
 rate, quantised half-even.
+
+## 26. Indices
+
+An **index** is defined under four eyes: its constituents (each an instrument and its free-float shares), its base
+level, a weight cap in basis points (0 for none) and its breaker's two thresholds (§27). Its level is computed in the
+fold, from the same trades as everything else, never from a feed: the adjusted capitalisation M is the sum over the
+constituents of the last price (the reference before any trade) × the free-float shares × the capping factor (parts
+per billion, 10^9 uncapped); the level, in hundredths of a point, is M × 10^18 / D quantised half-even, D the divisor.
+At definition D is M × 10^18 / (the base × 100), half-even, so the index starts at its base.
+
+**Capping** (as the EGX 30 Capped): at definition and at every review (four eyes) the factors are recomputed so that no
+constituent's weight exceeds the cap: the constituents above it are fixed at the cap, the others share the rest in
+proportion, repeated until none is above; each factor quantised half-even to parts per billion.
+
+**Continuity**: whenever the factors, the free-float shares or a constituent's price change for any reason other than
+a trade — a review, a corporate action — the divisor is set again to M_after × 10^18 / the level before, half-even, so
+the level does not move by itself (the divisor's purpose in index methodology).
+
+**The path**: after every act that moves a constituent's last price, each index's level is recomputed and, when it
+changed, recorded with the block.
+
+**Corporate actions** (four eyes, with the custody register's action named by its hash): a **split** of n new for d
+old multiplies the instrument's free-float shares in every index by n / d and divides its reference and last prices by
+it (quantised to the tick, half-even); a **cash dividend** lowers its reference and last prices by the dividend at the
+ex-date. The instrument must be closed with no open order. Each index holding it is then made continuous as above.
+
+## 27. The market-wide circuit breaker
+
+Each index's **reference** is its level at definition and at every day's seal (§15). When a recomputed level moves
+from its reference by at least the first threshold (as the EGX100's ±10%), the book records, in the block straight after
+the one that moved it, a `tripBreaker` that halts **every** instrument in that one block; by at least the second
+(±20%), the halt is a **suspension to the close**: no instrument may be resumed before the next market day. A tripped
+level is not tripped again until the next seal re-arms it. `tripBreaker` is the book's own act; no principal submits it.

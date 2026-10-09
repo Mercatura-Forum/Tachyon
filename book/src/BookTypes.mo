@@ -176,6 +176,14 @@ module {
     #massQuote : { account : AccountId; member : Nat; trader : Nat; sides : [QuoteSide] };
     /// The scheduler's close of the makers' period for the market day: presence recorded, rebates paid (§25).
     #settleMakers : { day : Day };
+    /// An index (SPEC §26; four eyes): its constituents with their free-float shares, its base level, its weight cap and
+    /// its breaker's thresholds in basis points; a review of its constituents' shares (four eyes).
+    #defineIndex : { index : Nat; base : Nat; capBps : Nat; haltBps : Nat; suspendBps : Nat; constituents : [Constituent] };
+    #reviewIndex : { index : Nat; constituents : [Constituent] };
+    /// A corporate action on an instrument (§26; four eyes), naming the custody register's action by its hash.
+    #corporateAction : { instrument : InstrumentId; action : Action; reference : Blob };
+    /// The market-wide breaker (§27): the book's own act, in the block straight after the one that moved an index.
+    #tripBreaker : { index : Nat };
   };
 
   /// A levy of a fee schedule (SPEC §22): its recipient account and its rate in parts per million of a fill's value.
@@ -185,6 +193,12 @@ module {
   /// One instrument's quote (§25): the bid and the ask, the quantity each side, the client reference its sides take
   /// (the bid's with ".b", the ask's with ".a").
   public type QuoteSide = { instrument : InstrumentId; bidPrice : Nat; askPrice : Nat; qty : Nat; ref : Text };
+  /// An index's constituent (§26): the instrument and its free-float shares.
+  public type Constituent = { instrument : InstrumentId; shares : Nat };
+  /// A corporate action (§26): a split of `num` new for `den` old, or a cash dividend per share.
+  public type Action = { #split : { num : Nat; den : Nat }; #dividend : { amount : Nat } };
+  public let MAX_INDICES = 8;
+  public let MAX_CONSTITUENTS = 50;
   public let MAX_LEVIES = 4;
   public let MAX_ATTESTED = 64;
   public let MAX_MASS_QUOTE = 16;

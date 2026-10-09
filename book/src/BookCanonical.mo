@@ -35,6 +35,13 @@ module {
   public func phaseCode(p : T.Phase) : Nat8 { switch (p) { case (#closed) 1; case (#continuous) 2; case (#auction) 3; case (#closingAuction) 4; case (#tradeAtClose) 5; case (#halted) 6 } };
   public func phaseOf(c : Nat8) : ?T.Phase { switch (c) { case 1 ?#closed; case 2 ?#continuous; case 3 ?#auction; case 4 ?#closingAuction; case 5 ?#tradeAtClose; case 6 ?#halted; case _ null } };
 
+  func writeConstituents(w : C.Writer, cs : [T.Constituent]) { w.len16(cs.size()); for (c in cs.vals()) { w.nat(c.instrument); w.nat(c.shares) } };
+  func readConstituents(r : C.Reader) : ?[T.Constituent] {
+    let ?n = r.len16() else return null;
+    let out = List.empty<T.Constituent>();
+    for (_ in Nat.range(0, n)) { let ?instrument = r.nat() else return null; let ?shares = r.nat() else return null; List.add(out, { instrument; shares }) };
+    ?List.toArray(out)
+  };
   func writeQuote(w : C.Writer, q : T.QuoteSide) { w.nat(q.instrument); w.nat(q.bidPrice); w.nat(q.askPrice); w.nat(q.qty); w.text(q.ref) };
   func readQuote(r : C.Reader) : ?T.QuoteSide {
     let ?instrument = r.nat() else return null; let ?bidPrice = r.nat() else return null; let ?askPrice = r.nat() else return null;
@@ -105,6 +112,14 @@ module {
       case (#quote(x)) { w.byte(45); w.nat(x.account); w.nat(x.member); w.nat(x.trader); writeQuote(w, x.side) };
       case (#massQuote(x)) { w.byte(46); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.len16(x.sides.size()); for (q in x.sides.vals()) writeQuote(w, q) };
       case (#settleMakers(x)) { w.byte(47); w.nat(x.day) };
+      case (#defineIndex(x)) { w.byte(48); w.nat(x.index); w.nat(x.base); w.nat(x.capBps); w.nat(x.haltBps); w.nat(x.suspendBps); writeConstituents(w, x.constituents) };
+      case (#reviewIndex(x)) { w.byte(49); w.nat(x.index); writeConstituents(w, x.constituents) };
+      case (#corporateAction(x)) {
+        w.byte(50); w.nat(x.instrument);
+        switch (x.action) { case (#split(a)) { w.byte(1); w.nat(a.num); w.nat(a.den) }; case (#dividend(a)) { w.byte(2); w.nat(a.amount) } };
+        w.blob(x.reference)
+      };
+      case (#tripBreaker(x)) { w.byte(51); w.nat(x.index) };
     };
     true
   };
@@ -196,6 +211,23 @@ module {
         ?#massQuote({ account; member; trader; sides = List.toArray(out) })
       };
       case 47 { let ?day = r.nat() else return null; ?#settleMakers({ day }) };
+      case 48 {
+        let ?index = r.nat() else return null; let ?base = r.nat() else return null; let ?capBps = r.nat() else return null;
+        let ?haltBps = r.nat() else return null; let ?suspendBps = r.nat() else return null; let ?constituents = readConstituents(r) else return null;
+        ?#defineIndex({ index; base; capBps; haltBps; suspendBps; constituents })
+      };
+      case 49 { let ?index = r.nat() else return null; let ?constituents = readConstituents(r) else return null; ?#reviewIndex({ index; constituents }) };
+      case 50 {
+        let ?instrument = r.nat() else return null; let ?k = r.byte() else return null;
+        let ?action : ?T.Action = (switch (k) {
+          case 1 { switch (r.nat(), r.nat()) { case (?num, ?den) ?#split({ num; den }); case (_) null } };
+          case 2 { switch (r.nat()) { case (?amount) ?#dividend({ amount }); case null null } };
+          case _ null;
+        }) else return null;
+        let ?reference = r.blob() else return null;
+        ?#corporateAction({ instrument; action; reference })
+      };
+      case 51 { let ?index = r.nat() else return null; ?#tripBreaker({ index }) };
       case _ null;
     }
   };
@@ -206,7 +238,8 @@ module {
     "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay", "setBlackout", "liftBlackout", "borrow", "returnBorrow",
     "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle", "settleCycle", "closeOut", "callFund",
     "contributeFund", "fundSkin", "declareDefault", "closeDefault",
-    "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "quote", "massQuote", "settleMakers"];
+    "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "quote", "massQuote", "settleMakers",
+    "defineIndex", "reviewIndex", "corporateAction", "tripBreaker"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -220,6 +253,7 @@ module {
       case (#callFund) "callFund"; case (#contributeFund(_)) "contributeFund"; case (#fundSkin(_)) "fundSkin"; case (#declareDefault(_)) "declareDefault"; case (#closeDefault(_)) "closeDefault";
       case (#setFeeSchedule(_)) "setFeeSchedule"; case (#sealStatements(_)) "sealStatements"; case (#reconcileMember(_)) "reconcileMember";
       case (#registerMaker(_)) "registerMaker"; case (#quote(_)) "quote"; case (#massQuote(_)) "massQuote"; case (#settleMakers(_)) "settleMakers";
+      case (#defineIndex(_)) "defineIndex"; case (#reviewIndex(_)) "reviewIndex"; case (#corporateAction(_)) "corporateAction"; case (#tripBreaker(_)) "tripBreaker";
     }
   };
 
