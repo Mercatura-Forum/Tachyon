@@ -1,0 +1,283 @@
+{
+  "battery": "BookMarkets",
+  "grants": [
+    {
+      "role": "2vxsx-fae",
+      "prefixes": [
+        "custody."
+      ],
+      "exact": [
+        "exchange.member.admit",
+        "exchange.member.status",
+        "exchange.trader.register",
+        "exchange.trader.revoke",
+        "exchange.right.grant",
+        "exchange.right.withdraw",
+        "exchange.account.open",
+        "exchange.account.close",
+        "exchange.segment.define",
+        "exchange.segment.schedule",
+        "exchange.calendar.restdays",
+        "exchange.calendar.holiday",
+        "exchange.ticktable.define",
+        "exchange.instrument.list",
+        "exchange.instrument.status",
+        "exchange.instrument.lot",
+        "exchange.clock.offset",
+        "book.instrument.open",
+        "book.instrument.halt",
+        "book.instrument.resume",
+        "book.kill.set",
+        "book.kill.revive",
+        "book.risk.limits",
+        "book.insider.blackout",
+        "book.insider.lift",
+        "book.clearing.terms",
+        "book.clearing.margin",
+        "book.clearing.admit",
+        "book.clearing.designate",
+        "book.fund.skin",
+        "book.default.declare",
+        "book.default.close",
+        "book.fees.schedule",
+        "book.maker.register"
+      ]
+    },
+    {
+      "role": "6abng-3xbmm-zos2l-batfg-zytpv-vj2jv-3t7hk-3hh6q-6hugj-2q3bc-cqe",
+      "prefixes": [],
+      "exact": [
+        "exchange.segment.advance",
+        "exchange.instrument.reference",
+        "book.instrument.trading",
+        "book.instrument.reference",
+        "book.batch.flush",
+        "book.sweep.endofday",
+        "book.sweep.expire",
+        "book.instrument.phase",
+        "book.auction.uncross",
+        "book.kill.sweep",
+        "book.day.seal",
+        "book.cycle.cut",
+        "book.cycle.settle",
+        "book.cycle.closeout",
+        "book.fund.call",
+        "book.statements.seal",
+        "book.maker.settle"
+      ]
+    },
+    {
+      "role": "aaaaa-aa",
+      "prefixes": [],
+      "exact": [
+        "command.approve",
+        "command.reject"
+      ]
+    },
+    {
+      "role": "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae",
+      "prefixes": [],
+      "exact": [
+        "command.approve",
+        "command.reject"
+      ]
+    },
+    {
+      "role": "renrk-eyaaa-aaaaa-aaada-cai",
+      "prefixes": [],
+      "exact": [
+        "book.funds.deposit",
+        "book.borrow.record"
+      ]
+    },
+    {
+      "role": "rdmx6-jaaaa-aaaaa-aaadq-cai",
+      "prefixes": [],
+      "exact": [
+        "book.batch.clear"
+      ]
+    },
+    {
+      "role": "ktizj-ppt3n-t4gxw-lzckj-ghema-o6gli-zx5uq-eivp6-q5sun-c22gs-cqe",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel",
+        "book.kill.set",
+        "book.borrow.return",
+        "book.collateral.post",
+        "book.collateral.withdraw",
+        "book.fund.contribute",
+        "book.member.reconcile",
+        "book.maker.quote",
+        "book.maker.massquote"
+      ]
+    },
+    {
+      "role": "rwlgt-iiaaa-aaaaa-aaaaa-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel",
+        "book.kill.set",
+        "book.borrow.return",
+        "book.collateral.post",
+        "book.collateral.withdraw",
+        "book.fund.contribute",
+        "book.member.reconcile",
+        "book.maker.quote",
+        "book.maker.massquote"
+      ]
+    },
+    {
+      "role": "rrkah-fqaaa-aaaaa-aaaaq-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel",
+        "book.kill.set",
+        "book.borrow.return",
+        "book.collateral.post",
+        "book.collateral.withdraw",
+        "book.fund.contribute",
+        "book.member.reconcile",
+        "book.maker.quote",
+        "book.maker.massquote"
+      ]
+    },
+    {
+      "role": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel",
+        "book.kill.set",
+        "book.borrow.return",
+        "book.collateral.post",
+        "book.collateral.withdraw",
+        "book.fund.contribute",
+        "book.member.reconcile",
+        "book.maker.quote",
+        "book.maker.massquote"
+      ]
+    },
+    {
+      "role": "4eveo-eiaaa-aaaaa-aabia-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel",
+        "book.kill.set",
+        "book.borrow.return",
+        "book.collateral.post",
+        "book.collateral.withdraw",
+        "book.fund.contribute",
+        "book.member.reconcile",
+        "book.maker.quote",
+        "book.maker.massquote"
+      ]
+    },
+    {
+      "role": "yva2f-aiaaa-aaaaa-aabqa-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel",
+        "book.kill.set",
+        "book.borrow.return",
+        "book.collateral.post",
+        "book.collateral.withdraw",
+        "book.fund.contribute",
+        "book.member.reconcile",
+        "book.maker.quote",
+        "book.maker.massquote"
+      ]
+    }
+  ],
+  "eligibleRole": "director",
+  "holders": [
+    "aaaaa-aa",
+    "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae"
+  ],
+  "offeringDuals": [],
+  "custodyDuals": [
+    "custody.holder.register",
+    "custody.asset.register",
+    "custody.reconcile",
+    "custody.action.announce",
+    "custody.action.cancel",
+    "custody.file.certify",
+    "custody.account.link"
+  ],
+  "bookDuals": [
+    "book.instrument.open",
+    "book.instrument.halt",
+    "book.instrument.resume",
+    "book.kill.revive",
+    "book.risk.limits",
+    "book.insider.blackout",
+    "book.insider.lift",
+    "book.clearing.terms",
+    "book.clearing.margin",
+    "book.clearing.admit",
+    "book.clearing.designate",
+    "book.fund.skin",
+    "book.default.declare",
+    "book.default.close",
+    "book.fees.schedule",
+    "book.maker.register"
+  ],
+  "exchangeDuals": [
+    "exchange.member.admit",
+    "exchange.member.status",
+    "exchange.trader.register",
+    "exchange.trader.revoke",
+    "exchange.right.grant",
+    "exchange.right.withdraw",
+    "exchange.segment.define",
+    "exchange.segment.schedule",
+    "exchange.calendar.restdays",
+    "exchange.calendar.holiday",
+    "exchange.ticktable.define",
+    "exchange.instrument.list",
+    "exchange.instrument.status",
+    "exchange.instrument.lot",
+    "exchange.clock.offset"
+  ],
+  "ttlSeconds": 3600,
+  "survDuals": [
+    "surv.params",
+    "surv.case.close",
+    "surv.case.report"
+  ]
+}
