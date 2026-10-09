@@ -57,7 +57,7 @@
   "id": "Z07",
   "file": "book/src/BookCore.mo",
   "mutant": "the buyer's difference between its limit and the clear's price kept",
-  "old": "                    credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);\n",
+  "old": "credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);",
   "new": "",
   "test": "Book",
   "property": "the buyer's difference between its limit and the clear's price kept"
@@ -66,8 +66,8 @@
   "id": "Z08",
   "file": "book/src/BookCore.mo",
   "mutant": "an iceberg's priority not refreshed when its peak fills",
-  "old": "if (o.peak != 0 and o.remaining > 0 and f >= Nat.min(o.peak, o.remaining + f)) putOrder(s, oid, { o with prio = time });",
-  "new": "if (o.peak != 0 and o.remaining > 0 and f >= Nat.min(o.peak, o.remaining + f)) putOrder(s, oid, { o with prio = o.prio });",
+  "old": "if (o.peak != 0 and o.remaining > 0 and f >= Nat.min(o.peak, o.remaining + f)) putOrder(s, oid, { o with prio = time })",
+  "new": "if (o.peak != 0 and o.remaining > 0 and f >= Nat.min(o.peak, o.remaining + f)) putOrder(s, oid, { o with prio = o.prio })",
   "test": "Book",
   "property": "an iceberg's priority not refreshed when its peak fills"
  },
@@ -75,8 +75,8 @@
   "id": "Z09",
   "file": "book/src/BookCore.mo",
   "mutant": "a fill does not cancel the linked order",
-  "old": "                        case (?o) { cancelOco(s, o, cancelled); if (o.status == #filled",
-  "new": "                        case (?o) { if (o.status == #filled",
+  "old": "case (?o) { cancelOco(s, o, cancelled); if (o.status == #filled",
+  "new": "case (?o) { if (o.status == #filled",
   "test": "Book",
   "property": "a fill does not cancel the linked order"
  },
@@ -93,7 +93,7 @@
   "id": "Z11",
   "file": "book/src/BookCore.mo",
   "mutant": "immediate orders survive the clear",
-  "old": "      for ((id, o) in List.values(ends)) { if (o.status == #live) { close(s, id, o, #cancelled); List.add(cancelled, id) } };\n",
+  "old": "for ((id, o) in List.values(ends)) { if (o.status == #live) { close(s, id, o, #cancelled); List.add(cancelled, id) } };",
   "new": "",
   "test": "Book",
   "property": "immediate orders survive the clear"
@@ -195,6 +195,150 @@
   "property": "the fingerprint in slices leaves out the proposal rows",
   "old": "case 9 { w.text(\"proposals\"); run.part := 10; run.cursor := 0 };",
   "new": "case 9 { w.text(\"proposals\"); run.part := 11; run.cursor := 0 };",
+  "test": "Book"
+ },
+ {
+  "id": "Z23",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "an uncross between two balanced prices takes the lowest instead of the reference (the reference-price tie-break)",
+  "property": "an uncross between two balanced prices takes the lowest instead of the reference (the reference-price tie-break)",
+  "old": "?(if (reference >= lo and reference <= hi) reference else if (reference < lo) lo else hi)",
+  "new": "?lo",
+  "test": "Book"
+ },
+ {
+  "id": "Z24",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "an uncross with a buy surplus at every remaining price takes the lowest (market pressure reversed)",
+  "property": "an uncross with a buy surplus at every remaining price takes the lowest (market pressure reversed)",
+  "old": "if (Array.all<(Nat, Nat, Int)>(rest, func(c) { c.2 > 0 })) return ?hi;",
+  "new": "if (Array.all<(Nat, Nat, Int)>(rest, func(c) { c.2 > 0 })) return ?lo;",
+  "test": "Book"
+ },
+ {
+  "id": "Z25",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the uncross reference is the reference price, never the last trade",
+  "property": "the uncross reference is the reference price, never the last trade",
+  "old": "let r = L.uncross(bids, asks, i0.lot, if (i0.lastPrice != 0) i0.lastPrice else i0.referencePrice);",
+  "new": "let r = L.uncross(bids, asks, i0.lot, i0.referencePrice);",
+  "test": "Book"
+ },
+ {
+  "id": "Z26",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the static band at entry is not checked",
+  "property": "the static band at entry is not checked",
+  "old": "if (x.price < lo or x.price > hi) return ?#PriceOutsideBand({ price = x.price; low = lo; high = hi });",
+  "new": "ignore (lo, hi);",
+  "test": "Book"
+ },
+ {
+  "id": "Z27",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a continuous clear outside the static band trades instead of interrupting",
+  "property": "a continuous clear outside the static band trades instead of interrupting",
+  "old": "case (?p) { not L.within(p, i0.referencePrice, i0.staticBps) or (i0.dynamicBps",
+  "new": "case (?p) { (i0.dynamicBps",
+  "test": "Book"
+ },
+ {
+  "id": "Z28",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the dynamic band is judged around the reference price instead of the last trade",
+  "property": "the dynamic band is judged around the reference price instead of the last trade",
+  "old": "not L.within(p, if (i0.lastPrice != 0) i0.lastPrice else i0.referencePrice, i0.dynamicBps)) };",
+  "new": "not L.within(p, i0.referencePrice, i0.dynamicBps)) };",
+  "test": "BookStreams1"
+ },
+ {
+  "id": "Z29",
+  "file": "book/src/BookCore.mo",
+  "mutant": "an order on a halted instrument is accepted",
+  "property": "an order on a halted instrument is accepted",
+  "old": "if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });\n        switch (killedFor(s, x.member, x.trader))",
+  "new": "switch (killedFor(s, x.member, x.trader))",
+  "test": "Book"
+ },
+ {
+  "id": "Z30",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a trader-level kill does not block the trader",
+  "property": "a trader-level kill does not block the trader",
+  "old": "case (?k) ?k; case null activeKill(s, 2, trader) } };",
+  "new": "case (?k) ?k; case null null } };",
+  "test": "Book"
+ },
+ {
+  "id": "Z31",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the kill is lifted by its first sweep slice",
+  "property": "the kill is lifted by its first sweep slice",
+  "old": "Array.concat<Nat>([19, x.kill, List.size(done)], List.toArray(done))",
+  "new": "RS.put(s.killRows, kills, x.kill, { k with active = false }); Array.concat<Nat>([19, x.kill, List.size(done)], List.toArray(done))",
+  "test": "Book"
+ },
+ {
+  "id": "Z32",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a revival is accepted while the member's orders are open",
+  "property": "a revival is accepted while the member's orders are open",
+  "old": "if (firstOpenOf(s, k) != null) return ?#OrdersStillOpen({ kill = x.kill });",
+  "new": "",
+  "test": "Book"
+ },
+ {
+  "id": "Z33",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the risk value of an order is its quantity, not price times quantity",
+  "property": "the risk value of an order is its quantity, not price times quantity",
+  "old": "switch (riskRefusal(s, x.member, x.qty, price * x.qty, 0))",
+  "new": "switch (riskRefusal(s, x.member, x.qty, x.qty, 0))",
+  "test": "Book"
+ },
+ {
+  "id": "Z34",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a cancel or a fill never returns the member's use",
+  "property": "a cancel or a fill never returns the member's use",
+  "old": "{ l with used = l.used + after - before }",
+  "new": "{ l with used = if (after > before) l.used + after - before else l.used }",
+  "test": "Book"
+ },
+ {
+  "id": "Z35",
+  "file": "book/src/BookCore.mo",
+  "mutant": "trade at close looks for its buys at a price other than the closing price",
+  "property": "trade at close looks for its buys at a price other than the closing price",
+  "old": "let bids = Array.map<(T.OrderId, T.Order), L.Bid>(crossingSide(s, inst, #buy, i0.closePrice), toBid);",
+  "new": "let bids = Array.map<(T.OrderId, T.Order), L.Bid>(crossingSide(s, inst, #buy, 999_999_999), toBid);",
+  "test": "Book"
+ },
+ {
+  "id": "Z36",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "with surpluses on both sides the reference is held against the whole remaining range, not the highest buy-surplus price to the lowest sell-surplus price",
+  "property": "with surpluses on both sides the reference is held against the whole remaining range, not the highest buy-surplus price to the lowest sell-surplus price",
+  "old": "      for (c in rest.vals()) { if (c.2 > 0 and c.0 > buyTop) buyTop := c.0; if (c.2 < 0 and c.0 < sellBottom) sellBottom := c.0 };\n      lo := buyTop; hi := sellBottom;",
+  "new": "      ignore (buyTop, sellBottom);",
+  "test": "Book"
+ },
+ {
+  "id": "Z37",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the calling index leaves out the closing auction",
+  "property": "the calling index leaves out the closing auction",
+  "old": "if (x.phase == #auction or x.phase == #closingAuction) ?R.key(id, 8) else null",
+  "new": "if (x.phase == #auction) ?R.key(id, 8) else null",
+  "test": "Book"
+ },
+ {
+  "id": "Z38",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the indicative price is held against the reference price, never the last trade, unlike the uncross",
+  "property": "the indicative price is held against the reference price, never the last trade, unlike the uncross",
+  "old": "switch (L.indicative(bids, asks, i.lot, if (i.lastPrice != 0) i.lastPrice else i.referencePrice)) {",
+  "new": "switch (L.indicative(bids, asks, i.lot, i.referencePrice)) {",
   "test": "Book"
  }
 ]
