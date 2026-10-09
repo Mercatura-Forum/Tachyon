@@ -562,8 +562,8 @@
   "file": "book/src/BookCore.mo",
   "mutant": "variation margin ignored",
   "property": "variation margin counts against a member's resources",
-  "old": "    let required = r.imOrders + add - drop + variationOf(s, r);",
-  "new": "    let required = r.imOrders + add - drop;",
+  "old": "    let required = r.imOrders + add - drop + variationOf(s, r) + memberImOf(s, r.member);",
+  "new": "    let required = r.imOrders + add - drop + memberImOf(s, r.member);",
   "test": "BookClearing"
  },
  {
@@ -814,8 +814,8 @@
   "file": "book/src/BookCore.mo",
   "mutant": "the fee left out of the line",
   "property": "a statement line carries the fee",
-  "old": "    appendStatement(s, bo.member, b, #buy, q, p, feeB);",
-  "new": "    appendStatement(s, bo.member, b, #buy, q, p, 0);",
+  "old": "    appendStatement(s, bo.member, b, #buy, q, p, feeB); appendStatement(s, ao.member, a, #sell, q, p, feeS);\n    // a close-out",
+  "new": "    appendStatement(s, bo.member, b, #buy, q, p, 0); appendStatement(s, ao.member, a, #sell, q, p, feeS);\n    // a close-out",
   "test": "BookMarkets"
  },
  {
@@ -1174,8 +1174,143 @@
   "file": "book/src/BookCore.mo",
   "mutant": "open values without the accrual",
   "property": "limits, margins and the CCP's commitment count a bond's accrual",
-  "old": "  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty + accrualBound(s, inst, qty) };",
-  "new": "  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { ignore (s, inst); price * qty };",
+  "old": "  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty * multiplierOf(s, inst) + accrualBound(s, inst, qty) };",
+  "new": "  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty * multiplierOf(s, inst) };",
   "test": "BookInstrumentsStreams"
+ },
+ {
+  "id": "D01",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a stale price accepted",
+  "property": "an attestation is for the market day only",
+  "old": "        if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = \"the market day's price\" });\n",
+  "new": "",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D02",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the mean for the median",
+  "property": "the daily price is the median of the three",
+  "old": "?Nat.max(Nat.min(x, y), Nat.min(Nat.max(x, y), z))",
+  "new": "?((x + y + z) / 3)",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D03",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a settlement before the third price",
+  "property": "a daily settlement waits for three attestations",
+  "old": "        } else if (d.runDay == 0 and attestedPrice(s, x.instrument, x.day) == null) return ?#InvalidTerms({ reason = \"three attestations for the day\" });\n",
+  "new": "        };\n",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D04",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no variation at the fill",
+  "property": "a future's trade is marked at once to the contract's mark",
+  "old": "        if (mark >= p) { owe(s, bm, s.cycleNo, d, 0); owe(s, am, s.cycleNo, 0, d) } else { owe(s, bm, s.cycleNo, 0, d); owe(s, am, s.cycleNo, d, 0) };\n",
+  "new": "        ignore d;\n",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D05",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the variation's sign reversed",
+  "property": "a long is owed a rise and owes a fall",
+  "old": "              if ((price > p.mark) == p.long) to := amt else by := amt;",
+  "new": "              if ((price > p.mark) != p.long) to := amt else by := amt;",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D06",
+  "file": "book/src/BookCore.mo",
+  "mutant": "expiry at the attested price",
+  "property": "a contract expires at the index's level",
+  "old": "let price = if (d.runDay != 0) d.runPrice else if (final) indexLevel(s, indexOfDeriv(s, inst)) else",
+  "new": "let price = if (d.runDay != 0) d.runPrice else if (false) indexLevel(s, indexOfDeriv(s, inst)) else",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D07",
+  "file": "book/src/BookCore.mo",
+  "mutant": "positions kept past expiry",
+  "property": "every position closes at expiry",
+  "old": "          let (qty, im) = if (final) (0, 0) else (p.qty, derivIm(s, inst, p.long, p.qty, price));",
+  "new": "          let (qty, im) = (p.qty, derivIm(s, inst, p.long, p.qty, price));",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D08",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a call paid as a put",
+  "property": "an option pays its own intrinsic value",
+  "old": "  func intrinsic(o : OptionTerms, u : Nat) : Nat { if (o.call) (if (u > o.strike) u - o.strike else 0) else (if (o.strike > u) o.strike - u else 0) };",
+  "new": "  func intrinsic(o : OptionTerms, u : Nat) : Nat { if (not o.call) (if (u > o.strike) u - o.strike else 0) else (if (o.strike > u) o.strike - u else 0) };",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D09",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a writer's margin without the premium",
+  "property": "a writer holds the premium beside the risk",
+  "old": "    ceilDiv(qty * o.multiplier * (premium * 10_000 + risk), 10_000)",
+  "new": "    ceilDiv(qty * o.multiplier * risk, 10_000)",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D10",
+  "file": "book/src/BookCore.mo",
+  "mutant": "out of the money not deducted",
+  "property": "a writer's margin deducts what the option is out of the money",
+  "old": "    let risk = Nat.max(if (a > away) a - away else 0, o.bBps * (if (o.call) u else o.strike));",
+  "new": "    let risk = Nat.max(a, o.bBps * (if (o.call) u else o.strike));",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D11",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the positions' margin uncounted",
+  "property": "an order's margin counts beside the positions'",
+  "old": "    let required = r.imOrders + add - drop + variationOf(s, r) + memberImOf(s, r.member);",
+  "new": "    let required = r.imOrders + add - drop + variationOf(s, r);",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D12",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a derivative on a pre-funded account",
+  "property": "a derivative trades on a clearing account",
+  "old": "          if (clearingOf(s, x.account) == null) return ?#InvalidTerms({ reason = \"a derivative traded on a clearing account\" });\n",
+  "new": "",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D13",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a cycle cut within a run",
+  "property": "no cycle is cut while a derivative's run is in progress",
+  "old": "        for (i in s.instrumentList.vals()) { switch (derivOf(s, i)) { case (?d) { if (d.runDay != 0) return ?#InvalidTerms({ reason = \"a derivative's settlement run finished first\" }) }; case null {} } };\n",
+  "new": "",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D14",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the run's balance dropped",
+  "property": "a run keeps what it owed and charged so far",
+  "old": "          sumTo += to; sumBy += by;\n",
+  "new": "",
+  "test": "BookDerivatives"
+ },
+ {
+  "id": "D15",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a put's floor on the index",
+  "property": "a put's minimum margin is on its strike",
+  "old": "o.bBps * (if (o.call) u else o.strike));",
+  "new": "o.bBps * u);",
+  "test": "BookDerivatives"
  }
 ]
