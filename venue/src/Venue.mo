@@ -59,12 +59,12 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle", "book.bond.valuedate", "book.derivatives.settle"];
   let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
     "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
-    "book.certificate.retire", "book.right.exercise"];
+    "book.certificate.retire", "book.right.exercise", "book.bridge.redeem"];
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
     "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
     "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
     "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply",
-    "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel", "book.attestors.set"];
+    "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel", "book.attestors.set", "book.bridge.register"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -76,6 +76,12 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     if (Principal.equal(p, init.scheduler)) return among(schedulerActs, perm);
     // the price attestors are the three principals the book registered under four eyes (SPEC §33)
     for (k in [1, 2, 3].vals()) { switch (B.attestorOf(bs, k)) { case (?a) { if (Principal.equal(a, p)) return perm == "book.price.attest" }; case null {} } };
+    // an RTGS operator is the principal a bridge was registered with under four eyes (SPEC §36)
+    var bid = 1;
+    while (bid < bs.nextBridge) {
+      switch (B.bridgeRow(bs, bid)) { case (?b) { if (Principal.equal(b.rtgs, p)) return perm == "book.rtgs.earmark" or perm == "book.rtgs.settle" or perm == "book.rtgs.reject" }; case null {} };
+      bid += 1;
+    };
     if (isDirector(p)) return perm == "command.approve" or perm == "command.reject";
     if (Principal.equal(p, init.depository)) return perm == "book.funds.deposit" or perm == "book.borrow.record";
     if (Principal.equal(p, init.analyst)) return perm == "surv.case.open" or perm == "surv.case.note";
@@ -331,6 +337,20 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   public shared (msg) func myPosition(account : Nat, instrument : Nat) : async ?B.Position {
     if (not ownsAccount(msg.caller, account)) return null;
     switch (B.positionOf(bs, account, instrument)) { case (?(_, p)) ?p; case null null }
+  };
+  // ─── the cash leg's bridge (SPEC §36) ───────────────────────────────────────────────────────
+  /// A bridged ledger's backing and pending redemptions: public, the claims' cover in aggregate, naming no holder.
+  public query func bridge(ledger : Principal) : async ?{ backing : Nat; redeeming : Nat; claims : Nat } {
+    switch (B.bridgeOf(bs, ledger)) { case (?(_, b)) ?{ backing = b.backing; redeeming = b.redeeming; claims = B.supplyOf(bs, ledger) }; case null null }
+  };
+  /// A redemption, to a trader of its account's member, the regulator and the directors; refused to anyone else.
+  public shared (msg) func redemption(id : Nat) : async { #ok : B.Redemption; #err : Text } {
+    switch (B.redemptionOf(bs, id)) { case (?r) { if (overseer(msg.caller) or ownsAccount(msg.caller, r.account)) #ok(r) else #err("NotYours") }; case null #err("NotYours") }
+  };
+  /// A member's redemption of claims from its account (SPEC §36); the member and the trader are the caller's.
+  public shared (msg) func redeem(account : Nat, ledger : Principal, amount : Nat) : async Text {
+    let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #redeem({ account; member = callerMember(msg.caller); trader; ledger; amount }), null, ""))
   };
   /// The settlement range's leaf count and root (SPEC §19): public, a hash that names nothing.
   public query func settlementRoot() : async { legs : Nat; root : Blob } { let (legs, root) = B.settlementRoot(bs); { legs; root } };
