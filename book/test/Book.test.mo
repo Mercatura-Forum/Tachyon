@@ -64,7 +64,7 @@ check(not Perm.clean(Perm.validate(missingOne, B.commandNames, B.methodNames)), 
 for ((id, reason) in B.singleActs().vals()) { switch (Perm.byId(cat, id)) { case (?p) check(not p.dualByDefault and reason.size() > 40, "single act " # id # " has its reason"); case null check(false, "single act " # id # " exists") } };
 for (p in cat.vals()) { if (not p.dualByDefault and Text.startsWith(p.id, #text "book.")) check(Array.find<(Text, Text)>(B.singleActs(), func(x) { x.0 == p.id }) != null, "single permission " # p.id # " has its reason recorded") };
 check(B.checkSums(), "row widths hold their fields");
-check(K.families.size() == 66, "sixty-six command families");
+check(K.families.size() == 67, "sixty-seven command families");
 Debug.print("count: catalogue rows validated in both directions = " # Nat.toText(report.checked));
 
 let sampleCommands : [T.Command] = [
@@ -119,6 +119,8 @@ let sampleCommands : [T.Command] = [
   #registerBridge({ ledger = w.claimsL; rtgs = w.rtgs }), #earmark({ ledger = w.claimsL; account = 2; member = 1; amount = 2_000_000; reference = bytes(0x10, 32) }),
   #redeem({ account = 10; member = 2; trader = 3; ledger = w.claimsL; amount = 850_000 }),
   #rtgsSettle({ redemption = 2; reference = bytes(0x22, 32) }), #rtgsReject({ redemption = 1; reference = bytes(0x20, 32) }),
+  // the cancel/replace (SPEC §37)
+  #replaceOrder({ order = 3; qty = 20; price = 84_990; clientRef = "طلب-٣" }),
 ];
 var roundTrips = 0;
 for (c in sampleCommands.vals()) {
@@ -600,7 +602,7 @@ printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancell
   "amendments keeping priority", "amendments taking a new priority", "uncrossed books checked", "checkpoints", "call-phase reads checked", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "uncrosses outside the static band, the auction continuing", "feed digests printed", "icebergs shown after a clear", "days sealed"]);
 // the clearing's families (SPEC §18 to §21, tags 27 to 40) are the clearing battery's, §22 to §25's (41 to 47) the markets
 // battery's, §26 to §27's (48 to 51) the index battery's, §28 to §32's (52 to 58) the instruments battery's, §33 to
-// §35's (59 to 61) the derivatives battery's, and §36's (62 to 66) the cash leg battery's
+// §35's (59 to 61) the derivatives battery's, §36's (62 to 66) the cash leg battery's, and §37's (67) the gateway's
 for (f in Array.sliceToArray<Text>(K.families, 0, 26).vals()) { if (f != "openInstrument" and f != "clear") Debug.print("count: executed " # f # " = " # n(seenCount("executed " # f))) };
 var refusalNames = 0;
 for ((k, _) in Map.entries(seen)) { if (Text.startsWith(k, #text "refused ")) refusalNames += 1 };

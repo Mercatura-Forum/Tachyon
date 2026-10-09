@@ -111,7 +111,7 @@ module {
       "book.statements.seal", "book.maker.settle", "book.bond.valuedate", "book.derivatives.settle"];
     public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
       "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
-      "book.certificate.retire", "book.right.exercise", "book.bridge.redeem"];
+      "book.certificate.retire", "book.right.exercise", "book.bridge.redeem", "book.order.replace"];
     public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift",
       "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
       "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply",
@@ -447,6 +447,7 @@ module {
         case (#redeem(x)) "k=redeem;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";ledger=" # ledgerName(x.ledger) # ";amount=" # n(x.amount);
         case (#rtgsSettle(x)) "k=rtgsSettle;redemption=" # n(x.redemption) # ";reference=" # TR.hex(x.reference);
         case (#rtgsReject(x)) "k=rtgsReject;redemption=" # n(x.redemption) # ";reference=" # TR.hex(x.reference);
+        case (#replaceOrder(x)) "k=replaceOrder;order=" # n(x.order) # ";qty=" # n(x.qty) # ";price=" # n(x.price) # ";ref=" # x.clientRef;
       }
     };
     public func joinText(xs : [Text]) : Text { var o = ""; for (x in xs.vals()) o := o # (if (o == "") "" else ",") # x; o };
