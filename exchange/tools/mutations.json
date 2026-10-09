@@ -1,0 +1,92 @@
+[
+ {
+  "id": "Y01",
+  "file": "exchange/src/ExchangeLogic.mo",
+  "mutant": "the calendar ignored: holidays and rest days traded",
+  "old": "    if (not Cal.isBusinessDay(cal, day)) return #closed;\n",
+  "new": "",
+  "test": "Exchange",
+  "property": "the calendar ignored: holidays and rest days traded"
+ },
+ {
+  "id": "Y02",
+  "file": "exchange/src/ExchangeLogic.mo",
+  "mutant": "the Luhn sum doubles the wrong digits",
+  "old": "    var double = true;\n    while (i > 0) {",
+  "new": "    var double = false;\n    while (i > 0) {",
+  "test": "Exchange",
+  "property": "the Luhn sum doubles the wrong digits"
+ },
+ {
+  "id": "Y03",
+  "file": "exchange/src/ExchangeCore.mo",
+  "mutant": "the scheduler's claimed time not checked against the chain's clock",
+  "old": "        if (x.day != day or x.sec != sec) return ?#NotTheChainsClock({ day; sec });\n",
+  "new": "",
+  "test": "Exchange",
+  "property": "the scheduler's claimed time not checked against the chain's clock"
+ },
+ {
+  "id": "Y04",
+  "file": "exchange/src/ExchangeLogic.mo",
+  "mutant": "every price on the first band's tick",
+  "old": "    for (b in bands.vals()) { if (b.fromPrice <= price) t := b.tick };\n",
+  "new": "",
+  "test": "Exchange",
+  "property": "every price on the first band's tick"
+ },
+ {
+  "id": "Y05",
+  "file": "exchange/src/ExchangeLogic.mo",
+  "mutant": "a schedule with a gap accepted",
+  "old": "      if (i > 0 and ws[i].startSec != ws[i - 1].endSec) return ?\"windows follow one another without gap or overlap\";\n",
+  "new": "",
+  "test": "Exchange",
+  "property": "a schedule with a gap accepted"
+ },
+ {
+  "id": "Y06",
+  "file": "exchange/src/ExchangeCore.mo",
+  "mutant": "an expelled member reinstated",
+  "old": "        if (m.status == #expelled) return ?#ExpelledIsFinal({ member = x.member });\n",
+  "new": "",
+  "test": "Exchange",
+  "property": "an expelled member reinstated"
+ },
+ {
+  "id": "Y07",
+  "file": "exchange/src/ExchangeCore.mo",
+  "mutant": "a trader opens an account of another member",
+  "old": "        if (t.member != x.member) return ?#NotYourMember({ member = x.member });\n",
+  "new": "",
+  "test": "Exchange",
+  "property": "a trader opens an account of another member"
+ },
+ {
+  "id": "Y08",
+  "file": "exchange/src/ExchangeCore.mo",
+  "mutant": "a withdrawn right stays held",
+  "old": "        RS.put(s.rightRows, rights, id, { r with held = false });",
+  "new": "        RS.put(s.rightRows, rights, id, { r with held = true });",
+  "test": "Exchange",
+  "property": "a withdrawn right stays held"
+ },
+ {
+  "id": "Y09",
+  "file": "exchange/src/ExchangeCore.mo",
+  "mutant": "admitting a member on one signature",
+  "old": "    Perm.p(\"exchange.member.admit\", \"member\", #create, #command(\"admitMember\"), false, false, true),",
+  "new": "    Perm.p(\"exchange.member.admit\", \"member\", #create, #command(\"admitMember\"), false, false, false),",
+  "test": "Exchange",
+  "property": "admitting a member on one signature"
+ },
+ {
+  "id": "Y10",
+  "file": "exchange/src/ExchangeCanonical.mo",
+  "mutant": "a negative offset decoded as positive",
+  "old": "case 1 { if (m == 0) null else ?(-(m : Int)) };",
+  "new": "case 1 { if (m == 0) null else ?(m : Int) };",
+  "test": "Exchange",
+  "property": "a negative offset decoded as positive"
+ }
+]
