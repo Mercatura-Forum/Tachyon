@@ -64,7 +64,7 @@ check(not Perm.clean(Perm.validate(missingOne, B.commandNames, B.methodNames)), 
 for ((id, reason) in B.singleActs().vals()) { switch (Perm.byId(cat, id)) { case (?p) check(not p.dualByDefault and reason.size() > 40, "single act " # id # " has its reason"); case null check(false, "single act " # id # " exists") } };
 for (p in cat.vals()) { if (not p.dualByDefault and Text.startsWith(p.id, #text "book.")) check(Array.find<(Text, Text)>(B.singleActs(), func(x) { x.0 == p.id }) != null, "single permission " # p.id # " has its reason recorded") };
 check(B.checkSums(), "row widths hold their fields");
-check(K.families.size() == 26, "twenty-six command families");
+check(K.families.size() == 40, "forty command families");
 Debug.print("count: catalogue rows validated in both directions = " # Nat.toText(report.checked));
 
 let sampleCommands : [T.Command] = [
@@ -82,6 +82,12 @@ let sampleCommands : [T.Command] = [
   #setBlackout({ instrument = 1; client = bytes(0x42, 32); until = 0; reason = "a director of the issuer" }), #liftBlackout({ blackout = 1 }),
   #borrow({ account = 4; member = 1; instrument = 1; qty = 100; reference = bytes(9, 32) }), #returnBorrow({ account = 4; member = 1; instrument = 1; qty = 100 }),
   #revive({ kill = 1 }), #setLimits({ member = 1; maxOrderQty = 1_000; maxOrderValue = 90_000_000; creditLimit = 2_000_000_000 }),
+  // the central counterparty (SPEC §18 to §21)
+  #setClearing({ ccpAccount = 18; ccpMember = 3; cashLedger = cash; cycleSecs = 900; cycleDays = 2; penaltyBps = 50; deadlineCycles = 3; fundBps = 500; fundFloor = 10_000_000 }),
+  #setMargin({ instrument = 1; imBps = 1_000 }), #admitClearing({ member = 1; settlementAccount = 1; creditLine = 50_000_000 }), #designateClearing({ account = 6; member = 1 }),
+  #postCollateral({ member = 1; amount = 20_000_000 }), #withdrawCollateral({ member = 1; amount = 1 }), #cutCycle({ cycle = 7; settleDay = 20_516 }), #settleCycle({ cycle = 7 }),
+  #closeOut({ member = 2; instrument = 2 }), #callFund, #contributeFund({ member = 2; amount = 3 }), #fundSkin({ account = 19; amount = 4_000_000 }),
+  #declareDefault({ member = 2; reason = "a missed payment past the deadline" }), #closeDefault({ member = 2 }),
 ];
 var roundTrips = 0;
 for (c in sampleCommands.vals()) {
@@ -97,6 +103,7 @@ var familiesCovered = 0;
 for (f in K.families.vals()) { if (Array.find<T.Command>(sampleCommands, func(c) { K.familyOf(c) == f }) != null) familiesCovered += 1 };
 check(familiesCovered == K.families.size(), "every family has a sample command");
 check(E.readAt(K.registry, 1 : Nat8, C.Reader([14 : Nat8])) == null, "an unknown family tag is a decode fault");
+check(E.readAt(K.registry, 1 : Nat8, C.Reader([41 : Nat8])) == null and E.readAt(K.registry, 1 : Nat8, C.Reader([36 : Nat8])) != null, "tag 41 is past the last family; 36 is the fund's call");
 check(K.phaseOf(7) == null and K.sideOf(3) == null and K.kindOf(8) == null and K.validityOf(0) == null and K.selfTradeOf(4) == null and K.statusOf(5) == null and K.capacityOf(3) == null, "an unknown vocabulary byte decodes to nothing");
 Debug.print("count: commands round-tripped through encoding v1 = " # Nat.toText(roundTrips));
 
@@ -560,7 +567,8 @@ Debug.print("count: linked orders cancelled on the main book = " # n(ocoCancelle
 Debug.print("count: icebergs that traded on the main book = " # n(icebergsFilled));
 printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "own orders cancelled at entry", "incoming orders cancelled with the resting",
   "amendments keeping priority", "amendments taking a new priority", "uncrossed books checked", "checkpoints", "call-phase reads checked", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "uncrosses outside the static band, the auction continuing", "feed digests printed", "icebergs shown after a clear", "days sealed"]);
-for (f in K.families.vals()) { if (f != "openInstrument" and f != "clear") Debug.print("count: executed " # f # " = " # n(seenCount("executed " # f))) };
+// the clearing's families (SPEC §18 to §21, tags 27 to 40) are the clearing battery's (BookClearing.test.mo)
+for (f in Array.sliceToArray<Text>(K.families, 0, 26).vals()) { if (f != "openInstrument" and f != "clear") Debug.print("count: executed " # f # " = " # n(seenCount("executed " # f))) };
 var refusalNames = 0;
 for ((k, _) in Map.entries(seen)) { if (Text.startsWith(k, #text "refused ")) refusalNames += 1 };
 Debug.print("count: refusal names reached = " # n(refusalNames));

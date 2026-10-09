@@ -26,6 +26,7 @@ import CivilDate "mo:kernel/num/CivilDate";
 import RS "mo:kernel/rows/RowStore";
 import Page "mo:kernel/rows/Page";
 import Sha256 "mo:sha2/Sha256";
+import MP "mo:kernel/proof/MmrProof";
 import XT "../../../exchange/src/ExchangeTypes";
 import X "../../../exchange/src/ExchangeCore";
 import XText "../../../exchange/src/ExchangeText";
@@ -61,17 +62,23 @@ module {
     public let sharesB = Principal.fromText("rno2w-sqaaa-aaaaa-aaacq-cai");
     public let sharesC = Principal.fromText("qoctq-giaaa-aaaaa-aaaea-cai");
     public let cash = Principal.fromText("rkp4c-7iaaa-aaaaa-aaaca-cai");
+    /// The trader of the venue's central counterparty (member 3, made by `openClearing`).
+    public let t5 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x01, 0x01]));
+    /// The trader of a third clearing firm (member 4, made by `openClearing`).
+    public let t6 = Principal.fromBlob(Blob.fromArray([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x01, 0x01]));
 
     public let roles : [(Text, Principal)] = [("operator", operator), ("director1", director1), ("director2", director2), ("stranger", stranger), ("scheduler", scheduler),
-      ("t1", t1), ("t2", t2), ("t3", t3), ("t4", t4), ("depository", depository), ("clearer", clearer)];
+      ("t1", t1), ("t2", t2), ("t3", t3), ("t4", t4), ("depository", depository), ("clearer", clearer), ("t5", t5), ("t6", t6)];
     public func roleName(p : Principal) : Text { for ((n, q) in roles.vals()) { if (peq(p, q)) return n }; Principal.toText(p) };
     public func ledgerName(p : Principal) : Text { if (peq(p, cash)) "cash" else if (peq(p, sharesA)) "sharesA" else if (peq(p, sharesB)) "sharesB" else if (peq(p, sharesC)) "sharesC" else if (Principal.toText(p) == "qjdve-lqaaa-aaaaa-aaaeq-cai") "sharesD" else Principal.toText(p) };
-    public func isTrader(p : Principal) : Bool { peq(p, t1) or peq(p, t2) or peq(p, t3) or peq(p, t4) };
+    public func isTrader(p : Principal) : Bool { peq(p, t1) or peq(p, t2) or peq(p, t3) or peq(p, t4) or peq(p, t5) or peq(p, t6) };
 
     public let schedulerActs = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire",
-      "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal"];
-    public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return"];
-    public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift"];
+      "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call"];
+    public let traderActs = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
+      "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute"];
+    public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift",
+      "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close"];
     public func among(xs : [Text], x : Text) : Bool { Array.find<Text>(xs, func(y) { y == x }) != null };
     public func hasGrant(p : Principal, perm : Text) : Bool {
       if (peq(p, operator)) return (Text.startsWith(perm, #text "exchange.") and perm != "exchange.segment.advance" and perm != "exchange.instrument.reference") or among(operatorBookActs, perm);
@@ -109,6 +116,41 @@ module {
     };
     public func xsingle(who : Principal, c : XT.Command, what : Text) { switch (xsub(who, c)) { case (#ok(#executed(_))) {}; case (o) check(false, what # ": " # debug_show(o)) } };
     public func today() : Nat { X.marketTime(xs, now).0 };
+    /// The venue's central counterparty (SPEC §18), made once and only for the batteries that clear: member 3 with its
+    /// trader t5, the CCP's account (18) and the venue's own account (19); a third clearing firm, member 4, with its trader
+    /// t6 and its house account (20); the settlement calendar's rest days (Friday and Saturday) and one holiday
+    /// (2026-03-04). Every fact the reference reads about them is printed again.
+    public var clearingOpen = false;
+    public let holiday = day(2026, 3, 4);
+    public func openClearing() {
+      if (clearingOpen) return;
+      clearingOpen := true;
+      xgovern(#admitMember({ code = "1003"; name = "Venue Central Counterparty"; marketMaker = false; clearing = true; day = today() }), "member 3");
+      xgovern(#registerTrader({ member = 3; principal = t5 }), "t5");
+      xsingle(t5, #openAccount({ member = 3; kind = #house; client = "" }), "account 18");
+      xsingle(t5, #openAccount({ member = 3; kind = #house; client = "" }), "account 19");
+      xgovern(#admitMember({ code = "1004"; name = "Third Clearing Firm"; marketMaker = false; clearing = true; day = today() }), "member 4");
+      xgovern(#registerTrader({ member = 4; principal = t6 }), "t6");
+      xsingle(t6, #openAccount({ member = 4; kind = #house; client = "" }), "account 20");
+      xgovern(#grantTradingRight({ trader = 5; segment = 1 }), "t5 right");
+      xgovern(#grantTradingRight({ trader = 6; segment = 1 }), "t6 right");
+      xgovern(#setRestDays({ days = [4, 5] }), "rest days");
+      xgovern(#declareHoliday({ day = holiday; reason = "test: a holiday inside a settlement cycle" }), "holiday");
+      for (a in Nat.range(18, 21)) { switch (X.account(xs, a)) { case (?r) Debug.print("H|account|" # Nat.toText(a) # "|1|" # Nat.toText(r.member) # "|"); case null check(false, "the clearing accounts") } };
+      Debug.print("H|member|3"); Debug.print("H|member|4");
+      for ((tid, nm) in [(5, "t5"), (6, "t6")].vals()) {
+        switch (X.trader(xs, tid)) { case (?row) Debug.print("H|trader|" # Nat.toText(tid) # "|" # Nat.toText(row.member) # "|1|" # nm # "|" # Principal.toText(row.principal)); case null check(false, "the clearing traders") };
+      };
+      for ((nm, p) in roles.vals()) {
+        for (a in Nat.range(1, 21)) {
+          let owns = switch (X.account(xs, a), X.traderByPrincipal(xs, p)) { case (?acc, ?(_, t)) t.status == #active and t.member == acc.member; case (_) false };
+          Debug.print("H|owns|" # nm # "|" # Nat.toText(a) # "|" # (if (owns) "1" else "0"));
+        };
+        for (i in Nat.range(1, 5)) Debug.print("H|may|" # nm # "|" # Nat.toText(i) # "|" # (switch (X.mayTrade(xs, p, i)) { case (?e) Nat.toText(XText.code(e)); case null "0" }));
+      };
+      Debug.print("H|restdays|4,5");
+      Debug.print("H|holiday|" # Nat.toText(holiday));
+    };
 
     xgovern(#setUtcOffset({ minutesEast = 120 }), "offset");
     xgovern(#defineTickTable({ bands = [{ fromPrice = 0; tick = 1 }, { fromPrice = 2_000; tick = 10 }] }), "tick table");
@@ -153,6 +195,7 @@ module {
       for (f in K.families.vals()) { switch (Perm.byCommand(B.catalogue(), f)) { case (?perm) { if (hasGrant(p, perm.id)) Debug.print("H|grant|" # n # "|" # f) }; case null check(false, "a permission guards " # f) } };
     };
     public func bandsText(bs : [T.Band]) : Text { var o = ""; for (b in bs.vals()) o := o # (if (o == "") "" else ",") # Nat.toText(b.fromPrice) # ":" # Nat.toText(b.tick); o };
+    for ((name, l) in [("cash", cash), ("sharesA", sharesA), ("sharesB", sharesB)].vals()) Debug.print("H|ledger|" # name # "|" # TR.hex(Principal.toBlob(l)));
     Debug.print("H|instrument|1|10|85000|500|" # bandsText(egxBands) # "|sharesA|cash");
     Debug.print("H|instrument|2|1|1995|500|" # bandsText(egxBands) # "|sharesB|cash");
     /// The member of an account (0 for none) and the exchange's id of a role's trader (0 for none).
@@ -202,6 +245,20 @@ module {
         case (#killSweep(x)) "k=killSweep;kill=" # n(x.kill) # ";limit=" # n(x.limit);
         case (#revive(x)) "k=revive;kill=" # n(x.kill);
         case (#setLimits(x)) "k=setLimits;member=" # n(x.member) # ";qty=" # n(x.maxOrderQty) # ";value=" # n(x.maxOrderValue) # ";credit=" # n(x.creditLimit);
+        case (#setClearing(x)) "k=setClearing;ccp=" # n(x.ccpAccount) # ";ccpMember=" # n(x.ccpMember) # ";cash=" # ledgerName(x.cashLedger) # ";secs=" # n(x.cycleSecs) # ";days=" # n(x.cycleDays) # ";penalty=" # n(x.penaltyBps) # ";deadline=" # n(x.deadlineCycles) # ";fundBps=" # n(x.fundBps) # ";floor=" # n(x.fundFloor);
+        case (#setMargin(x)) "k=setMargin;instrument=" # n(x.instrument) # ";bps=" # n(x.imBps);
+        case (#admitClearing(x)) "k=admitClearing;member=" # n(x.member) # ";settle=" # n(x.settlementAccount) # ";credit=" # n(x.creditLine);
+        case (#designateClearing(x)) "k=designateClearing;account=" # n(x.account) # ";member=" # n(x.member);
+        case (#postCollateral(x)) "k=postCollateral;member=" # n(x.member) # ";amount=" # n(x.amount);
+        case (#withdrawCollateral(x)) "k=withdrawCollateral;member=" # n(x.member) # ";amount=" # n(x.amount);
+        case (#cutCycle(x)) "k=cutCycle;cycle=" # n(x.cycle) # ";settleDay=" # n(x.settleDay);
+        case (#settleCycle(x)) "k=settleCycle;cycle=" # n(x.cycle);
+        case (#closeOut(x)) "k=closeOut;member=" # n(x.member) # ";instrument=" # n(x.instrument);
+        case (#callFund) "k=callFund";
+        case (#contributeFund(x)) "k=contributeFund;member=" # n(x.member) # ";amount=" # n(x.amount);
+        case (#fundSkin(x)) "k=fundSkin;account=" # n(x.account) # ";amount=" # n(x.amount);
+        case (#declareDefault(x)) "k=declareDefault;member=" # n(x.member) # ";reason=" # x.reason;
+        case (#closeDefault(x)) "k=closeDefault;member=" # n(x.member);
       }
     };
     public func outText(r : B.Result<B.Outcome>) : Text {
@@ -482,6 +539,7 @@ module {
             case (#borrow(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, x.qty); case null {} } };
             case (#returnBorrow(x)) { switch (B.instrument(r.st, x.instrument)) { case (?i) addTotal(r, i.assetLedger, -x.qty); case null {} } };
             case (#placeOrder(_)) { if (x.effects.size() > 5) saw("own orders cancelled at entry"); if (x.effects[2] == 4) saw("incoming orders cancelled with the resting") };
+            case (#settleCycle(_)) { for (j in Nat.range(0, x.effects[2])) { if (x.effects[4 + 3 * j] == 2) saw("cycle fails") } };
             case (#amendOrder(_)) saw(if (x.effects[2] == 1) "amendments keeping priority" else "amendments taking a new priority");
             case (#uncross(_)) {
               switch (ind) {
@@ -563,6 +621,11 @@ module {
       // what each account's open orders hold, per ledger; each member's use, recounted from its open orders
       let heldByOrders = Map.empty<Text, Nat>();
       let useByMember = Map.empty<Nat, Nat>();
+      let imByMember = Map.empty<Text, Nat>(); let custodyHeld = Map.empty<Text, Nat>(); let committedBy = Map.empty<Text, Nat>();
+      func addTo(m : Map.Map<Text, Nat>, k : Text, v : Nat) { Map.add(m, Text.compare, k, (switch (Map.get(m, Text.compare, k)) { case (?x) x; case null 0 }) + v) };
+      func got(m : Map.Map<Text, Nat>, k : Text) : Nat { switch (Map.get(m, Text.compare, k)) { case (?x) x; case null 0 } };
+      // the orders below `printedTo` were closed when last printed; a clearing order's figures are recounted from every
+      // open order, so the walk starts at the first open one
       var id = r.printedTo;
       var firstOpen = r.st.nextOrder;
       while (id < r.st.nextOrder) {
@@ -571,8 +634,19 @@ module {
             if ((o.status == #live or o.status == #waiting) and id < firstOpen) firstOpen := id;
             Debug.print("O|" # n(id) # "|" # n(Nat8.toNat(K.statusCode(o.status))) # "|" # n(o.remaining) # "|" # n(o.filled) # "|" # n(o.held) # "|" # Nat64.toText(o.prio) # "|" # n(o.price) # "|" # n(o.stopPrice) # "|" # n(Nat8.toNat(K.capacityCode(o.capacity))) # "|" # (if (o.shortSale) "1" else "0") # "|" # n(o.trail) # "|" # n(o.member) # "|" # n(o.trader));
             if (o.status == #live or o.status == #waiting) Map.add(useByMember, Nat.compare, o.member, (switch (Map.get(useByMember, Nat.compare, o.member)) { case (?v) v; case null 0 }) + o.price * o.remaining);
-            if (o.status == #live or o.status == #waiting) { let k = n(o.account) # "/" # ledgerName(ledgerOf(o.instrument, o.side)); Map.add(heldByOrders, Text.compare, k, (switch (Map.get(heldByOrders, Text.compare, k)) { case (?v) v; case null 0 }) + o.held) }
-            else check(o.held == 0, "a closed order holds nothing");
+            if (o.status == #live or o.status == #waiting) {
+              // a clearing order holds nothing on its account: a buy's margin is its member's, a sale's shares the custody's
+              switch (B.clearingOf(r.st, o.account)) {
+                case (?m) {
+                  if (o.side == #buy) { addTo(imByMember, n(m), o.held); addTo(committedBy, "all", o.price * o.remaining) }
+                  else addTo(custodyHeld, n(m) # "/" # n(o.instrument), o.held);
+                };
+                case null {
+                  let k = n(o.account) # "/" # ledgerName(ledgerOf(o.instrument, o.side)); addTo(heldByOrders, k, o.held);
+                  switch (B.closeoutOf(r.st, id)) { case (?m) addTo(custodyHeld, n(m) # "/" # n(o.instrument), o.held); case null {} };
+                };
+              };
+            } else check(o.held == 0, "a closed order holds nothing");
           };
           case null check(false, "order " # n(id) # " exists");
         };
@@ -620,6 +694,50 @@ module {
       for ((m, v) in Map.entries(useByMember)) { if (v > 0) check(B.limitsOf(r.st, m) != null, "member " # n(m) # " with open orders has its use kept") };
       var kid = 1;
       while (kid < r.st.nextKill) { switch (B.kill(r.st, kid)) { case (?k) Debug.print("K|" # n(kid) # "|" # n(k.member) # "|" # n(k.trader) # "|" # (if (k.active) "1" else "0")); case null {} }; kid += 1 };
+      // the central counterparty (SPEC §18 to §21): its members' rows, its custody, its figures, the settlement range
+      switch (B.clearingTerms(r.st)) {
+        case (?t) {
+          var coll = 0; var fund = 0; var to = 0; var by = 0; var debt = 0;
+          for (x in B.clearingMembers(r.st).vals()) {
+            Debug.print("G|" # n(x.member) # "|" # n(x.settlementAccount) # "|" # n(x.creditLine) # "|" # n(x.collateral) # "|" # n(x.fund) # "|" # n(x.fundRequired) # "|" # n(x.imOrders) # "|" # n(x.owedTo) # "|" # n(x.owedBy) # "|" # n(x.debt) # "|" # n(x.fails) # "|" # n(x.peak) # "|" # n(x.status));
+            check(x.imOrders == got(imByMember, n(x.member)), "member " # n(x.member) # "'s initial margin is its open buys' margin");
+            coll += x.collateral; fund += x.fund; to += x.owedTo; by += x.owedBy; debt += x.debt;
+            for (c in B.custodyRowsOf(r.st, x.member).vals()) {
+              Debug.print("J|" # n(c.member) # "|" # n(c.instrument) # "|" # n(c.qty) # "|" # n(c.held));
+              check(c.held == got(custodyHeld, n(c.member) # "/" # n(c.instrument)) and c.held <= c.qty, "custody " # n(c.member) # "/" # n(c.instrument) # " holds what its sales and close-outs hold");
+            };
+          };
+          let (committed, skin, cycleNo, settled, lastCut) = B.clearingFigures(r.st);
+          Debug.print("W|" # n(committed) # "|" # n(skin) # "|" # n(cycleNo) # "|" # n(settled) # "|" # Nat64.toText(lastCut));
+          check(committed == got(committedBy, "all"), "the CCP's commitment is its open clearing buys' value");
+          // the CCP's cash is what it holds for the members and the venue, plus what it is owed, less what it owes
+          let have : Int = B.balance(r.st, t.ccpAccount, t.cashLedger).available + B.balance(r.st, t.ccpAccount, t.cashLedger).held;
+          check(have == coll + fund + skin + to - by - debt, "the CCP's cash: " # debug_show(have) # " against its resources and obligations " # debug_show((coll + fund + skin + to : Int) - by - debt));
+          for ((i, l) in [(1, sharesA), (2, sharesB)].vals()) {
+            var q = 0;
+            for (x in B.clearingMembers(r.st).vals()) q += B.custodyOf(r.st, x.member, i).qty;
+            let b = B.balance(r.st, t.ccpAccount, l);
+            check(b.available + b.held == q, "the CCP holds instrument " # n(i) # "'s custody: " # n(b.available + b.held) # " against " # n(q));
+          };
+          saw("clearing checkpoints");
+        };
+        case null {};
+      };
+      let (legs, root) = B.settlementRoot(r.st);
+      Debug.print("M|" # n(legs) # "|" # TR.hex(root));
+      // inclusion proofs of the range's first and last legs verify against the root; a proof against another leg does not
+      for (i in [0, 1, 2, legs / 2, legs - Nat.min(legs, 2), legs - Nat.min(legs, 1)].vals()) {
+        if (i < legs) {
+          switch (B.settlementProof(r.st, i)) {
+            case (?p) {
+              check(MP.verify(B.legRows.encode(p.leg), i, p.proof, root), "leg " # n(i) # "'s proof verifies against the range's root");
+              check(not MP.verify(B.legRows.encode({ p.leg with units = p.leg.units + 1 }), i, p.proof, root), "an altered leg does not verify");
+              saw("settlement proofs verified");
+            };
+            case null check(false, "leg " # n(i) # " has a proof");
+          };
+        };
+      };
       saw("checkpoints");
       r.printedTo := firstOpen;
       Debug.print("E|" # n(r.st.nextOrder - 1));
@@ -631,7 +749,11 @@ module {
         member = memberOf(account); trader = traderIdOf(traderOf(account)) })
     };
     public func lim(account : Nat, inst : Nat, side : T.Side, qty : Nat, price : Nat, clientRef : Text) : T.Command { order(account, inst, side, #limit, qty, price, 0, 0, #gtc, 0, #cancelResting, clientRef, 0) };
-    public func traderOf(account : Nat) : Principal { if (account <= 8) t1 else t3 };
+    /// The trader a battery acts through for an account: its member's (member 1 t1, 2 t3, 3 t5, 4 t6); for an account
+    /// that does not exist, t1 below 9 and t3 from 9, as the batteries refer to such accounts.
+    public func traderOf(account : Nat) : Principal {
+      switch (memberOf(account)) { case 1 t1; case 2 t3; case 3 t5; case 4 t6; case _ (if (account <= 8) t1 else t3) }
+    };
     public func depRef(k : Nat) : Blob { Blob.fromArray(Array.tabulate<Nat8>(32, func(i) { if (i < 24) 0xD0 else Nat8.fromNat((k / (256 ** (31 - i : Nat))) % 256) })) };
     public func deposit(r : Run, account : Nat, ledger : Principal, amount : Nat) {
       r.depSeq += 1;
@@ -670,7 +792,12 @@ module {
       else { let p = (ref : Int) - rnd(20) + (if (rnd(5) == 0) rnd(20) else 0); Int.abs(p) }
     };
     public func pickTrader() : Principal { let x = rnd(40); if (x < 18) t1 else if (x < 37) t3 else if (x < 39) t2 else t4 };
-    public func accountFor(p : Principal) : Nat { if (rnd(25) == 0) 1 + rnd(18) else if (peq(p, t1) or peq(p, t2)) 1 + rnd(8) else 9 + rnd(9) };
+    /// Set by the clearing streams: half the orders go to the member's clearing accounts.
+    public var clearingBias = false;
+    public func accountFor(p : Principal) : Nat {
+      if (clearingBias and rnd(2) == 0) return if (peq(p, t1) or peq(p, t2)) 5 + rnd(2) else 13 + rnd(2);
+      if (rnd(25) == 0) 1 + rnd(18) else if (peq(p, t1) or peq(p, t2)) 1 + rnd(8) else 9 + rnd(9)
+    };
     public func clientRef(r : Run) : Text {
       let x = rnd(100);
       if (x == 0) return "";
@@ -706,11 +833,20 @@ module {
         member = memberOf(account) + (if (rnd(60) == 0) 1 else 0); trader = traderIdOf(who) + (if (rnd(60) == 0) 1 else 0) })
     };
     /// The acts under four eyes a stream may give: the operator proposes, a director approves (`govern`).
-    public func underFourEyes(c : T.Command) : Bool { switch (c) { case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_)) true; case (_) false } };
+    public func underFourEyes(c : T.Command) : Bool {
+      // (the clearing's four-eyes acts are listed with the book's)
+      switch (c) {
+        case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #setClearing(_) or #setMargin(_) or #admitClearing(_)
+          or #designateClearing(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_)) true;
+        case (_) false
+      }
+    };
     public func randomPhase() : T.Phase { let x = rnd(100); if (x < 55) #continuous else if (x < 75) #auction else if (x < 85) #closingAuction else if (x < 93) #tradeAtClose else #closed };
     /// An account's client code in the exchange's rows ("" for a house account or none).
     public func clientOf(account : Nat) : Blob { switch (X.account(xs, account)) { case (?a) a.client; case null "" } };
     public func randomCommand(r : Run) : (Principal, T.Command) {
+      // the clearing's acts (SPEC §18 to §21), on a run that clears, one command in five
+      if (B.clearingTerms(r.st) != null and rnd(5) == 0) return randomClearing(r);
       // securities loans and insider blackouts (SPEC §16, §17), now and then
       if (rnd(60) == 0) {
         let account = 1 + rnd(18); let inst = 1 + rnd(2);
@@ -805,6 +941,64 @@ module {
           creditLimit = if (rnd(4) == 0) 200_000_000 + rnd(800_000_000) else 0 }));
       };
       (stranger, randomOrder(r, t1))
+    };
+    /// A run that clears (SPEC §18 to §21): the CCP's terms (cycles of 900 seconds), both instruments' margins, members 1,
+    /// 2 and 4 admitted, accounts 5, 6, 13 and 14 designated, the venue's skin, collateral and the fund's first call paid.
+    /// Every act given as a stream's command, so the reference judges it.
+    public func clearingRun(r : Run) {
+      openClearing();
+      ignore tick();
+      // settlement accounts with little cash beyond their collateral and fund: cycles fail now and then
+      for (a in [1, 9, 20].vals()) { deposit(r, a, cash, 3_000_000 + rnd(6_000_000)); deposit(r, a, sharesA, 1_000 * (1 + rnd(5))); deposit(r, a, sharesB, 100 * (1 + rnd(20))) };
+      deposit(r, 19, cash, 5_000_000);
+      // resources small against the orders' values, so margins and the CCP's free cash refuse some of them
+      ignore govern(r, #setClearing({ ccpAccount = 18; ccpMember = 3; cashLedger = cash; cycleSecs = 900; cycleDays = 0; penaltyBps = 50 + rnd(200); deadlineCycles = 1 + rnd(3); fundBps = 500 + rnd(2_000); fundFloor = 3_000_000 }));
+      ignore govern(r, #setMargin({ instrument = 1; imBps = 500 + rnd(2_000) }));
+      ignore govern(r, #setMargin({ instrument = 2; imBps = 500 + rnd(2_000) }));
+      for ((mem, settle_) in [(1, 1), (2, 9), (4, 20)].vals()) ignore govern(r, #admitClearing({ member = mem; settlementAccount = settle_; creditLine = rnd(2) * 1_000_000 }));
+      for ((a, mem) in [(5, 1), (6, 1), (13, 2), (14, 2)].vals()) ignore govern(r, #designateClearing({ account = a; member = mem }));
+      ignore govern(r, #fundSkin({ account = 19; amount = 500_000 + rnd(1_000_000) }));
+      for ((who, mem) in [(t1, 1), (t3, 2), (t6, 4)].vals()) ignore act(r, who, #postCollateral({ member = mem; amount = 500_000 + rnd(3_000_000) }));
+      ignore act(r, scheduler, #callFund);
+      for ((who, mem) in [(t1, 1), (t3, 2), (t6, 4)].vals()) ignore act(r, who, #contributeFund({ member = mem; amount = 1_000_000 }));
+    };
+    /// A random act of the clearing: collateral in and out, the fund's call and contributions, the cycle's cut and
+    /// settlement (time moved past the cycle's length now and then), close-outs, and, rarely, a default and its waterfall.
+    public func randomClearing(r : Run) : (Principal, T.Command) {
+      let (who, mem) = pick<(Principal, Nat)>([(t1, 1), (t3, 2), (t6, 4)]);
+      let x = rnd(100);
+      if (x < 12) return (who, #postCollateral({ member = mem; amount = 1 + rnd(2_000_000) }));
+      if (x < 22) return (who, #withdrawCollateral({ member = mem; amount = if (rnd(10) == 0) 0 else 1 + rnd(15_000_000) }));
+      if (x < 27) return (scheduler, #callFund);
+      if (x < 37) {
+        let need = switch (B.clearingMember(r.st, mem)) { case (?(_, row)) (if (row.fundRequired > row.fund) row.fundRequired - row.fund else 0); case null 0 };
+        return (who, #contributeFund({ member = mem; amount = if (need == 0 or rnd(8) == 0) 1 + rnd(1_000_000) else need }));
+      };
+      let (_, _, cycleNo, settled, _) = B.clearingFigures(r.st);
+      if (x < 57) { if (rnd(3) != 0) advance(900); return (scheduler, #cutCycle({ cycle = if (rnd(15) == 0) cycleNo + 1 else cycleNo; settleDay = if (rnd(20) == 0) today() else 0 })) };
+      if (x < 80) return (scheduler, #settleCycle({ cycle = if (rnd(15) == 0) settled + 2 else settled + 1 }));
+      if (x < 90) return (scheduler, #closeOut({ member = if (rnd(10) == 0) 3 else mem; instrument = 1 + rnd(2) }));
+      if (x < 92) return (operator, #setMargin({ instrument = 1 + rnd(2); imBps = 300 + rnd(3_000) }));
+      if (x < 93) return (operator, #declareDefault({ member = mem; reason = "a fail past the deadline" }));
+      if (x < 96) return (operator, #closeDefault({ member = mem }));
+      (who, #postCollateral({ member = if (rnd(2) == 0) 3 else mem; amount = 1 }))
+    };
+    /// `count` random streams on fresh books that clear (`clearingRun`), each `steps` commands, the due clear recorded
+    /// before each so every open book is seen uncrossed. Returns the commands and the books replayed.
+    public func clearingStreams(first : Nat, count : Nat, steps : Nat) : (Nat, Nat) {
+      var commands = 0; var replays = 0;
+      for (k in Nat.range(first, first + count)) {
+        seed := seed ^ Nat64.fromNat(0xC1_0000 + k);
+        let r = newRun(false);
+        clearingBias := true;
+        for (a in [2 + rnd(2), 5, 6, 10 + rnd(2), 13, 14].vals()) { ignore tick(); deposit(r, a, cash, 50_000_000 + rnd(200_000_000)); deposit(r, a, sharesA, 100 * (1 + rnd(30))); deposit(r, a, sharesB, 10 * (1 + rnd(40))) };
+        clearingRun(r);
+        ignore tick(); ignore act(r, scheduler, #setTrading({ instrument = 1; open = true })); ignore act(r, scheduler, #setTrading({ instrument = 2; open = true }));
+        randomStream(r, steps, 250, true); commands += steps;
+        clearingBias := false;
+        if (replayed(r)) replays += 1 else check(false, "clearing stream " # n(k) # " replay");
+      };
+      (commands, replays)
     };
     /// A stream of `steps` random commands on a run, a checkpoint every `every`; with `explicit`, the due clear is recorded
     /// before each command (as the command's own submission would) so that every open book can be seen uncrossed, and a
