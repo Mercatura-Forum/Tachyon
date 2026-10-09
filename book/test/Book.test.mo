@@ -64,7 +64,7 @@ check(not Perm.clean(Perm.validate(missingOne, B.commandNames, B.methodNames)), 
 for ((id, reason) in B.singleActs().vals()) { switch (Perm.byId(cat, id)) { case (?p) check(not p.dualByDefault and reason.size() > 40, "single act " # id # " has its reason"); case null check(false, "single act " # id # " exists") } };
 for (p in cat.vals()) { if (not p.dualByDefault and Text.startsWith(p.id, #text "book.")) check(Array.find<(Text, Text)>(B.singleActs(), func(x) { x.0 == p.id }) != null, "single permission " # p.id # " has its reason recorded") };
 check(B.checkSums(), "row widths hold their fields");
-check(K.families.size() == 47, "forty-seven command families");
+check(K.families.size() == 51, "fifty-one command families");
 Debug.print("count: catalogue rows validated in both directions = " # Nat.toText(report.checked));
 
 let sampleCommands : [T.Command] = [
@@ -95,6 +95,11 @@ let sampleCommands : [T.Command] = [
   #quote({ account = 3; member = 1; trader = 1; side = { instrument = 2; bidPrice = 1_990; askPrice = 2_000; qty = 100; ref = "q-1" } }),
   #massQuote({ account = 3; member = 1; trader = 1; sides = [{ instrument = 2; bidPrice = 1_990; askPrice = 2_000; qty = 100; ref = "m-2" }, { instrument = 1; bidPrice = 84_990; askPrice = 85_010; qty = 10; ref = "m-1" }] }),
   #settleMakers({ day = 20_514 }),
+  // the index and the market-wide breaker (SPEC §26, §27)
+  #defineIndex({ index = 1; base = 1_000; capBps = 6_000; haltBps = 1_000; suspendBps = 2_000; constituents = [{ instrument = 1; shares = 1_000_000 }, { instrument = 2; shares = 20_000_000 }] }),
+  #reviewIndex({ index = 1; constituents = [{ instrument = 2; shares = 25_000_000 }] }),
+  #corporateAction({ instrument = 2; action = #split({ num = 3; den = 2 }); reference = bytes(0x43, 32) }), #corporateAction({ instrument = 1; action = #dividend({ amount = 5_000 }); reference = bytes(0x44, 32) }),
+  #tripBreaker({ index = 1 }),
 ];
 var roundTrips = 0;
 for (c in sampleCommands.vals()) {
@@ -574,7 +579,8 @@ Debug.print("count: linked orders cancelled on the main book = " # n(ocoCancelle
 Debug.print("count: icebergs that traded on the main book = " # n(icebergsFilled));
 printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "own orders cancelled at entry", "incoming orders cancelled with the resting",
   "amendments keeping priority", "amendments taking a new priority", "uncrossed books checked", "checkpoints", "call-phase reads checked", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "uncrosses outside the static band, the auction continuing", "feed digests printed", "icebergs shown after a clear", "days sealed"]);
-// the clearing's families (SPEC §18 to §21, tags 27 to 40) are the clearing battery's, and §22 to §25's (41 to 47) the markets battery's
+// the clearing's families (SPEC §18 to §21, tags 27 to 40) are the clearing battery's, §22 to §25's (41 to 47) the markets
+// battery's, and §26 to §27's (48 to 51) the index battery's
 for (f in Array.sliceToArray<Text>(K.families, 0, 26).vals()) { if (f != "openInstrument" and f != "clear") Debug.print("count: executed " # f # " = " # n(seenCount("executed " # f))) };
 var refusalNames = 0;
 for ((k, _) in Map.entries(seen)) { if (Text.startsWith(k, #text "refused ")) refusalNames += 1 };

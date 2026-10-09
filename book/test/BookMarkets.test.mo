@@ -78,6 +78,10 @@ ignore tick();
 let openBuy = placed(m, lim(2, 1, #buy, 10, 80_000, "open-buy"));
 refused(operator, #setFeeSchedule({ instrument = 1; levies = [{ account = 21; ppm = 10 }] }), "e:InvalidTerms", "a schedule changed under an open buy");
 w.cancel(m, openBuy);
+// a buy stop waiting for its trigger is an open buy as well (the stops are walked as the book is)
+let stopBuy = placed(m, w.order(2, 1, #buy, #stopLimit, 10, 86_000, 86_000, 0, #gtc, 0, #cancelResting, "open-stop", 0));
+refused(operator, #setFeeSchedule({ instrument = 1; levies = [{ account = 21; ppm = 10 }] }), "e:InvalidTerms", "a schedule changed under a waiting buy stop");
+w.cancel(m, stopBuy);
 checkpoint(m);
 
 // ─── A. a fill's fees (instrument 1) ─────────────────────────────────────────────────────────

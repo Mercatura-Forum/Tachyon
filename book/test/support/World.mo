@@ -80,7 +80,7 @@ module {
       "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote"];
     public let operatorBookActs = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits", "book.insider.blackout", "book.insider.lift",
       "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
-      "book.fees.schedule", "book.maker.register"];
+      "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply"];
     public func among(xs : [Text], x : Text) : Bool { Array.find<Text>(xs, func(y) { y == x }) != null };
     public func hasGrant(p : Principal, perm : Text) : Bool {
       if (peq(p, operator)) return (Text.startsWith(perm, #text "exchange.") and perm != "exchange.segment.advance" and perm != "exchange.instrument.reference") or among(operatorBookActs, perm);
@@ -235,6 +235,8 @@ module {
     public func validityT(v : T.Validity) : Text { switch (v) { case (#day) "day"; case (#gtc) "gtc"; case (#gtd) "gtd" } };
     public func smpT(x : T.SelfTrade) : Text { switch (x) { case (#cancelIncoming) "cancelIncoming"; case (#cancelResting) "cancelResting"; case (#cancelBoth) "cancelBoth" } };
     public func n(x : Nat) : Text { Nat.toText(x) };
+    /// a / b to the nearest, a half to the even neighbour (the book's rounding, SPEC §26).
+    func halfEven(a : Nat, b : Nat) : Nat { let q = a / b; let r = a % b; if (r * 2 > b or (r * 2 == b and q % 2 == 1)) q + 1 else q };
     public func cmdText(c : T.Command) : Text {
       switch (c) {
         case (#openInstrument(x)) "k=openInstrument;instrument=" # n(x.instrument) # ";asset=" # ledgerName(x.assetLedger) # ";cash=" # ledgerName(x.cashLedger) # ";lot=" # n(x.lot) # ";price=" # n(x.referencePrice) # ";bands=" # bandsText(x.bands) # ";collar=" # n(x.collarBps) # ";static=" # n(x.staticBps) # ";dynamic=" # n(x.dynamicBps) # ";secs=" # n(x.interruptSecs);
@@ -284,9 +286,14 @@ module {
         case (#quote(x)) "k=quote;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";sides=" # quoteText(x.side);
         case (#massQuote(x)) "k=massQuote;account=" # n(x.account) # ";member=" # n(x.member) # ";trader=" # n(x.trader) # ";sides=" # joinText(Array.map<T.QuoteSide, Text>(x.sides, quoteText));
         case (#settleMakers(x)) "k=settleMakers;day=" # n(x.day);
+        case (#defineIndex(x)) "k=defineIndex;index=" # n(x.index) # ";base=" # n(x.base) # ";cap=" # n(x.capBps) # ";halt=" # n(x.haltBps) # ";suspend=" # n(x.suspendBps) # ";constituents=" # constituentsText(x.constituents);
+        case (#reviewIndex(x)) "k=reviewIndex;index=" # n(x.index) # ";constituents=" # constituentsText(x.constituents);
+        case (#corporateAction(x)) "k=corporateAction;instrument=" # n(x.instrument) # (switch (x.action) { case (#split(a)) ";kind=split;num=" # n(a.num) # ";den=" # n(a.den); case (#dividend(a)) ";kind=dividend;amount=" # n(a.amount) }) # ";reference=" # TR.hex(x.reference);
+        case (#tripBreaker(x)) "k=tripBreaker;index=" # n(x.index);
       }
     };
     public func joinText(xs : [Text]) : Text { var o = ""; for (x in xs.vals()) o := o # (if (o == "") "" else ",") # x; o };
+    public func constituentsText(cs : [T.Constituent]) : Text { joinText(Array.map<T.Constituent, Text>(cs, func(c) { n(c.instrument) # ":" # n(c.shares) })) };
     public func quoteText(q : T.QuoteSide) : Text { n(q.instrument) # ":" # n(q.bidPrice) # ":" # n(q.askPrice) # ":" # n(q.qty) # ":" # q.ref };
     public func outText(r : B.Result<B.Outcome>) : Text {
       switch (r) {
@@ -448,6 +455,19 @@ module {
                   case (#setPhase(x)) { trackOf(r, x.instrument).phase := x.phase };
                   case (#halt(x)) { trackOf(r, x.instrument).phase := #halted; saw("halts") };
                   case (#resume(x)) { trackOf(r, x.instrument).phase := #auction; saw("resumptions") };
+                  // a corporate action re-bases the prices (SPEC §26): the reference from the effects, the last price
+                  // recomputed here from the action, half-even to its tick, so the band checks above follow the new prices
+                  case (#corporateAction(x)) {
+                    let t = trackOf(r, x.instrument);
+                    t.ref := effects[2];
+                    if (t.last != 0) {
+                      let p = switch (x.action) { case (#split(a)) halfEven(t.last * a.den, a.num); case (#dividend(a)) t.last - Nat.min(t.last - 1, a.amount) };
+                      let tk = L.tickAt(egxBands, p);
+                      t.last := Nat.max(tk, halfEven(p, tk) * tk);
+                    };
+                    saw("corporate actions");
+                  };
+                  case (#tripBreaker(_)) { for (k in Nat.range(5, effects.size())) trackOf(r, effects[k]).phase := #halted; saw("breakers tripped") };
                   case (#kill(_)) saw("kills");
                   case (#killSweep(_)) saw("kill sweeps");
                   case (#revive(_)) saw("revivals");
@@ -772,6 +792,12 @@ module {
       while (k < r.st.nextMaker) { switch (RS.get(r.st.makerStore, B.makerRows, k)) { case (?x) Debug.print("X|" # n(x.member) # "|" # n(x.instrument) # "|" # n(x.account) # "|" # n(x.bid) # "|" # n(x.ask) # "|" # (if (x.cont) "1" else "0") # "|" # (if (x.present) "1" else "0") # "|" # n(x.presentNs) # "|" # n(x.sessionNs) # "|" # Nat64.toText(x.lastAt)); case null {} }; k += 1 };
       k := 1;
       while (k < r.st.nextMakerDay) { switch (B.makerDayOf(r.st, k)) { case (?x) Debug.print("Z|" # n(x.member) # "|" # n(x.instrument) # "|" # n(x.day) # "|" # n(x.presentNs) # "|" # n(x.sessionNs) # "|" # (if (x.met) "1" else "0") # "|" # n(x.rebate)); case null {} }; k += 1 };
+      // indices (SPEC §26, §27): each row and the path
+      for (ix in Nat.range(1, T.MAX_INDICES + 1)) {
+        switch (B.indexRowOf(r.st, ix)) { case (?x) Debug.print("IX|" # n(ix) # "|" # n(x.level) # "|" # n(x.reference) # "|" # n(x.tripped) # "|" # n(x.divisor)); case null {} };
+      };
+      k := 1;
+      while (k < r.st.nextPath) { switch (B.pathOf(r.st, k)) { case (?x) Debug.print("IP|" # n(x.index) # "|" # n(x.block) # "|" # n(x.level)); case null {} }; k += 1 };
       let (legs, root) = B.settlementRoot(r.st);
       Debug.print("M|" # n(legs) # "|" # TR.hex(root));
       // inclusion proofs of the range's first and last legs verify against the root; a proof against another leg does not
@@ -886,7 +912,7 @@ module {
       // (the clearing's four-eyes acts are listed with the book's)
       switch (c) {
         case (#halt(_) or #resume(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #setClearing(_) or #setMargin(_) or #admitClearing(_)
-          or #designateClearing(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_) or #setFeeSchedule(_) or #registerMaker(_)) true;
+          or #designateClearing(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_) or #setFeeSchedule(_) or #registerMaker(_) or #defineIndex(_) or #reviewIndex(_) or #corporateAction(_)) true;
         case (_) false
       }
     };
@@ -898,6 +924,8 @@ module {
       if (B.clearingTerms(r.st) != null and rnd(5) == 0) return randomClearing(r);
       // the makers' quotes, statements and reconciliations (SPEC §22 to §25), on a run with makers, one in four
       if (r.st.nextMaker > 1 and rnd(4) == 0) return randomMarkets(r);
+      // the indices' acts (SPEC §26, §27), on a run with an index, one in six
+      if (B.indexRowOf(r.st, 1) != null and rnd(6) == 0) return randomIndex(r);
       // securities loans and insider blackouts (SPEC §16, §17), now and then
       if (rnd(60) == 0) {
         let account = 1 + rnd(18); let inst = 1 + rnd(2);
@@ -1061,6 +1089,63 @@ module {
       let account = 9 + rnd(3);
       let b = B.balance(r.st, account, cash);
       (t3, #reconcileMember({ member = 2; day = today(); balances = [{ account; ledger = cash; amount = b.available + b.held + (if (rnd(3) == 0) 1 else 0) }, { account; ledger = sharesA; amount = rnd(100) }] }))
+    };
+    /// A run with indices (SPEC §26, §27): index 1 on both instruments and index 2 on instrument 2 alone, random free
+    /// floats, caps, and breaker thresholds narrow enough that the stream's prices trip them.
+    public func indexRun(r : Run) {
+      ignore govern(r, #defineIndex({ index = 1; base = 1_000; capBps = 5_000 + rnd(5_000); haltBps = 100 + rnd(400); suspendBps = if (rnd(4) == 0) 0 else 600 + rnd(600);
+        constituents = [{ instrument = 1; shares = 1_000 * (1 + rnd(2_000)) }, { instrument = 2; shares = 10_000 * (1 + rnd(5_000)) }] }));
+      ignore govern(r, #defineIndex({ index = 2; base = 100 + rnd(5_000); capBps = 10_000; haltBps = 200 + rnd(800); suspendBps = 1_200 + rnd(800); constituents = [{ instrument = 2; shares = 1 + rnd(1_000_000) }] }));
+    };
+    /// A random act on the indices: a review, a corporate action (refused while its instrument trades; the instrument
+    /// closed first now and then so that one executes), a further index or a refused one, the breaker submitted
+    /// (refused: nobody holds it).
+    public func randomIndex(r : Run) : (Principal, T.Command) {
+      let x = rnd(100);
+      let inst = 1 + rnd(2);
+      if (x < 40) {
+        let open_ = switch (B.instrument(r.st, inst)) { case (?i) i.phase == #continuous; case null false };
+        if (open_ and rnd(2) == 0) return (scheduler, #setTrading({ instrument = inst; open = false }));
+        // an action needs the instrument's book empty: the owner of its newest live or waiting order cancels its orders
+        if (not open_ and rnd(3) != 0) {
+          var oid = r.st.nextOrder;
+          while (oid > 1) {
+            oid -= 1;
+            switch (B.order(r.st, oid)) {
+              case (?o) { if (o.instrument == inst and (o.status == #live or o.status == #waiting)) return (traderOf(o.account), #massCancel({ account = o.account; member = memberOf(o.account); limit = 500 })) };
+              case null {};
+            };
+          };
+        };
+        r.depSeq += 1;
+        let action : T.Action = if (rnd(2) == 0) #split({ num = if (rnd(2) == 0) 2 else 1; den = if (rnd(2) == 0) 1 else 2 }) else #dividend({ amount = 1 + rnd(refOf(r, inst) / 20 + 1) });
+        return (operator, #corporateAction({ instrument = inst; action; reference = depRef(r.depSeq + streams * 1_000_000) }));
+      };
+      if (x < 48) return (scheduler, #setTrading({ instrument = inst; open = true }));
+      if (x < 65) {
+        let index = 1 + rnd(3);
+        let cs : [T.Constituent] = if (rnd(2) == 0) [{ instrument = inst; shares = 1 + rnd(5_000_000) }] else [{ instrument = 1; shares = 1 + rnd(3_000) }, { instrument = 2; shares = 1 + rnd(5_000_000) }];
+        return (operator, #reviewIndex({ index; constituents = cs }));
+      };
+      if (x < 80) return (operator, #defineIndex({ index = 2 + rnd(8); base = 1 + rnd(2_000); capBps = 2_000 + rnd(8_001); haltBps = 50 + rnd(500); suspendBps = rnd(1_500);
+        constituents = if (rnd(5) == 0) [{ instrument = 1 + rnd(4); shares = rnd(100) }] else [{ instrument = 1; shares = 1 + rnd(3_000) }, { instrument = 2; shares = 1 + rnd(5_000_000) }] }));
+      if (x < 85) return (scheduler, #tripBreaker({ index = 1 }));
+      (operator, #resume({ instrument = inst }))
+    };
+    /// `count` random streams on books with indices: the breaker trips on the stream's own prices, halts every book, and
+    /// the stream's recovery resumes them (a suspension only after the day's seal).
+    public func indexStreams(first : Nat, count : Nat, steps : Nat) : (Nat, Nat) {
+      var commands = 0; var replays = 0;
+      for (k in Nat.range(first, first + count)) {
+        seed := seed ^ Nat64.fromNat(0x1D_0000 + k);
+        let r = newRun(false);
+        for (a in [2, 3, 5, 6, 10 + rnd(2), 13, 14].vals()) { ignore tick(); deposit(r, a, cash, 50_000_000 + rnd(200_000_000)); deposit(r, a, sharesA, 100 * (1 + rnd(30))); deposit(r, a, sharesB, 10 * (1 + rnd(400))) };
+        indexRun(r);
+        ignore tick(); ignore act(r, scheduler, #setTrading({ instrument = 1; open = true })); ignore act(r, scheduler, #setTrading({ instrument = 2; open = true }));
+        randomStream(r, steps, 250, true); commands += steps;
+        if (replayed(r)) replays += 1 else check(false, "index stream " # n(k) # " replay");
+      };
+      (commands, replays)
     };
     /// `count` random streams on books with fees and makers that also clear: the clearing's set-up, then the markets'.
     public func marketsStreams(first : Nat, count : Nat, steps : Nat) : (Nat, Nat) {
