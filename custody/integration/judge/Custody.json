@@ -9,6 +9,7 @@
   "holders": ["aaaaa-aa", "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae"],
   "offeringDuals": [],
   "custodyDuals": ["custody.holder.register", "custody.asset.register", "custody.reconcile", "custody.action.announce", "custody.action.cancel", "custody.file.certify"],
+  "bookDuals": [],
   "exchangeDuals": [],
   "ttlSeconds": 3600
 }

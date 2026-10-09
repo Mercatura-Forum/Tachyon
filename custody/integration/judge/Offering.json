@@ -8,6 +8,7 @@
   "holders": ["aaaaa-aa"],
   "offeringDuals": ["offering.open", "offering.cornerstone.commit", "offering.price", "offering.handoff", "offering.withdraw"],
   "custodyDuals": ["custody.holder.register", "custody.asset.register", "custody.reconcile"],
+  "bookDuals": [],
   "exchangeDuals": [],
   "ttlSeconds": 3600
 }

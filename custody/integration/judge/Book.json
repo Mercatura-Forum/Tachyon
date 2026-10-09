@@ -1,5 +1,5 @@
 {
-  "battery": "Exchange",
+  "battery": "Book",
   "grants": [
     {
       "role": "2vxsx-fae",
@@ -21,7 +21,8 @@
         "exchange.instrument.list",
         "exchange.instrument.status",
         "exchange.instrument.lot",
-        "exchange.clock.offset"
+        "exchange.clock.offset",
+        "book.instrument.open"
       ]
     },
     {
@@ -29,7 +30,12 @@
       "prefixes": [],
       "exact": [
         "exchange.segment.advance",
-        "exchange.instrument.reference"
+        "exchange.instrument.reference",
+        "book.instrument.trading",
+        "book.instrument.reference",
+        "book.batch.flush",
+        "book.sweep.endofday",
+        "book.sweep.expire"
       ]
     },
     {
@@ -49,11 +55,30 @@
       ]
     },
     {
+      "role": "renrk-eyaaa-aaaaa-aaada-cai",
+      "prefixes": [],
+      "exact": [
+        "book.funds.deposit"
+      ]
+    },
+    {
+      "role": "rdmx6-jaaaa-aaaaa-aaadq-cai",
+      "prefixes": [],
+      "exact": [
+        "book.batch.clear"
+      ]
+    },
+    {
       "role": "ktizj-ppt3n-t4gxw-lzckj-ghema-o6gli-zx5uq-eivp6-q5sun-c22gs-cqe",
       "prefixes": [],
       "exact": [
         "exchange.account.open",
-        "exchange.account.close"
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel"
       ]
     },
     {
@@ -61,7 +86,12 @@
       "prefixes": [],
       "exact": [
         "exchange.account.open",
-        "exchange.account.close"
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel"
       ]
     },
     {
@@ -69,7 +99,12 @@
       "prefixes": [],
       "exact": [
         "exchange.account.open",
-        "exchange.account.close"
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel"
       ]
     },
     {
@@ -77,7 +112,12 @@
       "prefixes": [],
       "exact": [
         "exchange.account.open",
-        "exchange.account.close"
+        "exchange.account.close",
+        "book.funds.withdraw",
+        "book.order.place",
+        "book.order.cancel",
+        "book.order.amend",
+        "book.order.masscancel"
       ]
     }
   ],
@@ -88,7 +128,9 @@
   ],
   "offeringDuals": [],
   "custodyDuals": [],
-  "bookDuals": [],
+  "bookDuals": [
+    "book.instrument.open"
+  ],
   "exchangeDuals": [
     "exchange.member.admit",
     "exchange.member.status",

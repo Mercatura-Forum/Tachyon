@@ -1,5 +1,5 @@
 /// VenueJudge.mo: the test composition the chain judge installs (`custody/integration/chain_judge.py`): the offering,
-/// the custody register and the exchange's foundation, composed as their batteries compose them, so that a battery's transcript can be made again on a
+/// the custody register, the exchange's foundation and the book on it, composed as their batteries compose them, so that a battery's transcript can be made again on a
 /// chain, call by call. It is a test actor and never the product's front.
 ///
 /// Each chain signer the judge uses stands for one of the battery's roles (a principal the battery acted as). The actor
@@ -31,6 +31,9 @@ import TC "../test/support/Traced";
 import X "../../exchange/src/ExchangeCore";
 import XK "../../exchange/src/ExchangeCanonical";
 import XTC "../../exchange/test/support/Traced";
+import Bk "../../book/src/BookCore";
+import BK "../../book/src/BookCanonical";
+import BTC "../../book/test/support/Traced";
 
 persistent actor class VenueJudge(init : {
   roles : [{ signer : Principal; role : Principal }];
@@ -40,18 +43,21 @@ persistent actor class VenueJudge(init : {
   offeringDuals : [Text];
   custodyDuals : [Text];
   exchangeDuals : [Text];
+  bookDuals : [Text];
   ttlSeconds : Nat;
 }) {
 
   let os = Of.newState();
   let cs = Cu.newState();
   let xs = X.newState();
+  let bs = Bk.newState();
   func duals(ps : [Text]) : [{ permission : Text; required : Nat; eligibleRole : Text; ttlSeconds : Nat }] {
     Array.map<Text, { permission : Text; required : Nat; eligibleRole : Text; ttlSeconds : Nat }>(ps, func(permission) { { permission; required = 1; eligibleRole = init.eligibleRole; ttlSeconds = init.ttlSeconds } })
   };
   Of.setPolicies(os, duals(init.offeringDuals));
   Cu.setPolicies(cs, duals(init.custodyDuals));
   X.setPolicies(xs, duals(init.exchangeDuals));
+  Bk.setPolicies(bs, duals(init.bookDuals));
 
   func hasGrant(p : Principal, perm : Text) : Bool {
     for (g in init.grants.vals()) {
@@ -76,6 +82,7 @@ persistent actor class VenueJudge(init : {
       case "offering" { let ?c = E.readAt(OK.registry, version, r) else return "e=Undecodable"; TC.oOut(Of.submit(os, auth, now, role, c, null, justification)) };
       case "custody" { let ?c = E.readAt(CK.registry, version, r) else return "e=Undecodable"; TC.cOut(Cu.submit(cs, auth, now, role, c, null, justification)) };
       case "exchange" { let ?c = E.readAt(XK.registry, version, r) else return "e=Undecodable"; XTC.xOut(X.submit(xs, auth, now, role, c, null, justification)) };
+      case "book" { let ?c = E.readAt(BK.registry, version, r) else return "e=Undecodable"; BTC.bOut(Bk.submit(bs, xs, auth, now, role, c, null, justification)) };
       case _ "e=UnknownDomain";
     }
   };
@@ -85,10 +92,11 @@ persistent actor class VenueJudge(init : {
       case "offering" TC.oOut(Of.approve(os, auth, now, role, proposal));
       case "custody" TC.cOut(Cu.approve(cs, auth, now, role, proposal));
       case "exchange" XTC.xOut(X.approve(xs, auth, now, role, proposal));
+      case "book" BTC.bOut(Bk.approve(bs, xs, auth, now, role, proposal));
       case _ "e=UnknownDomain";
     }
   };
-  public func fingerprints() : async [(Text, Blob)] { [("offering", Of.fingerprint(os)), ("custody", Cu.fingerprint(cs)), ("exchange", X.fingerprint(xs))] };
+  public func fingerprints() : async [(Text, Blob)] { [("offering", Of.fingerprint(os)), ("custody", Cu.fingerprint(cs)), ("exchange", X.fingerprint(xs)), ("book", Bk.fingerprint(bs))] };
   public func replayCheck() : async Text {
     let o2 = Of.newStateOver(os.log); Of.setPolicies(o2, duals(init.offeringDuals));
     let orp = Of.replay(o2);
@@ -99,7 +107,10 @@ persistent actor class VenueJudge(init : {
     let x2 = X.newStateOver(xs.log); X.setPolicies(x2, duals(init.exchangeDuals));
     let xrp = X.replay(x2);
     if (xrp.faults.size() > 0 or X.fingerprint(x2) != X.fingerprint(xs)) return "fault|exchange|" # debug_show(xrp.faults);
-    "ok|" # Nat.toText(orp.blocks) # "," # Nat.toText(crp.blocks) # "," # Nat.toText(xrp.blocks)
+    let b2 = Bk.newStateOver(bs.log); Bk.setPolicies(b2, duals(init.bookDuals));
+    let brp = Bk.replay(b2);
+    if (brp.faults.size() > 0 or Bk.fingerprint(b2) != Bk.fingerprint(bs)) return "fault|book|" # debug_show(brp.faults);
+    "ok|" # Nat.toText(orp.blocks) # "," # Nat.toText(crp.blocks) # "," # Nat.toText(xrp.blocks) # "," # Nat.toText(brp.blocks)
   };
-  public query func counts() : async { offeringBlocks : Nat; custodyBlocks : Nat; exchangeBlocks : Nat } { { offeringBlocks = Of.counts(os).blocks; custodyBlocks = Cu.counts(cs).blocks; exchangeBlocks = X.counts(xs).blocks } };
+  public query func counts() : async { offeringBlocks : Nat; custodyBlocks : Nat; exchangeBlocks : Nat; bookBlocks : Nat } { { offeringBlocks = Of.counts(os).blocks; custodyBlocks = Cu.counts(cs).blocks; exchangeBlocks = X.counts(xs).blocks; bookBlocks = Bk.counts(bs).blocks } };
 }
