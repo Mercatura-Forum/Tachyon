@@ -122,6 +122,15 @@ class FeedBook:
             inst = r.nat()
             self.instrument_body(r, inst, False)
             self.phase[inst] = r.byte()
+        elif kind == 11:
+            # a maker's quotes: per quote its cancelled orders, then the sides it adds
+            for _ in range(r.len16()):
+                inst = r.nat()
+                for x in r.nats():
+                    self.orders.pop(x, None)
+                for _ in range(r.len16()):
+                    oid, side, price, shown = r.nat(), r.byte(), r.nat(), r.nat()
+                    self.orders[oid] = [inst, side, price, shown]
         elif kind == 10:
             r.nat(); r.nat(); r.p += 32      # the day's seal: day, rows, the file's hash; nothing visible changes
         else:

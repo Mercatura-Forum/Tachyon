@@ -19,12 +19,14 @@ import hashlib
 import sys
 
 MAXP = 2 ** 64 - 1
+PPM = 1_000_000
 STATUS = {"waiting": 1, "live": 2, "filled": 3, "cancelled": 4}
 DAY_DOMAIN = "thebes.book.day.v1"   # the day's file (§15)
 PHASE = {"closed": 1, "continuous": 2, "auction": 3, "closingAuction": 4, "tradeAtClose": 5, "halted": 6}
 CALL = ("auction", "closingAuction")
 DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout",
-        "setClearing", "setMargin", "admitClearing", "designateClearing", "fundSkin", "declareDefault", "closeDefault"}
+        "setClearing", "setMargin", "admitClearing", "designateClearing", "fundSkin", "declareDefault", "closeDefault",
+        "setFeeSchedule", "registerMaker"}
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
 MAX_TRAILING = 64
@@ -85,6 +87,14 @@ def mmr_root(leaves):
 def leg_bytes(kind, ledger_hex, frm, to, units, block):
     lb = bytes.fromhex(ledger_hex)
     return bytes([kind]) + bytes([len(lb)]) + lb + bytes(29 - len(lb)) + b"".join(x.to_bytes(8, "big") for x in (frm, to, units, block))
+
+
+def statement_head(lines, block_of):
+    """§23: the lines chained by SHA-256 from 32 zero bytes, each line its block, order, side, quantity, price, fee."""
+    h = bytes(32)
+    for (entry, order, side, q, p, fee) in lines:
+        h = hashlib.sha256(h + b"".join(nat(x) for x in (block_of[entry], order, side, q, p, fee))).digest()
+    return h
 
 
 def tick_at(bands, p):
@@ -164,6 +174,17 @@ class Ref:
         self.cycles = {}      # cycle -> [cut at, settle day, settled]
         self.cycle_no, self.settled, self.last_cut, self.skin = 1, 0, 0, 0
         self.legs = []        # [kind, ledger, from, to, units, the log entry that settled it]
+        # fees, statements, reconciliations, makers (SPEC §22 to §25)
+        self.fees = {}        # instrument -> [(account, ppm)]
+        self.payable = {}     # levy account -> what the CCP owes it, in the order the rows were made
+        self.fee_totals = {}  # (member, instrument) -> fees in the makers' open period
+        self.stmt = {}        # member -> its open statement's lines (log entry, order, side, qty, price, fee), in row order
+        self.stmt_seals = []  # (member, day, lines)
+        self.last_stmt_day = 0
+        self.recons = []      # (member, day, rows, matched, breaks, hash)
+        self.makers = {}      # (member, instrument) -> the registration and its period's figures
+        self.maker_days = []  # (member, instrument, day, present, session, met, rebate)
+        self.last_maker_day = 0
 
     # ── funds ──
     def b(self, a, l):
@@ -187,6 +208,82 @@ class Ref:
         if o["account"] not in self.desig:
             self.release(o["account"], self.ledger(o["instrument"], o["side"]), o["held"])
         o["held"] = 0; o["status"] = status
+
+    def ledger_bytes(self, led):
+        return bytes.fromhex(self.f["ledgers"][led])
+
+    # ── fees (SPEC §22) ──
+    def ppm(self, inst):
+        return sum(x for _, x in self.fees.get(inst, []))
+
+    def fee_on(self, inst, value):
+        n, q = value * self.ppm(inst), 0
+        if n == 0:
+            return 0
+        q, r = divmod(n, PPM)
+        return q + 1 if 2 * r > PPM else q if 2 * r < PPM else q + q % 2
+
+    def buy_hold(self, inst, price, qty):
+        ppm = self.ppm(inst)
+        return price * qty if ppm == 0 else price * qty + ceil_div(price * qty * ppm, PPM) + qty // self.inst[inst]["lot"]
+
+    def fee_parts(self, inst, fee):
+        """The largest remainder over the levies' rates, ties to the first (the kernel's allocation, written again)."""
+        levies = self.fees.get(inst, [])
+        if not fee or not levies:
+            return []
+        total = sum(x for _, x in levies)
+        base = [fee * x // total for _, x in levies]
+        rem = [fee * x % total for _, x in levies]
+        taken = [False] * len(levies)
+        for _ in range(fee - sum(base)):
+            best = None
+            for k in range(len(levies)):
+                if not taken[k] and (best is None or rem[k] > rem[best]):
+                    best = k
+            base[best] += 1; taken[best] = True
+        return [(levies[k][0], base[k]) for k in range(len(levies))]
+
+    def pay_fee(self, inst, account, led, fee):
+        for to, part in self.fee_parts(inst, fee):
+            if part:
+                self.mv(account, to, led, part)
+                self.leg(4, led, account, to, part)
+
+    def owe_payable(self, inst, fee):
+        for to, part in self.fee_parts(inst, fee):
+            if part:
+                self.payable[to] = self.payable.get(to, 0) + part
+
+    def has_open_buy(self, inst):
+        return any(self.orders[x]["side"] == "buy" for x in self.open_ids("inst", inst))
+
+    # ── market makers (SPEC §25) ──
+    def present_now(self, m):
+        i = self.inst.get(m["instrument"])
+        cont = bool(i) and i["phase"] == "continuous"
+        if not cont or not m["bid"]:
+            return cont, False
+        b, a = self.orders.get(m["bid"]), self.orders.get(m["ask"])
+        ok = (b is not None and a is not None and b["status"] == "live" and a["status"] == "live" and b["remaining"] >= m["minQty"]
+              and a["remaining"] >= m["minQty"] and a["price"] > b["price"] and (a["price"] - b["price"]) * 20_000 <= m["maxSpread"] * (a["price"] + b["price"]))
+        return cont, ok
+
+    def accrue(self, now):
+        for m in self.makers.values():
+            dt = now - m["lastAt"] if m["lastAt"] and now > m["lastAt"] else 0
+            if m["cont"]:
+                m["session"] += dt
+            if m["present"]:
+                m["presentNs"] += dt
+            m["cont"], m["present"] = self.present_now(m)
+            m["lastAt"] = now
+
+    def apply_all(self, now, c):
+        """A block's command applied, then every maker's presence accrued to its time (SPEC §25)."""
+        fx = self.clear(c["time"]) if c["k"] == "clear" else self.apply(now, c)
+        self.accrue(now)
+        return fx
 
     # ── the central counterparty (SPEC §18 to §21) ──
     def is_ccp(self, a):
@@ -570,7 +667,7 @@ class Ref:
             e = self.risk(c["member"], c["qty"], price * c["qty"], 0)
             if e:
                 return e
-            need = price * c["qty"] if c["side"] == "buy" else c["qty"]
+            need = self.buy_hold(c["instrument"], price, c["qty"]) if c["side"] == "buy" else c["qty"]
             crossing = [] if kind in STOPS else self.crossing_own(c["account"], c["instrument"], c["side"], price)
             if crossing and c["smp"] == "cancelIncoming":
                 return "SelfTradePrevented"
@@ -621,7 +718,7 @@ class Ref:
             e = self.risk(o["member"], c["qty"], c["price"] * c["qty"], o["price"] * o["remaining"])
             if e:
                 return e
-            need = c["price"] * c["qty"] if o["side"] == "buy" else c["qty"]
+            need = self.buy_hold(o["instrument"], c["price"], c["qty"]) if o["side"] == "buy" else c["qty"]
             m = self.desig.get(o["account"])
             if m is None:
                 if need > o["held"] and self.b(o["account"], self.ledger(o["instrument"], o["side"]))[0] < need - o["held"]:
@@ -880,7 +977,163 @@ class Ref:
             if any(q > 0 for (mm, _), q in self.custody.items() if mm == c["member"]):
                 return "InvalidTerms"
             return "InvalidTerms" if r["to"] or r["by"] else None
+        return self.validate_markets(now, role, c)
+
+    def validate_markets(self, now, role, c):
+        """SPEC §22 to §25, in the Motoko book's order of checks."""
+        k, accts = c["k"], self.f["accounts"]
+        if k == "setFeeSchedule":
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            lv = c["levies"]
+            if not 1 <= len(lv) <= 4:
+                return "InvalidTerms"
+            seen = []
+            for (a, ppm) in lv:
+                if ppm == 0:
+                    return "InvalidTerms"
+                if a not in accts:
+                    return "UnknownAccount"
+                if not accts[a]["open"]:
+                    return "AccountClosed"
+                if self.is_ccp(a) or a in self.desig or a in seen:
+                    return "InvalidTerms"
+                seen.append(a)
+            if sum(x for _, x in lv) > 100_000 or self.has_open_buy(c["instrument"]):
+                return "InvalidTerms"
+            return None
+        if k in ("sealStatements", "settleMakers"):
+            last = self.last_stmt_day if k == "sealStatements" else self.last_maker_day
+            return "InvalidTerms" if c["day"] != self.today(now) or c["day"] <= last else None
+        if k == "reconcileMember":
+            me = self.trader_id(role)
+            if not me or not self.f["traders"][me]["active"] or self.f["traders"][me]["member"] != c["member"]:
+                return "NotYourAccount"
+            if c["day"] > self.today(now) or not 1 <= len(c["balances"]) <= 64:
+                return "InvalidTerms"
+            seen = set()
+            for (a, led, _) in c["balances"]:
+                if a not in accts:
+                    return "UnknownAccount"
+                if accts[a]["member"] != c["member"]:
+                    return "NotYourAccount"
+                if (a, led) in seen:
+                    return "InvalidTerms"
+                seen.add((a, led))
+            return None
+        if k == "registerMaker":
+            if c["member"] not in self.f["members"]:
+                return "InvalidTerms"
+            if not self.f["makers"].get(c["member"]):
+                return "NotAMaker"
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            if (c["member"], c["instrument"]) in self.makers or len(self.makers) >= 32:
+                return "InvalidTerms"
+            if c["maxSpread"] == 0 or c["maxSpread"] > 10_000 or c["minQty"] == 0 or c["presence"] > 10_000 or c["rebate"] > 10_000:
+                return "InvalidTerms"
+            return None
+        if k in ("quote", "massQuote"):
+            return self.quote_refusal(now, role, c)
         raise ValueError(k)
+
+    def quote_refusal(self, now, role, c):
+        e = self.own_account(role, c["account"])
+        if e:
+            return e
+        if self.f["accounts"][c["account"]]["member"] != c["member"] or self.trader_id(role) != c["trader"]:
+            return "NotYourAccount"
+        if self.is_ccp(c["account"]) or c["account"] in self.desig:
+            return "InvalidTerms"
+        sides = c["sides"]
+        if not 1 <= len(sides) <= 16:
+            return "InvalidTerms"
+        if self.killed(c["member"], c["trader"]):
+            return "Killed"
+        need = freed = 0
+        net = 0
+        cash = None
+        for n, q in enumerate(sides):
+            inst = q["instrument"]
+            if any(sides[j]["instrument"] == inst for j in range(n)):
+                return "InvalidTerms"
+            mk = self.makers.get((c["member"], inst))
+            if mk is None:
+                return "NotAMaker"
+            if self.f["may"][(role, inst)] != 0:
+                return "MayNotTrade"
+            i = self.inst.get(inst)
+            if i is None or not i["opened"]:
+                return "UnknownInstrument"
+            if i["phase"] == "halted":
+                return "InstrumentHalted"
+            if self.blacked_out(c["account"], inst, now):
+                return "InsiderBlackout"
+            if q["qty"] == 0 or q["qty"] % i["lot"]:
+                return "NotALot"
+            if not 1 <= len(q["ref"].encode()) <= 18:
+                return "InvalidTerms"
+            for sfx in (".b", ".a"):
+                if (c["account"], q["ref"] + sfx) in self.refs_used:
+                    return "DuplicateClientRef"
+            for p in (q["bid"], q["ask"]):
+                if not on_tick(i["bands"], p):
+                    return "PriceOffTick"
+                if not within(p, i["ref"], i["static"]):
+                    return "PriceOutsideBand"
+            if q["bid"] >= q["ask"]:
+                return "InvalidPrice"
+            bh = ah = ov = 0
+            if mk["account"] == c["account"]:
+                for oid, which in ((mk["bid"], "b"), (mk["ask"], "a")):
+                    o = self.orders.get(oid)
+                    if o is not None and self.liveish(o):
+                        if which == "b":
+                            bh = o["held"]
+                        else:
+                            ah = o["held"]
+                        ov += o["price"] * o["remaining"]
+            value = (q["bid"] + q["ask"]) * q["qty"]
+            e = self.risk(c["member"], q["qty"], value, ov)
+            if e:
+                return e
+            net += value - ov
+            if c["member"] in self.limits:
+                cr = self.limits[c["member"]][2]
+                if cr and self.used(c["member"]) + net > cr:
+                    return "RiskLimit"
+            if cash is not None and cash != i["cash"]:
+                return "InvalidTerms"
+            cash = i["cash"]
+            need += self.buy_hold(inst, q["bid"], q["qty"]); freed += bh
+            if q["qty"] > self.owned_free(c["account"], inst) + ah:
+                return "ShortSaleNotFlagged"
+        if cash is not None and need > self.b(c["account"], cash)[0] + freed:
+            return "InsufficientFunds"
+        return None
+
+    def enter_quotes(self, now, c, tag):
+        fx = [tag, len(c["sides"])]
+        for q in c["sides"]:
+            mk = self.makers[(c["member"], q["instrument"])]
+            cancelled = []
+            for oid in (mk["bid"], mk["ask"]):
+                o = self.orders.get(oid)
+                if o is not None and self.liveish(o):
+                    self.close(oid, "cancelled"); cancelled.append(oid)
+            eff = []
+            for side, price, sfx in (("buy", q["bid"], ".b"), ("sell", q["ask"], ".a")):
+                e = self.apply(now, {"k": "placeOrder", "account": c["account"], "instrument": q["instrument"], "side": side, "kind": "limit", "qty": q["qty"],
+                                     "price": price, "stop": 0, "peak": 0, "validity": "day", "gtd": 0, "smp": "cancelResting", "oco": 0, "capacity": "principal",
+                                     "short": 0, "ref": q["ref"] + sfx, "trail": 0, "member": c["member"], "trader": c["trader"]})
+                eff.append(e)
+            for e in eff:
+                cancelled += e[5:]
+            mk.update(account=c["account"], bid=eff[0][1], ask=eff[1][1])
+            fx += [q["instrument"], len(cancelled)] + cancelled
+            for e in eff:
+                fx += e[1:5]
+        return fx
 
     # ── apply ──
     def cancel_oco(self, o, out):
@@ -976,7 +1229,7 @@ class Ref:
                     self.close(rid, "cancelled"); cancelled.append(rid)
                 if crossing and c["smp"] == "cancelBoth":
                     cancelled_in = True
-            need = price * c["qty"] if c["side"] == "buy" else c["qty"]
+            need = self.buy_hold(c["instrument"], price, c["qty"]) if c["side"] == "buy" else c["qty"]
             status = "cancelled" if cancelled_in else ("waiting" if stop else "live")
             held = 0
             if not cancelled_in:
@@ -984,7 +1237,7 @@ class Ref:
                 if m is None:
                     self.hold(c["account"], self.ledger(c["instrument"], c["side"]), need); held = need
                 elif c["side"] == "buy":
-                    held = ceil_div(self.margin.get(c["instrument"], 0) * need, 10_000)
+                    held = ceil_div(self.margin.get(c["instrument"], 0) * price * c["qty"], 10_000)
                 else:
                     self.pledge(m, c["instrument"], c["qty"]); held = c["qty"]
             self.orders[oid] = dict(account=c["account"], instrument=c["instrument"], side=c["side"], kind=kind, qty=c["qty"], remaining=c["qty"],
@@ -1013,7 +1266,7 @@ class Ref:
             o = self.orders[c["order"]]
             keeps = c["price"] == o["price"] and c["qty"] <= o["remaining"]
             led = self.ledger(o["instrument"], o["side"])
-            need = c["price"] * c["qty"] if o["side"] == "buy" else c["qty"]
+            need = self.buy_hold(o["instrument"], c["price"], c["qty"]) if o["side"] == "buy" else c["qty"]
             m = self.desig.get(o["account"])
             if m is None:
                 if need > o["held"]:
@@ -1022,7 +1275,7 @@ class Ref:
                     self.release(o["account"], led, o["held"] - need)
                 held = need
             elif o["side"] == "buy":
-                held = ceil_div(self.margin.get(o["instrument"], 0) * need, 10_000)
+                held = ceil_div(self.margin.get(o["instrument"], 0) * c["price"] * c["qty"], 10_000)
             else:
                 if c["qty"] > o["held"]:
                     self.pledge(m, o["instrument"], c["qty"] - o["held"])
@@ -1132,6 +1385,58 @@ class Ref:
             return [39, c["member"], kid]
         if k == "closeDefault":
             return self.close_default(c["member"])
+        if k == "setFeeSchedule":
+            self.fees[c["instrument"]] = list(c["levies"])
+            return [41, c["instrument"], len(c["levies"])]
+        if k == "sealStatements":
+            sealed = []
+            for m, lines in self.stmt.items():
+                if lines:
+                    self.stmt_seals.append((m, c["day"], list(lines)))
+                    sealed.append((m, len(lines)))
+                    self.stmt[m] = []
+            self.last_stmt_day = c["day"]
+            return [42, c["day"], len(sealed)] + [x for sl in sealed for x in sl]
+        if k == "reconcileMember":
+            w = bytearray(text("thebes.book.reconciliation.v1")) + nat(c["member"]) + nat(c["day"]) + nat(len(c["balances"]))
+            matched = 0
+            for (a, led, amount) in c["balances"]:
+                book = sum(self.bal.get((a, led), [0, 0]))
+                matched += book == amount
+                raw = self.ledger_bytes(led)
+                w += nat(a) + bytes([len(raw)]) + raw + nat(amount) + nat(book)
+            rid = len(self.recons) + 1
+            self.recons.append((c["member"], c["day"], len(c["balances"]), matched, len(c["balances"]) - matched, hashlib.sha256(bytes(w)).hexdigest()))
+            return [43, rid, matched, len(c["balances"]) - matched]
+        if k == "registerMaker":
+            self.makers[(c["member"], c["instrument"])] = dict(member=c["member"], instrument=c["instrument"], maxSpread=c["maxSpread"], minQty=c["minQty"],
+                                                               presence=c["presence"], rebate=c["rebate"], account=0, bid=0, ask=0, cont=False, present=False,
+                                                               lastAt=now, presentNs=0, session=0)
+            return [44, len(self.makers)]
+        if k in ("quote", "massQuote"):
+            return self.enter_quotes(now, c, 45 if k == "quote" else 46)
+        if k == "settleMakers":
+            self.accrue(now)
+            fx = [47, c["day"], len(self.makers)]
+            for (mem, inst), m in self.makers.items():
+                met = m["session"] > 0 and m["presentNs"] * 10_000 >= m["presence"] * m["session"]
+                fees = self.fee_totals.get((mem, inst), 0)
+                q_, r_ = divmod(fees * m["rebate"], 10_000)
+                due = q_ + 1 if 2 * r_ > 10_000 else q_ if 2 * r_ < 10_000 else q_ + q_ % 2
+                rebate = 0
+                levies = self.fees.get(inst, [])
+                cash = self.inst[inst]["cash"]
+                if met and due and m["account"] and levies and self.b(levies[0][0], cash)[0] >= due:
+                    self.mv(levies[0][0], m["account"], cash, due)
+                    self.leg(5, cash, levies[0][0], m["account"], due)
+                    rebate = due
+                self.maker_days.append((mem, inst, c["day"], m["presentNs"], m["session"], met, rebate))
+                fx += [mem, inst, m["presentNs"], m["session"], 1 if met else 0, rebate]
+                m["presentNs"] = 0; m["session"] = 0
+                if (mem, inst) in self.fee_totals:
+                    self.fee_totals[(mem, inst)] = 0
+            self.last_maker_day = c["day"]
+            return fx
         raise ValueError(k)
 
     def deliver(self, m, k, out):
@@ -1155,7 +1460,16 @@ class Ref:
         outcomes, deliveries = [], []
         # each member's side as the cycle was cut, fixed before anything moves
         plan = [(m, *self.oblig.get((m, k), [0, 0]), self.oblig.get((m, k), [0, 0])[1] + self.cm[m]["debt"]) for m in sorted(self.cm)]
+        levies = []
         for payers in (True, False):
+            if not payers:
+                for acct in list(self.payable):
+                    amt = self.payable[acct]
+                    if amt and self.ccp_free() >= amt:
+                        self.mv(t["ccp"], acct, t["cash"], amt)
+                        self.leg(4, t["cash"], t["ccp"], acct, amt)
+                        self.payable[acct] = 0
+                        levies.append((acct, amt))
             for (m, to, by, pay) in plan:
                 r = self.cm[m]
                 if r["status"] == 3 or (pay > to) != payers:
@@ -1189,7 +1503,8 @@ class Ref:
                 self.deliver(m, k, deliveries)
         self.cycles[k][2] = True
         self.settled = k
-        return [34, k, len(outcomes)] + [x for o in outcomes for x in o] + [len(deliveries)] + [x for d in deliveries for x in d]
+        return ([34, k, len(outcomes)] + [x for o in outcomes for x in o] + [len(deliveries)] + [x for d in deliveries for x in d]
+                + [len(levies)] + [x for lv in levies for x in lv])
 
     def close_default(self, m):
         """§21: the waterfall in its fixed order; the others' share by the largest remainder, ties in member order."""
@@ -1380,7 +1695,7 @@ class Ref:
             bo, ao = self.orders[b], self.orders[a]
             self.settle_pair(inst, i, b, bo, a, ao, p, q)
             bm = self.desig.get(bo["account"])
-            bo["held"] = bo["held"] * (bo["remaining"] - q) // bo["remaining"] if bm is not None else bo["held"] - bo["price"] * q
+            bo["held"] = bo["held"] * (bo["remaining"] - q) // bo["remaining"] if bm is not None else self.buy_hold(inst, bo["price"], bo["remaining"] - q)
             ao["held"] -= q
             for o in (bo, ao):
                 o["remaining"] -= q; o["filled"] += q
@@ -1404,19 +1719,23 @@ class Ref:
         v = p * q
         bm, am = self.desig.get(bo["account"]), self.desig.get(ao["account"])
         ccp = self.clearing["ccp"] if self.clearing else 0
+        fee_b = fee_s = self.fee_on(inst, v)
         if bm is None:
-            self.b(bo["account"], i["cash"])[1] -= bo["price"] * q
-            self.b(bo["account"], i["cash"])[0] += (bo["price"] - p) * q
+            after = self.buy_hold(inst, bo["price"], bo["remaining"] - q)
+            self.b(bo["account"], i["cash"])[1] -= bo["held"] - after
+            self.b(bo["account"], i["cash"])[0] += bo["held"] - after - v
             self.b(bo["account"], i["asset"])[0] += q
         else:
-            self.owe(bm, self.cycle_no, 0, v)
+            self.owe(bm, self.cycle_no, 0, v + fee_b)
+            self.owe_payable(inst, fee_b)
             self.bought[(bm, inst, self.cycle_no)] = self.bought.get((bm, inst, self.cycle_no), 0) + q
             self.custody[(bm, inst)] = self.custody.get((bm, inst), 0) + q
         if am is None:
             self.b(ao["account"], i["asset"])[1] -= q
             self.b(ao["account"], i["cash"])[0] += v
         else:
-            self.owe(am, self.cycle_no, v, 0)
+            self.owe(am, self.cycle_no, v, fee_s)
+            self.owe_payable(inst, fee_s)
             self.custody[(am, inst)] -= q
         if bm is None and am is None:
             self.leg(1, i["cash"], bo["account"], ao["account"], v); self.leg(1, i["asset"], ao["account"], bo["account"], q)
@@ -1428,13 +1747,23 @@ class Ref:
             assert self.b(ccp, i["cash"])[0] >= v, "the CCP paid beyond its cash"
             self.b(ccp, i["cash"])[0] -= v; self.b(ccp, i["asset"])[0] += q
             self.leg(1, i["cash"], ccp, ao["account"], v); self.leg(1, i["asset"], ao["account"], ccp, q)
+        if bm is None:
+            self.pay_fee(inst, bo["account"], i["cash"], fee_b)
+        if am is None:
+            self.pay_fee(inst, ao["account"], i["cash"], fee_s)
+        for (mem, f) in ((bo["member"], fee_b), (ao["member"], fee_s)):
+            if f:
+                self.fee_totals[(mem, inst)] = self.fee_totals.get((mem, inst), 0) + f
+        self.stmt.setdefault(bo["member"], []).append((len(self.log), b, 1, q, p, fee_b))
+        self.stmt.setdefault(ao["member"], []).append((len(self.log), a, 2, q, p, fee_s))
         if am is None and ccp and ao["account"] == ccp and a in self.closeouts:
             m = self.closeouts[a]
             self.custody[(m, inst)] -= q
-            paid = min(self.cm[m]["debt"], v)
+            net = v - fee_s
+            paid = min(self.cm[m]["debt"], net)
             self.cm[m]["debt"] -= paid
-            if v > paid:
-                self.owe(m, self.cycle_no, v - paid, 0)
+            if net > paid:
+                self.owe(m, self.cycle_no, net - paid, 0)
 
     # ── the day's statistics (§15) ──
     def add_trade(self, inst, p, q):
@@ -1602,7 +1931,7 @@ class Ref:
         """§1: the clear of a batch waiting from an earlier time, or of an instrument left due, recorded first."""
         pending = self.batch if self.batch else (self.last_time if self.due else 0)
         if pending and now > pending:
-            self.log.append((now, "clear", self.clear(pending)))
+            self.log.append((now, "clear", self.apply_all(now, {"k": "clear", "time": pending})))
             self.last_time = now
 
     def submit(self, now, role, c):
@@ -1615,7 +1944,7 @@ class Ref:
         if c["k"] in DUAL:
             self.last_time = now   # the proposal is a block
             return "p:"
-        fx = self.apply(now, c)
+        fx = self.apply_all(now, c)
         self.log.append((now, c["k"], fx))
         self.last_time = now
         return "x:" + ",".join(map(str, fx))
@@ -1628,7 +1957,7 @@ class Ref:
         e = self.validate(now, maker, c)
         if e:
             return "e:" + e
-        fx = self.apply(now, c)
+        fx = self.apply_all(now, c)
         self.log.append((now, c["k"], fx))
         return "x:" + ",".join(map(str, fx))
 
@@ -1653,7 +1982,7 @@ class Ref:
         t = self.clearing
         if t:
             # the CCP's cash is what it holds for the members and the venue, plus what it is owed less what it owes
-            want = (sum(r["coll"] + r["fund"] + r["to"] for r in self.cm.values()) + self.skin
+            want = (sum(r["coll"] + r["fund"] + r["to"] for r in self.cm.values()) + self.skin + sum(self.payable.values())
                     - sum(r["by"] + r["debt"] for r in self.cm.values()))
             have = sum(self.b(t["ccp"], t["cash"]))
             if have != want:
@@ -1671,9 +2000,18 @@ def parse_cmd(s):
     for kv in s.split(";"):
         k, _, v = kv.partition("=")
         # a client reference and a deposit's reference are text whatever their characters
-        c[k] = v if k in ("ref", "reference") else (int(v) if v.isdigit() else v)
+        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances") else (int(v) if v.isdigit() else v)
     if "open" in c:
         c["open"] = c["open"] in (1, True)
+    # the nested fields of SPEC §22 to §25: levies (account:ppm), balances (account:ledger:amount), quotes
+    # (instrument:bid:ask:qty:ref)
+    if "levies" in c:
+        c["levies"] = [tuple(int(x) for x in t.split(":")) for t in str(c["levies"]).split(",") if t]
+    if "balances" in c:
+        c["balances"] = [(int(t.split(":")[0]), t.split(":")[1], int(t.split(":")[2])) for t in str(c["balances"]).split(",") if t]
+    if "sides" in c:
+        c["sides"] = [dict(zip(("instrument", "bid", "ask", "qty", "ref"), (int(a), int(b), int(d), int(q), r)))
+                      for a, b, d, q, r in (t.split(":") for t in str(c["sides"]).split(",") if t)]
     return c
 
 
@@ -1685,12 +2023,12 @@ def main():
         if l.startswith("+|"):
             if kept:
                 lines[-1] += l[2:]      # a long line printed in pieces
-        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP"):
+        elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP", "N|", "P|", "R|", "X|", "Z|", "T|"):
             lines.append(l); kept = True
         else:
             kept = False
     facts = {"accounts": {}, "owns": {}, "may": {}, "instruments": {}, "grants": {}, "offset": 0, "xinstruments": {}, "xbands": None, "members": set(), "traders": {},
-             "ledgers": {}, "restdays": set(), "holidays": set()}
+             "ledgers": {}, "restdays": set(), "holidays": set(), "makers": {}}
     proposals = {}
     errors = []
     streams = cmds = blocks = checkpoints = legs_checked = 0
@@ -1700,6 +2038,7 @@ def main():
     sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
     block_of = {}
     custody_legs, custody_pos = [], {}
+    sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}
     for l in lines:
         f = l.split("|")
         if f[0] == "H":
@@ -1728,6 +2067,8 @@ def main():
                 facts["restdays"] = {int(x) for x in f[2].split(",") if x}
             elif kind == "holiday":
                 facts["holidays"].add(int(f[2]))
+            elif kind == "maker":
+                facts["makers"][int(f[2])] = f[3] == "1"
             elif kind == "instrument":
                 bands = [tuple(int(x) for x in b.split(":")) for b in f[6].split(",")]
                 facts["instruments"][int(f[2])] = {"lot": int(f[3]), "ref": int(f[4]), "collar": int(f[5]), "bands": bands, "asset": f[7], "cash": f[8]}
@@ -1747,6 +2088,7 @@ def main():
             sblocks, sorders, squeue = [], {}, {}
             sinst, slimits, skills = {}, {}, {}
             sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
+            sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}
             block_of = {}
             proposals = {}
             streams += 1
@@ -1798,6 +2140,21 @@ def main():
             custody_legs.append((lg[2], lg[3], units, hf, ht) if lg else None)
         elif f[0] == "CP":
             custody_pos[int(f[1])] = int(f[2])
+        elif f[0] == "N":
+            sstmt[int(f[1])] = (int(f[2]), f[3])
+        elif f[0] == "P":
+            sseals.append((int(f[1]), int(f[2]), int(f[3]), f[4]))
+        elif f[0] == "R":
+            srecons[int(f[1])] = (int(f[2]), int(f[3]), int(f[4]), int(f[5]), int(f[6]), f[7])
+        elif f[0] == "X":
+            smakers[(int(f[1]), int(f[2]))] = [int(x) for x in f[3:]]
+        elif f[0] == "Z":
+            smdays.append(tuple(int(x) for x in f[1:]))
+        elif f[0] == "T":
+            if f[1] == "p":
+                spay[int(f[2])] = int(f[3])
+            else:
+                sfees[(int(f[2]), int(f[3]))] = int(f[4])
         elif f[0] == "O":
             sorders[int(f[1])] = f[2:]
         elif f[0] == "Q":
@@ -1877,6 +2234,30 @@ def main():
                     if mine != sroot:
                         errors.append(f"stream {streams}: the settlement range: book {sroot}, reference {mine}")
                     legs_checked += len(leaves)
+            # fees, statements, reconciliations, makers (SPEC §22 to §25)
+            if sstmt or ref.stmt or sseals or ref.stmt_seals:
+                if any(ln[0] not in block_of for lines in list(ref.stmt.values()) + [x[2] for x in ref.stmt_seals] for ln in lines):
+                    errors.append(f"stream {streams}: a statement line of an entry the book printed no block for")
+                else:
+                    mine = {m: (len(lines), statement_head(lines, block_of).hex()) for m, lines in ref.stmt.items()}
+                    if mine != sstmt:
+                        errors.append(f"stream {streams}: open statements: book {dict(list(sstmt.items())[:4])}, reference {dict(list(mine.items())[:4])}")
+                    mine = [(m, d, len(lines), statement_head(lines, block_of).hex()) for (m, d, lines) in ref.stmt_seals]
+                    if mine != sseals:
+                        errors.append(f"stream {streams}: sealed statements: book {sseals[:3]}, reference {mine[:3]}")
+            mine = {n + 1: r for n, r in enumerate(ref.recons)}
+            if mine != srecons:
+                errors.append(f"stream {streams}: member reconciliations: book {srecons}, reference {mine}")
+            mine = {key: [m["account"], m["bid"], m["ask"], int(m["cont"]), int(m["present"]), m["presentNs"], m["session"], m["lastAt"]] for key, m in ref.makers.items()}
+            if mine != smakers:
+                errors.append(f"stream {streams}: makers: book {smakers}, reference {mine}")
+            mine = [(a, b, c_, d, e, int(f_), g) for (a, b, c_, d, e, f_, g) in ref.maker_days]
+            if mine != smdays:
+                errors.append(f"stream {streams}: makers' periods: book {smdays}, reference {mine}")
+            if dict(ref.payable) != spay:
+                errors.append(f"stream {streams}: levies payable: book {spay}, reference {ref.payable}")
+            if dict(ref.fee_totals) != sfees:
+                errors.append(f"stream {streams}: fee totals: book {sfees}, reference {ref.fee_totals}")
             bad = ref.reconciled()
             if bad:
                 errors.append(f"stream {streams}: the legs do not account for the balances: {bad}")
@@ -1884,6 +2265,7 @@ def main():
             sblocks, sorders, squeue = [], {}, {}
             sinst, slimits, skills = {}, {}, {}
             sclear, scust, sscalars, sroot, sidx = {}, {}, None, None, []
+            sstmt, sseals, srecons, smakers, smdays, spay, sfees = {}, [], {}, {}, [], {}, {}
     if custody_pos:
         # the custody register refolded here from the deliveries in and the admitted legs: each linked account's position
         # is the reference's holding of it in instrument 1's shares, and every leg kept its accounts' holders

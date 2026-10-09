@@ -214,6 +214,18 @@ def read_command(data):
         c = {"k": "declareDefault", "member": r.nat(), "reason": r.text()}
     elif tag == 40:
         c = {"k": "closeDefault", "member": r.nat()}
+    elif tag == 41:
+        c = {"k": "setFeeSchedule", "instrument": r.nat(), "levies": [(r.nat(), r.nat()) for _ in range(r.len16())]}
+    elif tag in (42, 47):
+        c = {"k": "sealStatements" if tag == 42 else "settleMakers", "day": r.nat()}
+    elif tag == 43:
+        c = {"k": "reconcileMember", "member": r.nat(), "day": r.nat(), "balances": [(r.nat(), principal_text(r.principal()), r.nat()) for _ in range(r.len16())]}
+    elif tag == 44:
+        c = {"k": "registerMaker", "member": r.nat(), "instrument": r.nat(), "maxSpread": r.nat(), "minQty": r.nat(), "presence": r.nat(), "rebate": r.nat()}
+    elif tag in (45, 46):
+        c = {"k": "quote" if tag == 45 else "massQuote", "account": r.nat(), "member": r.nat(), "trader": r.nat()}
+        n = 1 if tag == 45 else r.len16()
+        c["sides"] = [{"instrument": r.nat(), "bid": r.nat(), "ask": r.nat(), "qty": r.nat(), "ref": r.text()} for _ in range(n)]
     else:
         raise ValueError(f"family tag {tag}")
     assert r.p == len(data), "bytes after the command"
@@ -253,6 +265,9 @@ class Book(Ref):
     def __init__(self):
         super().__init__({"instruments": {}, "accounts": {}, "owns": {}, "may": {}, "grants": {}, "offset": 0, "xinstruments": {}, "xbands": None})
         self.reflist = []
+
+    def ledger_bytes(self, led):
+        return principal_raw(led)
 
     def apply(self, now, c):
         if c["k"] == "openInstrument":
@@ -342,6 +357,21 @@ def concerned(block, order_member, kill_member):
         own(c["member"])
         for j in range(e[7]):
             mentioned(e[8 + 2 * j])
+    elif k in ("reconcileMember", "registerMaker"):
+        own(c["member"])
+    elif k in ("quote", "massQuote"):
+        own(c["member"]); p = 2
+        for _ in range(e[1]):
+            nc = e[p + 1]
+            for oid in e[p + 2:p + 2 + nc]:
+                touched(oid)
+            p += 2 + nc + 8
+    elif k == "sealStatements":
+        for j in range(e[2]):
+            mentioned(e[3 + 2 * j])
+    elif k == "settleMakers":
+        for j in range(e[2]):
+            mentioned(e[3 + 6 * j])
     elif k == "callFund":
         for j in range(e[1]):
             mentioned(e[2 + 2 * j])
@@ -501,6 +531,42 @@ def clearing_sections(w, book):
     w.text("settlementnodes"); w.nat(len(nodes) + 1)
     for n, x in enumerate(nodes, start=1):
         w.nat(n); w.blob(x)
+    markets_sections(w, book)
+
+
+def markets_sections(w, book):
+    """SPEC §22 to §25: fee schedules, levies payable, fee totals, statements, seals, reconciliations, makers."""
+    import reference_book as RB
+    w.text("fees")
+    for i in sorted(book.fees):
+        lv = book.fees[i]
+        row = bytes([len(lv)]) + b"".join(be(lv[k][0], 8) + be(lv[k][1], 4) if k < len(lv) else bytes(12) for k in range(4))
+        w.nat(i); w.blob(row)
+    w.nat(book.last_stmt_day); w.nat(book.last_maker_day)
+    w.text("levypayable"); w.nat(len(book.payable) + 1)
+    for n, (a, x) in enumerate(book.payable.items(), start=1):
+        w.nat(n); w.blob(be(a, 8) + be(x, 8))
+    w.text("feetotals"); w.nat(len(book.fee_totals) + 1)
+    for n, ((m, i), x) in enumerate(book.fee_totals.items(), start=1):
+        w.nat(n); w.blob(be(m, 8) + be(i, 8) + be(x, 8))
+    blocks = {e: e - 1 for e in range(len(book.log) + 1)}
+    w.text("statements"); w.nat(len(book.stmt) + 1)
+    for n, (m, lines) in enumerate(book.stmt.items(), start=1):
+        w.nat(n); w.blob(be(m, 8) + RB.statement_head(lines, blocks) + be(len(lines), 8))
+    w.text("statementseals"); w.nat(len(book.stmt_seals) + 1)
+    for n, (m, d, lines) in enumerate(book.stmt_seals, start=1):
+        w.nat(n); w.blob(be(m, 8) + be(d, 8) + RB.statement_head(lines, blocks) + be(len(lines), 8))
+    w.text("memberrecons"); w.nat(len(book.recons) + 1)
+    for n, (m, d, rows, matched, breaks, h) in enumerate(book.recons, start=1):
+        w.nat(n); w.blob(be(m, 8) + be(d, 8) + be(rows, 8) + be(matched, 8) + be(breaks, 8) + bytes.fromhex(h))
+    w.text("makers"); w.nat(len(book.makers) + 1)
+    for n, m in enumerate(book.makers.values(), start=1):
+        row = b"".join(be(m[x], 8) for x in ("member", "instrument", "maxSpread", "minQty", "presence", "rebate", "account", "bid", "ask"))
+        row += bytes([1 if m["cont"] else 0, 1 if m["present"] else 0]) + be(m["lastAt"], 8) + be(m["presentNs"], 8) + be(m["session"], 8)
+        w.nat(n); w.blob(row)
+    w.text("makerdays"); w.nat(len(book.maker_days) + 1)
+    for n, (m, i, d, pr, se, met, rb) in enumerate(book.maker_days, start=1):
+        w.nat(n); w.blob(be(m, 8) + be(i, 8) + be(d, 8) + be(pr, 8) + be(se, 8) + bytes([1 if met else 0]) + be(rb, 8))
 
 
 def main():
@@ -557,7 +623,7 @@ def main():
             proposals[ev["proposal"]].update(status=ev["t"], at=i)
         else:
             c = ev["command"]
-            got = book.apply(b["time"], c)
+            got = book.apply_all(b["time"], c)
             executed += 1
             if got != ev["effects"]:
                 errors.append(f"block {i} ({c['k']}): recorded effects {ev['effects'][:12]}, refolded {got[:12]}")
@@ -578,6 +644,11 @@ def main():
                 kill_member[ev["effects"][1]] = c["member"]
             if c["k"] == "closeOut":
                 order_member[ev["effects"][1]] = book.clearing["ccpMember"]
+            if c["k"] in ("quote", "massQuote"):
+                p = 2
+                for _ in range(got[1]):
+                    nc = got[p + 1]; p += 2 + nc
+                    order_member[got[p]] = c["member"]; order_member[got[p + 4]] = c["member"]; p += 8
             if c["k"] == "declareDefault" and ev["effects"][2]:
                 kill_member[ev["effects"][2]] = c["member"]
         # the drop copy (SPEC §14): the members this block concerns, and what each is given

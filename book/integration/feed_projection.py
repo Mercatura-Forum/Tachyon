@@ -108,9 +108,20 @@ def body(w, c, e):
     elif k == "closeOut":
         # the CCP's close-out order, added as any sale is (SPEC §20): effects [35, order, status, price, shown, member]
         w.byte(4); w.nat(e[1]); w.nat(c["instrument"]); w.byte(2); w.nat(e[3]); w.nat(e[4]); w.nats([])
+    elif k in ("quote", "massQuote"):
+        # a maker's quotes (SPEC §25): per quote its cancelled orders and the sides it adds (the live ones)
+        w.byte(11); n = e[1]; w.len16(n); p = 2
+        for _ in range(n):
+            w.nat(e[p]); nc = e[p + 1]; w.nats(e[p + 2:p + 2 + nc]); p += 2 + nc
+            adds = [k for k in (0, 1) if e[p + 4 * k + 1] == LIVE]
+            w.len16(len(adds))
+            for k in adds:
+                w.nat(e[p + 4 * k]); w.byte(1 if k == 0 else 2); w.nat(e[p + 4 * k + 2]); w.nat(e[p + 4 * k + 3])
+            p += 8
     elif k in ("deposit", "withdraw", "flush", "kill", "revive", "setLimits", "setBlackout", "liftBlackout", "borrow", "returnBorrow",
                "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle",
-               "settleCycle", "callFund", "contributeFund", "fundSkin", "declareDefault", "closeDefault"):
+               "settleCycle", "callFund", "contributeFund", "fundSkin", "declareDefault", "closeDefault",
+               "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "settleMakers"):
         w.byte(0)
     else:
         raise ValueError(f"no feed message for {k}")
