@@ -181,6 +181,14 @@ def read_command(data):
         c = {"k": "setLimits", "member": r.nat(), "qty": r.nat(), "value": r.nat(), "credit": r.nat()}
     elif tag == 22:
         c = {"k": "sealDay", "day": r.nat()}
+    elif tag == 23:
+        c = {"k": "setBlackout", "instrument": r.nat(), "client": r.blob(), "until": r.nat(), "reason": r.text()}
+    elif tag == 24:
+        c = {"k": "liftBlackout", "blackout": r.nat()}
+    elif tag == 25:
+        c = {"k": "borrow", "account": r.nat(), "member": r.nat(), "instrument": r.nat(), "qty": r.nat(), "reference": r.blob()}
+    elif tag == 26:
+        c = {"k": "returnBorrow", "account": r.nat(), "member": r.nat(), "instrument": r.nat(), "qty": r.nat()}
     else:
         raise ValueError(f"family tag {tag}")
     assert r.p == len(data), "bytes after the command"
@@ -227,9 +235,11 @@ class Book(Ref):
                                           "cash": c["cash"], "phase": "closed", "last": 0, "close": 0, "endFrom": 0, "endTo": 0, "until": 0,
                                           "static": c["static"], "dynamic": c["dynamic"], "secs": c["secs"], "opened": True}
             return [1, c["instrument"]]
-        if c["k"] == "deposit":
+        if c["k"] in ("deposit", "borrow"):
             self.reflist.append(c["reference"])
             c = dict(c, reference=c["reference"].hex())
+        if c["k"] == "setBlackout":
+            c = dict(c, client=c["client"].hex())
         if c["k"] == "clear":
             return self.clear(c["time"])
         return super().apply(now, c)
@@ -297,7 +307,7 @@ def concerned(block, order_member, kill_member):
         m = order_member.get(oid)
         if m is not None and m not in out:
             out[m] = False
-    if k in ("placeOrder", "deposit", "withdraw", "massCancel", "kill", "setLimits"):
+    if k in ("placeOrder", "deposit", "withdraw", "massCancel", "kill", "setLimits", "borrow", "returnBorrow"):
         own(c["member"])
     elif k in ("cancelOrder", "amendOrder"):
         own(order_member.get(c["order"], 0))
@@ -377,6 +387,14 @@ def fingerprint(book, proposals, n_blocks, tip, feed_next, feed_head, drops):
     w.text("seals"); w.nat(len(book.seals) + 1)
     for n, (day, rows, h) in enumerate(book.seals, start=1):
         w.nat(n); w.blob(be(day, 8) + be(rows, 8) + h)
+    # insider blackouts and securities loans (§16, §17)
+    w.text("blackouts"); w.nat(len(book.blackouts) + 1)
+    for bid in sorted(book.blackouts):
+        b = book.blackouts[bid]
+        w.nat(bid); w.blob(be(b["instrument"], 8) + bytes.fromhex(b["client"]) + be(b["until"], 8) + bytes([1 if b["active"] else 0]))
+    w.text("borrows"); w.nat(len(book.borrows) + 1)
+    for n, ((account, inst), owed) in enumerate(book.borrows.items(), start=1):
+        w.nat(n); w.blob(be(account, 8) + be(inst, 8) + be(owed, 8))
     w.text("log"); w.nat(n_blocks); w.opt_blob(tip)
     return hash_with_domain(FOLD_DOMAIN, bytes(w.b))
 

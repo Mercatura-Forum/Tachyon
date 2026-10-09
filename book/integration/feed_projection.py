@@ -105,7 +105,7 @@ def body(w, c, e):
         w.byte(e[p])
     elif k == "sealDay":
         w.byte(10); w.nat(e[1]); w.nat(e[2]); w.b += bytes(e[3:35])
-    elif k in ("deposit", "withdraw", "flush", "kill", "revive", "setLimits"):
+    elif k in ("deposit", "withdraw", "flush", "kill", "revive", "setLimits", "setBlackout", "liftBlackout", "borrow", "returnBorrow"):
         w.byte(0)
     else:
         raise ValueError(f"no feed message for {k}")

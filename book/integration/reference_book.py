@@ -23,7 +23,7 @@ STATUS = {"waiting": 1, "live": 2, "filled": 3, "cancelled": 4}
 DAY_DOMAIN = "thebes.book.day.v1"   # the day's file (§15)
 PHASE = {"closed": 1, "continuous": 2, "auction": 3, "closingAuction": 4, "tradeAtClose": 5, "halted": 6}
 CALL = ("auction", "closingAuction")
-DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits"}
+DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout"}
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
 MAX_TRAILING = 64
@@ -95,6 +95,8 @@ class Ref:
         self.days = []        # every sealed day's rows: (day, instrument, statistics, reference)
         self.seals = []       # (day, rows, hash)
         self.files = {}       # day -> the day's file
+        self.blackouts = {}   # id -> {instrument, client (hex), until, active} (§16)
+        self.borrows = {}     # (account, instrument) -> owed, in the order the rows were made (§17)
         self.last_time = 0    # the time of the log's last block (proposals and approvals included)
         self.due = set()
         self.batch = 0
@@ -106,7 +108,7 @@ class Ref:
         # to look changes: every rule below still filters and orders exactly as the specification says.
         self.opens = {}
         self.refs_used = set()
-        self.deposited = {}   # ledger -> deposits less withdrawals
+        self.deposited = {}   # ledger -> deposits and loans in, less withdrawals and returns
 
     # ── funds ──
     def b(self, a, l):
@@ -158,6 +160,24 @@ class Ref:
 
     def killed(self, member, trader):
         return self.active_kill(member=member) or self.active_kill(trader=trader)
+
+    # ── insider blackouts and short sales (§16, §17) ──
+    def blacked_out(self, account, inst, now):
+        client = self.f["accounts"].get(account, {}).get("client", "")
+        if len(client) != 64:
+            return False
+        for b in self.blackouts.values():
+            if b["active"] and b["instrument"] == inst and b["client"] == client:
+                return b["until"] == 0 or self.today(now) <= b["until"]
+        return False
+
+    def owned_free(self, account, inst):
+        avail = self.b(account, self.inst[inst]["asset"])[0]
+        return max(0, avail - self.borrows.get((account, inst), 0))
+
+    @staticmethod
+    def short_floor(i):
+        return i["last"] or i["ref"]
 
     def used(self, member):
         return sum(self.orders[x]["price"] * self.orders[x]["remaining"] for x in self.open_ids("member", member))
@@ -291,6 +311,8 @@ class Ref:
                 return "InstrumentHalted"
             if self.killed(c["member"], c["trader"]):
                 return "Killed"
+            if self.blacked_out(c["account"], c["instrument"], now):
+                return "InsiderBlackout"
             if c["qty"] == 0 or c["qty"] % i["lot"] != 0:
                 return "NotALot"
             if c["peak"] != 0 and (c["peak"] % i["lot"] != 0 or c["peak"] >= c["qty"]):
@@ -347,6 +369,15 @@ class Ref:
                     return "InvalidOco"
             if kind in ("limit", "ioc", "fok", "stopLimit") and not within(c["price"], i["ref"], i["static"]):
                 return "PriceOutsideBand"
+            # §17
+            if c["short"] and c["side"] == "buy":
+                return "InvalidTerms"
+            if c["side"] == "sell":
+                if c["short"]:
+                    if kind not in ("limit", "ioc", "fok", "stopLimit") or c["price"] < self.short_floor(i):
+                        return "ShortSalePrice"
+                elif c["qty"] > self.owned_free(c["account"], c["instrument"]):
+                    return "ShortSaleNotFlagged"
             price = collar(c["side"], i["ref"], i["collar"], i["bands"]) if kind in ("market", "stop", "trailingStop") else c["price"]
             e = self.risk(c["member"], c["qty"], price * c["qty"], 0)
             if e:
@@ -376,6 +407,8 @@ class Ref:
                 return "InstrumentHalted"
             if self.killed(o["member"], o["trader"]):
                 return "Killed"
+            if self.blacked_out(o["account"], o["instrument"], now):
+                return "InsiderBlackout"
             if c["qty"] == 0 or c["qty"] % i["lot"] != 0:
                 return "NotALot"
             if o["peak"] != 0 and o["peak"] >= c["qty"]:
@@ -386,6 +419,12 @@ class Ref:
                 return "InvalidTerms"
             if not within(c["price"], i["ref"], i["static"]):
                 return "PriceOutsideBand"
+            if o["side"] == "sell":
+                if o["short"]:
+                    if c["price"] < self.short_floor(i):
+                        return "ShortSalePrice"
+                elif c["qty"] > o["remaining"] and c["qty"] - o["remaining"] > self.owned_free(o["account"], o["instrument"]):
+                    return "ShortSaleNotFlagged"
             e = self.risk(o["member"], c["qty"], c["price"] * c["qty"], o["price"] * o["remaining"])
             if e:
                 return e
@@ -466,6 +505,46 @@ class Ref:
             return None
         if k == "setLimits":
             return None if c["member"] in self.f["members"] else "InvalidTerms"
+        if k == "setBlackout":
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            if len(c["client"]) != 64:
+                return "InvalidTerms"
+            if c["until"] != 0 and c["until"] < self.today(now):
+                return "InvalidTerms"
+            if not (1 <= len(c["reason"].encode()) <= 256):
+                return "InvalidTerms"
+            if any(b["active"] and b["instrument"] == c["instrument"] and b["client"] == c["client"] for b in self.blackouts.values()):
+                return "InvalidTerms"
+            return None
+        if k == "liftBlackout":
+            b = self.blackouts.get(c["blackout"])
+            return None if b and b["active"] else "UnknownBlackout"
+        if k == "borrow":
+            if c["account"] not in self.f["accounts"]:
+                return "UnknownAccount"
+            if self.f["accounts"][c["account"]]["member"] != c["member"]:
+                return "InvalidTerms"
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            if c["qty"] == 0 or len(c["reference"]) != 64:
+                return "InvalidTerms"
+            if c["reference"] in self.refs:
+                return "DuplicateReference"
+            return None
+        if k == "returnBorrow":
+            e = self.own_account(role, c["account"])
+            if e:
+                return e
+            if self.f["accounts"][c["account"]]["member"] != c["member"]:
+                return "InvalidTerms"
+            if c["instrument"] not in self.inst or not self.inst[c["instrument"]]["opened"]:
+                return "UnknownInstrument"
+            if c["qty"] == 0 or c["qty"] > self.borrows.get((c["account"], c["instrument"]), 0):
+                return "InvalidTerms"
+            if self.b(c["account"], self.inst[c["instrument"]]["asset"])[0] < c["qty"]:
+                return "InsufficientFunds"
+            return None
         if k == "sealDay":
             # §15: the market day of the act, later than every day sealed
             if c["day"] != self.today(now) or c["day"] <= (self.seals[-1][0] if self.seals else 0):
@@ -516,6 +595,24 @@ class Ref:
         if k == "setLimits":
             self.limits[c["member"]] = [c["qty"], c["value"], c["credit"]]
             return [21, c["member"]]
+        if k == "setBlackout":
+            bid = len(self.blackouts) + 1
+            self.blackouts[bid] = {"instrument": c["instrument"], "client": c["client"], "until": c["until"], "active": True}
+            return [23, bid]
+        if k == "liftBlackout":
+            self.blackouts[c["blackout"]]["active"] = False
+            return [24, c["blackout"]]
+        if k == "borrow":
+            self.refs.add(c["reference"])
+            self.b(c["account"], self.inst[c["instrument"]]["asset"])[0] += c["qty"]
+            led = self.inst[c["instrument"]]["asset"]; self.deposited[led] = self.deposited.get(led, 0) + c["qty"]
+            self.borrows[(c["account"], c["instrument"])] = self.borrows.get((c["account"], c["instrument"]), 0) + c["qty"]
+            return [25, c["account"], c["qty"]]
+        if k == "returnBorrow":
+            self.b(c["account"], self.inst[c["instrument"]]["asset"])[0] -= c["qty"]
+            self.deposited[self.inst[c["instrument"]]["asset"]] -= c["qty"]
+            self.borrows[(c["account"], c["instrument"])] -= c["qty"]
+            return [26, c["account"], c["qty"]]
         if k == "sealDay":
             rows, h = self.seal(c["day"])
             return [22, c["day"], rows] + list(h)
@@ -1039,7 +1136,7 @@ def main():
         if f[0] == "H":
             kind = f[1]
             if kind == "account":
-                facts["accounts"][int(f[2])] = {"open": f[3] == "1", "member": int(f[4])}
+                facts["accounts"][int(f[2])] = {"open": f[3] == "1", "member": int(f[4]), "client": f[5] if len(f) > 5 else ""}
             elif kind == "member":
                 facts["members"].add(int(f[2]))
             elif kind == "trader":
