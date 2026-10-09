@@ -282,3 +282,26 @@ the file's SHA-256, one effect per byte; its feed message (kind 10) carries the 
 then for every instrument the book holds, in instrument order: the instrument, the first, high, low and last prices,
 the closing price, the volume, the value, the trades and the reference price at the seal. Anyone holding the log
 rebuilds it byte for byte and its hash with it.
+
+## 16. Insider blackouts
+
+An insider list names, for an instrument, the client codes of persons who may not trade it (the exchange's account row
+holds a member's 32-byte code for its client: the investor's unified code). `setBlackout(instrument, client, until,
+reason)`, under four eyes, records one until the end of the market day `until` (0: until lifted); `liftBlackout(id)`,
+under four eyes, ends it. An order or an amendment on an account whose client code is blacked out for the instrument at
+the act's market day is refused (InsiderBlackout). A house account (no client code) is the member's own book and is not
+an insider list's subject.
+
+## 17. Short sales
+
+Funds are held at entry (§4), so a sale is always covered by shares the account holds; shares it holds may be borrowed.
+`borrow(account, member, instrument, quantity, reference)`, the depository's attestation of a securities loan, credits
+the shares and records them owed; `returnBorrow(account, member, instrument, quantity)`, a trader's act, debits them and
+reduces what is owed. What an account owns free of other sales is its available shares less what it owes (at least 0).
+
+- A sale not flagged short whose quantity exceeds what the account owns free is refused (ShortSaleNotFlagged); an
+  amendment of such a sale may add only what the account owns free.
+- A sale flagged short names a limit (a limit, immediate-or-cancel, fill-or-kill or stop-limit order) at or above the
+  instrument's last trade price (its reference price before any trade); otherwise it is refused (ShortSalePrice). An
+  amendment of it is judged on its new price.
+- A return may not exceed what is owed nor what is available.

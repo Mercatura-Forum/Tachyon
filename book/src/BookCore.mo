@@ -80,6 +80,10 @@ module {
     Perm.p("book.kill.revive", "kill", #close, #command("revive"), false, false, true),
     Perm.p("book.risk.limits", "limits", #update, #command("setLimits"), false, false, true),
     Perm.p("book.day.seal", "day", #create, #command("sealDay"), false, false, false),
+    Perm.p("book.insider.blackout", "insider", #create, #command("setBlackout"), false, false, true),
+    Perm.p("book.insider.lift", "insider", #close, #command("liftBlackout"), false, false, true),
+    Perm.p("book.borrow.record", "borrow", #create, #command("borrow"), false, false, false),
+    Perm.p("book.borrow.return", "borrow", #update, #command("returnBorrow"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -101,6 +105,8 @@ module {
     ("book.kill.set", "the operator, or a trader of the member, blocks a member or a trader at once; lifting it takes four eyes"),
     ("book.kill.sweep", "the operator's system cancels a killed member's or trader's open orders in slices; what they held returns"),
     ("book.day.seal", "the scheduler seals the market day at its end: the day's statistics recorded and their file's hash written; it moves no order and no funds"),
+    ("book.borrow.record", "the depository attests a securities loan settled at the custodian, as it attests a deposit: the shares credited and recorded owed"),
+    ("book.borrow.return", "a trader of the member returns borrowed shares from its account; it moves what the account holds and what it owes, nothing else"),
   ] };
   public let commandNames : [Text] = K.families;
   public let methodNames : [Text] = ["approve", "reject"];
@@ -245,6 +251,26 @@ module {
     decode = func(a : [Nat8]) : SealRow { { day = R.getNat(a, 0, 8); rows = R.getNat(a, 8, 8); hash = R.getBlob(a, 16, 32) } };
     indexes = [{ name = "byDay"; keyBytes = 8; keyOf = func(_ : Nat, x : SealRow) : ?Blob { ?R.key(x.day, 8) } }];
   };
+  /// An insider blackout (SPEC §16): a client code barred from an instrument until the end of a market day (0: until
+  /// lifted); found while active by (instrument, client).
+  public type Blackout = { instrument : Nat; client : Blob; until : Nat; active : Bool };
+  public let BLACKOUT_ROW_BYTES = 49;   // instrument 8, client 32, until 8, active 1
+  func blackoutKey(instrument : Nat, client : Blob) : Blob { Blob.fromArray(Array.concat<Nat8>(Blob.toArray(R.key(instrument, 8)), Blob.toArray(client))) };
+  public let blackoutRows : RS.Decl<Blackout> = {
+    table = "blackouts"; idBytes = 8; rowBytes = BLACKOUT_ROW_BYTES;
+    encode = func(x : Blackout) : Blob { let b = R.buf(); R.putNat(b, x.instrument, 8); R.putBlob(b, x.client, 32); R.putNat(b, x.until, 8); R.putBool(b, x.active); padded(b, BLACKOUT_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Blackout { { instrument = R.getNat(a, 0, 8); client = R.getBlob(a, 8, 32); until = R.getNat(a, 40, 8); active = R.getBool(a, 48) } };
+    indexes = [{ name = "active"; keyBytes = 40; keyOf = func(_ : Nat, x : Blackout) : ?Blob { if (x.active) ?blackoutKey(x.instrument, x.client) else null } }];
+  };
+  /// Shares an account owes from securities loans in an instrument (SPEC §17); found by (account, instrument).
+  public type BorrowRow = { account : Nat; instrument : Nat; owed : Nat };
+  public let BORROW_ROW_BYTES = 24;
+  public let borrowRows : RS.Decl<BorrowRow> = {
+    table = "borrows"; idBytes = 8; rowBytes = BORROW_ROW_BYTES;
+    encode = func(x : BorrowRow) : Blob { let b = R.buf(); R.putNat(b, x.account, 8); R.putNat(b, x.instrument, 8); R.putNat(b, x.owed, 8); padded(b, BORROW_ROW_BYTES) };
+    decode = func(a : [Nat8]) : BorrowRow { { account = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); owed = R.getNat(a, 16, 8) } };
+    indexes = [{ name = "byAccount"; keyBytes = 16; keyOf = func(_ : Nat, x : BorrowRow) : ?Blob { ?R.key2(x.account, 8, x.instrument, 8) } }];
+  };
   /// A drop-copy row (SPEC §14): a block that concerns a member, and whether it is the member's own act.
   public type DropRow = { member : Nat; block : Nat; own : Bool };
   public let DROP_ROW_BYTES = 17;   // member 8, block 8, own 1
@@ -317,6 +343,8 @@ module {
     /// The instruments the book holds, in id order (written when one opens; the fold rebuilds it): what the fingerprint,
     /// the seal and the readers walk, in place of every possible id.
     var instrumentList : [Nat];
+    /// Insider blackouts and securities loans (SPEC §16, §17).
+    blackoutStore : RS.Store; var nextBlackout : Nat; borrowStore : RS.Store; var nextBorrow : Nat;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -337,7 +365,7 @@ module {
     { log; var orderRows = RS.newStore(orders); balanceRows = RS.newStore(balances); refRows = RS.newStore(refs); var instrumentRows = RS.newStore(instruments); dueRows = RS.newStore(dues);
       proposalRows = RS.newStore(proposals); killRows = RS.newStore(kills); limitStore = RS.newStore(limitRows);
       feedRows = RS.newStore(feedHashes); var feedHead = F.genesis(); var feedNext = 0; dropStore = RS.newStore(dropRows); var nextDrop = 1;
-      statStore = RS.newStore(statRows); dayStore = RS.newStore(dayRows); var nextDayRow = 1; var lastSealed = 0; sealStore = RS.newStore(sealRows); var nextSeal = 1; var instrumentList = [];
+      statStore = RS.newStore(statRows); dayStore = RS.newStore(dayRows); var nextDayRow = 1; var lastSealed = 0; sealStore = RS.newStore(sealRows); var nextSeal = 1; var instrumentList = []; blackoutStore = RS.newStore(blackoutRows); var nextBlackout = 1; borrowStore = RS.newStore(borrowRows); var nextBorrow = 1;
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -507,6 +535,31 @@ module {
     if (a.status != #open) return ?#AccountClosed({ account });
     null
   };
+  /// Whether the account's client code is blacked out for the instrument at the act's market day (SPEC §16).
+  func blackedOut(s : State, xs : X.State, account : Nat, inst : Nat, now : Nat64) : Bool {
+    let ?a = X.account(xs, account) else return false;
+    if (a.client.size() != 32) return false;
+    switch (one(s.blackoutStore, blackoutRows, "active", blackoutKey(inst, a.client))) {
+      case (?(_, bo)) bo.until == 0 or X.marketTime(xs, now).0 <= bo.until;
+      case null false;
+    }
+  };
+  /// What an account owes in an instrument from securities loans (SPEC §17).
+  public func owedOf(s : State, account : Nat, inst : Nat) : Nat { switch (one(s.borrowStore, borrowRows, "byAccount", R.key2(account, 8, inst, 8))) { case (?(_, r)) r.owed; case null 0 } };
+  func putOwed(s : State, account : Nat, inst : Nat, owed : Nat) {
+    switch (one(s.borrowStore, borrowRows, "byAccount", R.key2(account, 8, inst, 8))) {
+      case (?(id, r)) RS.put(s.borrowStore, borrowRows, id, { r with owed });
+      case null { let id = s.nextBorrow; s.nextBorrow += 1; RS.put(s.borrowStore, borrowRows, id, { account; instrument = inst; owed }) };
+    }
+  };
+  /// The shares an account owns free of other sales: its available shares less what it owes, at least 0 (SPEC §17).
+  func ownedFree(s : State, account : Nat, i : T.Instrument, inst : Nat) : Nat {
+    let avail = balance(s, account, i.assetLedger).available;
+    let owed = owedOf(s, account, inst);
+    if (avail > owed) avail - owed else 0
+  };
+  /// The price a short sale may not go below: the last trade, or the reference before any (SPEC §17).
+  func shortFloor(i : T.Instrument) : Nat { if (i.lastPrice != 0) i.lastPrice else i.referencePrice };
   /// The member an account belongs to in the exchange's rows (0 for no such account).
   func memberOf(xs : X.State, account : Nat) : Nat { switch (X.account(xs, account)) { case (?a) a.member; case null 0 } };
   func ownOrder(s : State, xs : X.State, caller : Principal, id : Nat) : Result.Result<T.Order, T.Error> {
@@ -596,6 +649,7 @@ module {
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
         if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });
         switch (killedFor(s, x.member, x.trader)) { case (?k) return ?#Killed({ kill = k }); case null {} };
+        if (blackedOut(s, xs, x.account, x.instrument, now)) return ?#InsiderBlackout({ instrument = x.instrument });
         if (x.qty == 0 or x.qty % i.lot != 0) return ?#NotALot({ qty = x.qty; lot = i.lot });
         if (x.peak != 0 and (x.peak % i.lot != 0 or x.peak >= x.qty)) return ?#NotALot({ qty = x.peak; lot = i.lot });
         let n = Text.encodeUtf8(x.clientRef).size();
@@ -630,6 +684,17 @@ module {
           let (lo, hi) = L.band(i.referencePrice, i.staticBps);
           if (x.price < lo or x.price > hi) return ?#PriceOutsideBand({ price = x.price; low = lo; high = hi });
         };
+        // short sales (SPEC §17): flagged, a limit at or above the floor; unflagged, no more than the account owns free
+        if (x.shortSale and x.side == #buy) return ?#InvalidTerms({ reason = "a short sale sells" });
+        if (x.side == #sell) {
+          if (x.shortSale) {
+            let limited = x.kind == #limit or x.kind == #ioc or x.kind == #fok or x.kind == #stopLimit;
+            if (not limited or x.price < shortFloor(i)) return ?#ShortSalePrice({ price = x.price; floor = shortFloor(i) });
+          } else {
+            let free = ownedFree(s, x.account, i, x.instrument);
+            if (x.qty > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty });
+          };
+        };
         let price = effectivePrice(i, x.side, x.kind, x.price);
         switch (riskRefusal(s, x.member, x.qty, price * x.qty, 0)) { case (?e) return ?e; case null {} };
         let need = holdingOf(x.side, price, x.qty);
@@ -653,12 +718,18 @@ module {
         let ?i = instrument(s, o.instrument) else return ?#UnknownInstrument({ instrument = o.instrument });
         if (i.phase == #halted) return ?#InstrumentHalted({ instrument = o.instrument });
         switch (killedFor(s, o.member, o.trader)) { case (?k) return ?#Killed({ kill = k }); case null {} };
+        if (blackedOut(s, xs, o.account, o.instrument, now)) return ?#InsiderBlackout({ instrument = o.instrument });
         if (x.qty == 0 or x.qty % i.lot != 0) return ?#NotALot({ qty = x.qty; lot = i.lot });
         if (o.peak != 0 and o.peak >= x.qty) return ?#NotALot({ qty = x.qty; lot = i.lot });
         if (not L.onTick(i.bands, x.price)) return ?#PriceOffTick({ price = x.price; tick = L.tickAt(i.bands, x.price) });
         if (x.qty == o.remaining and x.price == o.price) return ?#InvalidTerms({ reason = "nothing to amend" });
         let (blo, bhi) = L.band(i.referencePrice, i.staticBps);
         if (x.price < blo or x.price > bhi) return ?#PriceOutsideBand({ price = x.price; low = blo; high = bhi });
+        // short sales (SPEC §17): a flagged one's new price at or above the floor; an unflagged one adds only what is owned free
+        if (o.side == #sell) {
+          if (o.shortSale) { if (x.price < shortFloor(i)) return ?#ShortSalePrice({ price = x.price; floor = shortFloor(i) }) }
+          else if (x.qty > o.remaining) { let free = ownedFree(s, o.account, i, o.instrument); if (x.qty - o.remaining > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty - o.remaining }) };
+        };
         switch (riskRefusal(s, o.member, x.qty, x.price * x.qty, openValue(o))) { case (?e) return ?e; case null {} };
         let need = holdingOf(o.side, x.price, x.qty);
         let ledger = holdingLedger(i, o.side);
@@ -733,6 +804,38 @@ module {
       };
       case (#setLimits(x)) {
         if (X.member(xs, x.member) == null) return ?#InvalidTerms({ reason = "no such member" });
+        null
+      };
+      // SPEC §16
+      case (#setBlackout(x)) {
+        if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (x.client.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte client code" });
+        if (x.until != 0 and x.until < X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "a day not past" });
+        switch (reasonRefusal(x.reason)) { case (?e) return ?e; case null {} };
+        if (one(s.blackoutStore, blackoutRows, "active", blackoutKey(x.instrument, x.client)) != null) return ?#InvalidTerms({ reason = "already blacked out" });
+        null
+      };
+      case (#liftBlackout(x)) {
+        switch (RS.get(s.blackoutStore, blackoutRows, x.blackout)) { case (?b) { if (not b.active) return ?#UnknownBlackout({ blackout = x.blackout }) }; case null return ?#UnknownBlackout({ blackout = x.blackout }) };
+        null
+      };
+      // SPEC §17
+      case (#borrow(x)) {
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (x.qty == 0) return ?#InvalidTerms({ reason = "a quantity above zero" });
+        if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
+        if (one(s.refRows, refs, "byRef", x.reference) != null) return ?#DuplicateReference;
+        null
+      };
+      case (#returnBorrow(x)) {
+        switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
+        if (memberOf(xs, x.account) != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        if (x.qty == 0 or x.qty > owedOf(s, x.account, x.instrument)) return ?#InvalidTerms({ reason = "no more than is owed" });
+        let b = balance(s, x.account, i.assetLedger);
+        if (b.available < x.qty) return ?#InsufficientFunds({ ledger = i.assetLedger; available = b.available; wanted = x.qty });
         null
       };
       // SPEC §15: the market day of the act, later than every day sealed
@@ -972,6 +1075,31 @@ module {
       case (#setLimits(x)) {
         putLimits(s, x.member, func(l : T.Limits) : T.Limits { { l with maxOrderQty = x.maxOrderQty; maxOrderValue = x.maxOrderValue; creditLimit = x.creditLimit } });
         [21, x.member]
+      };
+      case (#setBlackout(x)) {
+        let id = s.nextBlackout; s.nextBlackout += 1;
+        RS.put(s.blackoutStore, blackoutRows, id, { instrument = x.instrument; client = x.client; until = x.until; active = true });
+        [23, id]
+      };
+      case (#liftBlackout(x)) {
+        let ?b = RS.get(s.blackoutStore, blackoutRows, x.blackout) else Runtime.trap("apply: blackout vanished");
+        RS.put(s.blackoutStore, blackoutRows, x.blackout, { b with active = false });
+        [24, x.blackout]
+      };
+      case (#borrow(x)) {
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        let id = s.nextRef; s.nextRef += 1;
+        RS.put(s.refRows, refs, id, { reference = x.reference });
+        credit(s, x.account, i.assetLedger, x.qty);
+        putOwed(s, x.account, x.instrument, owedOf(s, x.account, x.instrument) + x.qty);
+        [25, x.account, x.qty]
+      };
+      case (#returnBorrow(x)) {
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        let b = balance(s, x.account, i.assetLedger);
+        putBalance(s, { b with available = b.available - x.qty });
+        putOwed(s, x.account, x.instrument, owedOf(s, x.account, x.instrument) - x.qty);
+        [26, x.account, x.qty]
       };
       case (#sealDay(x)) {
         let (rows, hash) = seal(s, x.day);
@@ -1377,6 +1505,8 @@ module {
           case (#revive(c)) own(killMember(c.kill));
           case (#killSweep(c)) own(killMember(c.kill));
           case (#setLimits(c)) own(c.member);
+          case (#borrow(c)) own(c.member);
+          case (#returnBorrow(c)) own(c.member);
           case (#endOfDay(_) or #expireGtd(_)) { for (oid in Array.sliceToArray<Nat>(e, 2, 2 + e[1]).vals()) touched(oid) };
           case (#clear(_)) {
             var k = 1;
@@ -1551,6 +1681,8 @@ module {
     Fold.section(f, "stats", func(w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.statStore, statRows, i)) { case (?r) { w.nat(i); w.blob(statRows.encode(r)) }; case null {} } } });
     table<DayRow>("days", s.dayStore, dayRows, s.nextDayRow);
     table<SealRow>("seals", s.sealStore, sealRows, s.nextSeal);
+    table<Blackout>("blackouts", s.blackoutStore, blackoutRows, s.nextBlackout);
+    table<BorrowRow>("borrows", s.borrowStore, borrowRows, s.nextBorrow);
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
@@ -1567,7 +1699,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 24) {
+    while (left > 0 and run.part < 28) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -1593,12 +1725,16 @@ module {
         case 20 { if (run.cursor < s.nextDayRow) { switch (RS.get(s.dayStore, dayRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(dayRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 21 };
         case 21 { w.text("seals"); w.nat(s.nextSeal); run.part := 22; run.cursor := 1 };
         case 22 { if (run.cursor < s.nextSeal) { switch (RS.get(s.sealStore, sealRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(sealRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 23 };
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 24 };
+        case 23 { w.text("blackouts"); w.nat(s.nextBlackout); run.part := 24; run.cursor := 1 };
+        case 24 { if (run.cursor < s.nextBlackout) { switch (RS.get(s.blackoutStore, blackoutRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(blackoutRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 25 };
+        case 25 { w.text("borrows"); w.nat(s.nextBorrow); run.part := 26; run.cursor := 1 };
+        case 26 { if (run.cursor < s.nextBorrow) { switch (RS.get(s.borrowStore, borrowRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(borrowRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 27 };
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 28 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 24) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 28) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };

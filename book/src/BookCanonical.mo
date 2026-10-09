@@ -73,6 +73,10 @@ module {
       case (#revive(x)) { w.byte(20); w.nat(x.kill) };
       case (#setLimits(x)) { w.byte(21); w.nat(x.member); w.nat(x.maxOrderQty); w.nat(x.maxOrderValue); w.nat(x.creditLimit) };
       case (#sealDay(x)) { w.byte(22); w.nat(x.day) };
+      case (#setBlackout(x)) { w.byte(23); w.nat(x.instrument); w.blob(x.client); w.nat(x.until); w.text(x.reason) };
+      case (#liftBlackout(x)) { w.byte(24); w.nat(x.blackout) };
+      case (#borrow(x)) { w.byte(25); w.nat(x.account); w.nat(x.member); w.nat(x.instrument); w.nat(x.qty); w.blob(x.reference) };
+      case (#returnBorrow(x)) { w.byte(26); w.nat(x.account); w.nat(x.member); w.nat(x.instrument); w.nat(x.qty) };
     };
     true
   };
@@ -115,6 +119,10 @@ module {
       case 20 { let ?kill = r.nat() else return null; ?#revive({ kill }) };
       case 21 { let ?member = r.nat() else return null; let ?maxOrderQty = r.nat() else return null; let ?maxOrderValue = r.nat() else return null; let ?creditLimit = r.nat() else return null; ?#setLimits({ member; maxOrderQty; maxOrderValue; creditLimit }) };
       case 22 { let ?day = r.nat() else return null; ?#sealDay({ day }) };
+      case 23 { let ?instrument = r.nat() else return null; let ?client = r.blob() else return null; let ?until = r.nat() else return null; let ?reason = r.text() else return null; ?#setBlackout({ instrument; client; until; reason }) };
+      case 24 { let ?blackout = r.nat() else return null; ?#liftBlackout({ blackout }) };
+      case 25 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?instrument = r.nat() else return null; let ?qty = r.nat() else return null; let ?reference = r.blob() else return null; ?#borrow({ account; member; instrument; qty; reference }) };
+      case 26 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?instrument = r.nat() else return null; let ?qty = r.nat() else return null; ?#returnBorrow({ account; member; instrument; qty }) };
       case _ null;
     }
   };
@@ -122,7 +130,7 @@ module {
   public let registry : E.Registry<T.Command> = { domainPrefix = "tachyon-book-command"; current = 1; encoders = [{ version = 1; write = writeV1; read = readV1 }] };
 
   public let families : [Text] = ["openInstrument", "setTrading", "setReference", "deposit", "withdraw", "placeOrder", "cancelOrder", "amendOrder", "massCancel", "flush", "endOfDay", "expireGtd", "clear",
-    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay"];
+    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay", "setBlackout", "liftBlackout", "borrow", "returnBorrow"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -130,6 +138,7 @@ module {
       case (#massCancel(_)) "massCancel"; case (#flush) "flush"; case (#endOfDay(_)) "endOfDay"; case (#expireGtd(_)) "expireGtd"; case (#clear(_)) "clear";
       case (#setPhase(_)) "setPhase"; case (#uncross(_)) "uncross"; case (#halt(_)) "halt"; case (#resume(_)) "resume"; case (#kill(_)) "kill"; case (#killSweep(_)) "killSweep";
       case (#revive(_)) "revive"; case (#setLimits(_)) "setLimits"; case (#sealDay(_)) "sealDay";
+      case (#setBlackout(_)) "setBlackout"; case (#liftBlackout(_)) "liftBlackout"; case (#borrow(_)) "borrow"; case (#returnBorrow(_)) "returnBorrow";
     }
   };
 

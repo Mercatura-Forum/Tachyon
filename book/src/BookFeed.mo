@@ -76,7 +76,8 @@ module {
       };
       // effects: [22, day, rows, the file's hash, one byte an effect]
       case (#sealDay(_)) { w.byte(10); w.nat(e[1]); w.nat(e[2]); w.bytes(Array.tabulate<Nat8>(32, func(i) { Nat8.fromNat(e[3 + i]) })) };
-      case (#deposit(_) or #withdraw(_) or #flush or #kill(_) or #revive(_) or #setLimits(_)) w.byte(0);
+      // private: funds, kills, limits, insider lists, securities loans
+      case (#deposit(_) or #withdraw(_) or #flush or #kill(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #borrow(_) or #returnBorrow(_)) w.byte(0);
     }
   };
 

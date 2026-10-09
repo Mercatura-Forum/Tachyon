@@ -133,6 +133,13 @@ module {
     #setLimits : { member : Nat; maxOrderQty : Nat; maxOrderValue : Nat; creditLimit : Nat };
     /// The scheduler seals the market day (SPEC §15): the day's file written, its hash recorded, a new session begun.
     #sealDay : { day : Nat };
+    /// Compliance, under four eyes, blacks out a client code for an instrument until the end of a market day (0: until
+    /// lifted), and lifts it (SPEC §16).
+    #setBlackout : { instrument : InstrumentId; client : Blob; until : Nat; reason : Text };
+    #liftBlackout : { blackout : Nat };
+    /// The depository attests a securities loan: the shares credited and recorded owed; a trader returns them (§17).
+    #borrow : { account : AccountId; member : Nat; instrument : InstrumentId; qty : Nat; reference : Blob };
+    #returnBorrow : { account : AccountId; member : Nat; instrument : InstrumentId; qty : Nat };
   };
 
   /// Effects: a flat list of numbers, the family tag first (`BookCore.apply` gives each family's layout).
@@ -170,5 +177,9 @@ module {
     #UnknownKill : { kill : Nat };
     #OrdersStillOpen : { kill : Nat };
     #RiskLimit : { figure : Text; limit : Nat; wanted : Nat };
+    #InsiderBlackout : { instrument : InstrumentId };
+    #UnknownBlackout : { blackout : Nat };
+    #ShortSaleNotFlagged : { free : Nat; wanted : Nat };
+    #ShortSalePrice : { price : Nat; floor : Nat };
   };
 };
