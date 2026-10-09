@@ -1,0 +1,109 @@
+{
+  "battery": "Exchange",
+  "grants": [
+    {
+      "role": "2vxsx-fae",
+      "prefixes": [],
+      "exact": [
+        "exchange.member.admit",
+        "exchange.member.status",
+        "exchange.trader.register",
+        "exchange.trader.revoke",
+        "exchange.right.grant",
+        "exchange.right.withdraw",
+        "exchange.account.open",
+        "exchange.account.close",
+        "exchange.segment.define",
+        "exchange.segment.schedule",
+        "exchange.calendar.restdays",
+        "exchange.calendar.holiday",
+        "exchange.ticktable.define",
+        "exchange.instrument.list",
+        "exchange.instrument.status",
+        "exchange.instrument.lot",
+        "exchange.clock.offset"
+      ]
+    },
+    {
+      "role": "6abng-3xbmm-zos2l-batfg-zytpv-vj2jv-3t7hk-3hh6q-6hugj-2q3bc-cqe",
+      "prefixes": [],
+      "exact": [
+        "exchange.segment.advance",
+        "exchange.instrument.reference"
+      ]
+    },
+    {
+      "role": "aaaaa-aa",
+      "prefixes": [],
+      "exact": [
+        "command.approve",
+        "command.reject"
+      ]
+    },
+    {
+      "role": "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae",
+      "prefixes": [],
+      "exact": [
+        "command.approve",
+        "command.reject"
+      ]
+    },
+    {
+      "role": "ktizj-ppt3n-t4gxw-lzckj-ghema-o6gli-zx5uq-eivp6-q5sun-c22gs-cqe",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close"
+      ]
+    },
+    {
+      "role": "rwlgt-iiaaa-aaaaa-aaaaa-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close"
+      ]
+    },
+    {
+      "role": "rrkah-fqaaa-aaaaa-aaaaq-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close"
+      ]
+    },
+    {
+      "role": "ryjl3-tyaaa-aaaaa-aaaba-cai",
+      "prefixes": [],
+      "exact": [
+        "exchange.account.open",
+        "exchange.account.close"
+      ]
+    }
+  ],
+  "eligibleRole": "director",
+  "holders": [
+    "aaaaa-aa",
+    "ckbmq-yctyx-z6a2f-2xyya-pfg5n-jvgca-tye34-z7x4e-w6v53-cnjit-uae"
+  ],
+  "offeringDuals": [],
+  "custodyDuals": [],
+  "exchangeDuals": [
+    "exchange.member.admit",
+    "exchange.member.status",
+    "exchange.trader.register",
+    "exchange.trader.revoke",
+    "exchange.right.grant",
+    "exchange.right.withdraw",
+    "exchange.segment.define",
+    "exchange.segment.schedule",
+    "exchange.calendar.restdays",
+    "exchange.calendar.holiday",
+    "exchange.ticktable.define",
+    "exchange.instrument.list",
+    "exchange.instrument.status",
+    "exchange.instrument.lot",
+    "exchange.clock.offset"
+  ],
+  "ttlSeconds": 3600
+}

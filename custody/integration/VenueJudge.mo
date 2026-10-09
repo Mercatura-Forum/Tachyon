@@ -1,5 +1,5 @@
-/// VenueJudge.mo: the test composition the chain judge installs (`custody/integration/chain_judge.py`): the offering and
-/// the custody register, composed as their batteries compose them, so that a battery's transcript can be made again on a
+/// VenueJudge.mo: the test composition the chain judge installs (`custody/integration/chain_judge.py`): the offering,
+/// the custody register and the exchange's foundation, composed as their batteries compose them, so that a battery's transcript can be made again on a
 /// chain, call by call. It is a test actor and never the product's front.
 ///
 /// Each chain signer the judge uses stands for one of the battery's roles (a principal the battery acted as). The actor
@@ -28,6 +28,9 @@ import OK "../src/OfferingCanonical";
 import Cu "../src/CustodyCore";
 import CK "../src/CustodyCanonical";
 import TC "../test/support/Traced";
+import X "../../exchange/src/ExchangeCore";
+import XK "../../exchange/src/ExchangeCanonical";
+import XTC "../../exchange/test/support/Traced";
 
 persistent actor class VenueJudge(init : {
   roles : [{ signer : Principal; role : Principal }];
@@ -36,16 +39,19 @@ persistent actor class VenueJudge(init : {
   holders : [Principal];
   offeringDuals : [Text];
   custodyDuals : [Text];
+  exchangeDuals : [Text];
   ttlSeconds : Nat;
 }) {
 
   let os = Of.newState();
   let cs = Cu.newState();
+  let xs = X.newState();
   func duals(ps : [Text]) : [{ permission : Text; required : Nat; eligibleRole : Text; ttlSeconds : Nat }] {
     Array.map<Text, { permission : Text; required : Nat; eligibleRole : Text; ttlSeconds : Nat }>(ps, func(permission) { { permission; required = 1; eligibleRole = init.eligibleRole; ttlSeconds = init.ttlSeconds } })
   };
   Of.setPolicies(os, duals(init.offeringDuals));
   Cu.setPolicies(cs, duals(init.custodyDuals));
+  X.setPolicies(xs, duals(init.exchangeDuals));
 
   func hasGrant(p : Principal, perm : Text) : Bool {
     for (g in init.grants.vals()) {
@@ -69,6 +75,7 @@ persistent actor class VenueJudge(init : {
     switch (domain) {
       case "offering" { let ?c = E.readAt(OK.registry, version, r) else return "e=Undecodable"; TC.oOut(Of.submit(os, auth, now, role, c, null, justification)) };
       case "custody" { let ?c = E.readAt(CK.registry, version, r) else return "e=Undecodable"; TC.cOut(Cu.submit(cs, auth, now, role, c, null, justification)) };
+      case "exchange" { let ?c = E.readAt(XK.registry, version, r) else return "e=Undecodable"; XTC.xOut(X.submit(xs, auth, now, role, c, null, justification)) };
       case _ "e=UnknownDomain";
     }
   };
@@ -77,10 +84,11 @@ persistent actor class VenueJudge(init : {
     switch (domain) {
       case "offering" TC.oOut(Of.approve(os, auth, now, role, proposal));
       case "custody" TC.cOut(Cu.approve(cs, auth, now, role, proposal));
+      case "exchange" XTC.xOut(X.approve(xs, auth, now, role, proposal));
       case _ "e=UnknownDomain";
     }
   };
-  public func fingerprints() : async [(Text, Blob)] { [("offering", Of.fingerprint(os)), ("custody", Cu.fingerprint(cs))] };
+  public func fingerprints() : async [(Text, Blob)] { [("offering", Of.fingerprint(os)), ("custody", Cu.fingerprint(cs)), ("exchange", X.fingerprint(xs))] };
   public func replayCheck() : async Text {
     let o2 = Of.newStateOver(os.log); Of.setPolicies(o2, duals(init.offeringDuals));
     let orp = Of.replay(o2);
@@ -88,7 +96,10 @@ persistent actor class VenueJudge(init : {
     let crp = Cu.replay(c2);
     if (orp.faults.size() > 0 or Of.fingerprint(o2) != Of.fingerprint(os)) return "fault|offering|" # debug_show(orp.faults);
     if (crp.faults.size() > 0 or Cu.fingerprint(c2) != Cu.fingerprint(cs)) return "fault|custody|" # debug_show(crp.faults);
-    "ok|" # Nat.toText(orp.blocks) # "," # Nat.toText(crp.blocks)
+    let x2 = X.newStateOver(xs.log); X.setPolicies(x2, duals(init.exchangeDuals));
+    let xrp = X.replay(x2);
+    if (xrp.faults.size() > 0 or X.fingerprint(x2) != X.fingerprint(xs)) return "fault|exchange|" # debug_show(xrp.faults);
+    "ok|" # Nat.toText(orp.blocks) # "," # Nat.toText(crp.blocks) # "," # Nat.toText(xrp.blocks)
   };
-  public query func counts() : async { offeringBlocks : Nat; custodyBlocks : Nat } { { offeringBlocks = Of.counts(os).blocks; custodyBlocks = Cu.counts(cs).blocks } };
+  public query func counts() : async { offeringBlocks : Nat; custodyBlocks : Nat; exchangeBlocks : Nat } { { offeringBlocks = Of.counts(os).blocks; custodyBlocks = Cu.counts(cs).blocks; exchangeBlocks = X.counts(xs).blocks } };
 }
