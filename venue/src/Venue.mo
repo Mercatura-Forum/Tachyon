@@ -62,7 +62,7 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
     "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
     "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
-    "book.fees.schedule", "book.maker.register"];
+    "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -250,6 +250,24 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   };
   /// An instrument's fee schedule (SPEC §22): public, the rates the venue charges.
   public query func feeSchedule(instrument : Nat) : async [T.Levy] { B.feeSchedule(bs, instrument) };
+  /// An index (SPEC §26, §27): its row (level and reference in hundredths of a point, the breaker's state, the divisor)
+  /// and its constituents with their free-float shares and capping factors. Public: the levels the venue publishes.
+  public query func index(i : Nat) : async ?{ row : B.IndexRow; constituents : [B.ConstituentRow] } {
+    switch (B.indexRowOf(bs, i)) {
+      case (?row) ?{ row; constituents = Array.map<(Nat, B.ConstituentRow), B.ConstituentRow>(B.constituentsOf(bs, i), func(e) { e.1 }) };
+      case null null;
+    }
+  };
+  /// An index's path (SPEC §26): the path's rows from `from` (the first is 1), at most `limit` of them examined (up to
+  /// 500), those of index `i` returned with the block that recorded each; `next` the row to read from, 0 at the end.
+  /// Public, as the levels are.
+  public query func indexPath(i : Nat, from : Nat, limit : Nat) : async { rows : [B.PathRow]; next : Nat } {
+    let start = Nat.max(from, 1);
+    let stop = Nat.min(bs.nextPath, start + Nat.min(Nat.max(limit, 1), 500));
+    let rows = List.empty<B.PathRow>();
+    for (id in Nat.range(start, stop)) { switch (B.pathOf(bs, id)) { case (?r) { if (r.index == i) List.add(rows, r) }; case null {} } };
+    { rows = List.toArray(rows); next = if (stop >= bs.nextPath) 0 else stop }
+  };
   /// The settlement range's leaf count and root (SPEC §19): public, a hash that names nothing.
   public query func settlementRoot() : async { legs : Nat; root : Blob } { let (legs, root) = B.settlementRoot(bs); { legs; root } };
   /// Leg `index` and its inclusion proof against the root at `legs` legs (0 for the present one): to the regulator and the
