@@ -2,3 +2,8 @@
 build/
 .dfx/
 .thebes/
+test/chain/out/
+test/chain/local.thebes.toml
+test/chain/thebes.toml
+__pycache__/
+*.pyc
