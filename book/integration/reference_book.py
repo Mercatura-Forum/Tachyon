@@ -855,6 +855,15 @@ class Ref:
                 else:
                     return self.clearing_refusal(m, c["instrument"], c["side"], c["short"], price, c["qty"], 0, 0)
             return None
+        if k == "replaceOrder":
+            # §37: every rule of an amendment, then the new reference, 1 to 20 bytes, naming none of the account's orders
+            e = self.validate(now, role, {"k": "amendOrder", "order": c["order"], "qty": c["qty"], "price": c["price"]})
+            if e:
+                return e
+            n = len(c["ref"].encode())
+            if n == 0 or n > 20:
+                return "InvalidTerms"
+            return "DuplicateClientRef" if (self.orders[c["order"]]["account"], c["ref"]) in self.refs_used else None
         if k in ("cancelOrder", "amendOrder"):
             o = self.orders.get(c["order"])
             if o is None:
@@ -1758,6 +1767,13 @@ class Ref:
         if k == "cancelOrder":
             self.close(c["order"], "cancelled")
             return [7, c["order"]]
+        if k == "replaceOrder":
+            fx = self.apply(now, {"k": "amendOrder", "order": c["order"], "qty": c["qty"], "price": c["price"]})
+            o = self.orders[c["order"]]
+            # the order answers to the new reference only: the old one names no order of the account any more
+            self.refs_used.discard((o["account"], o["ref"])); self.refs_used.add((o["account"], c["ref"]))
+            o["ref"] = c["ref"]
+            return [67, c["order"], fx[2], fx[3]]
         if k == "amendOrder":
             o = self.orders[c["order"]]
             keeps = c["price"] == o["price"] and c["qty"] <= o["remaining"]

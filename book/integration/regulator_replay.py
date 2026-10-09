@@ -156,6 +156,8 @@ def read_command(data):
         c = {"k": "cancelOrder", "order": r.nat()}
     elif tag == 8:
         c = {"k": "amendOrder", "order": r.nat(), "qty": r.nat(), "price": r.nat()}
+    elif tag == 67:
+        c = {"k": "replaceOrder", "order": r.nat(), "qty": r.nat(), "price": r.nat(), "ref": r.text()}
     elif tag == 9:
         c = {"k": "massCancel", "account": r.nat(), "member": r.nat(), "limit": r.nat()}
     elif tag == 10:
@@ -454,7 +456,7 @@ def concerned(block, order_member, kill_member, terms, redemptions):
             mentioned(e[3 + 3 * j])
         for j in range(e[3 + 3 * n]):
             mentioned(e[4 + 3 * n + 3 * j])
-    elif k in ("cancelOrder", "amendOrder"):
+    elif k in ("cancelOrder", "amendOrder", "replaceOrder"):
         own(order_member.get(c["order"], 0))
     elif k in ("revive", "killSweep"):
         own(kill_member.get(c["kill"], 0))

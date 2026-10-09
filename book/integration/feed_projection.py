@@ -82,7 +82,7 @@ def body(w, c, e):
             w.byte(0)
     elif k == "cancelOrder":
         w.byte(5); w.nats([c["order"]])
-    elif k == "amendOrder":
+    elif k in ("amendOrder", "replaceOrder"):
         if e[3] == 0:
             w.byte(0)
         else:
