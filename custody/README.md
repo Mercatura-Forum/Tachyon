@@ -30,6 +30,14 @@ vendor/thebes-kernel  the kernel, pinned by commit
 - `recordSettlement` (single, the reason recorded): the venue's receipt `{ kind; id; block; hash }`, once; the units
   move from one holder to another and never more than the holder has; none on an asset whose struck action awaits
   payment, because the record-date positions are the entitlement's basis.
+- `linkAccount` (dual): the custodian attests that a venue account is a holder's, once per account.
+- `admitLeg` (single, the reason recorded): a leg of the book's settlement range (book/SPEC.md §19) admitted as a
+  receipt only with its inclusion proof against the book's root at the leg count the command names. The register is
+  composed with the book by its host (`submitWith` and its anchor, the book's `settlementRootAt`): without the book the
+  root is unknown and no leg is admitted. The holders are the linked holders of the leg's accounts, the units and the
+  ledger the leg's (the asset's ledger); the leg's bytes are written here again from the book's SPEC, so a leg the two
+  encodings disagree on cannot prove; each leg is recorded once, under its own kind (a fill's, a cycle's, a
+  transfer's) and its index in the range.
 - `reconcile` (dual): the custodian attests the ledger's balances as of a block; every holder's position is
   compared, the matches and the breaks counted, the rows sealed by a hash (`tachyon.custody.reconciliation.v1`).
   The register's total and the issued supply are recorded side by side; they agree by construction.

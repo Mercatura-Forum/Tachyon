@@ -43,6 +43,12 @@ module {
     TR.submitted("custody", CK.registry.current, bytesOr(E.bytesAt(CK.registry, CK.registry.current, c)), caller, now, justification, cOut(r));
     r
   };
+  /// A submission composed with the book's settlement root (SPEC §19), traced as any other.
+  public func csubWith(s : Cu.State, auth : Cu.Authority, anchor : Cu.Anchor, now : Nat64, caller : Principal, c : CT.Command, partition : ?Text, justification : Text) : Cu.Result<Cu.Outcome> {
+    let r = Cu.submitWith(s, auth, anchor, now, caller, c, partition, justification);
+    TR.submitted("custody", CK.registry.current, bytesOr(E.bytesAt(CK.registry, CK.registry.current, c)), caller, now, justification, cOut(r));
+    r
+  };
   public func capp(s : Cu.State, auth : Cu.Authority, now : Nat64, checker : Principal, id : Nat) : Cu.Result<Cu.Outcome> {
     let r = Cu.approve(s, auth, now, checker, id);
     TR.approved("custody", id, checker, now, cOut(r));

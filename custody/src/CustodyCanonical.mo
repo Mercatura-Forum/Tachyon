@@ -3,6 +3,7 @@
 
 import Blob "mo:core/Blob";
 import List "mo:core/List";
+import Nat "mo:core/Nat";
 import Nat8 "mo:core/Nat8";
 
 import C "mo:kernel/codec/Canonical";
@@ -36,8 +37,8 @@ module {
       case _ null;
     }
   };
-  public func receiptKindCode(k : CT.ReceiptKind) : Nat8 { switch (k) { case (#trade) 1; case (#delivery) 2; case (#issuance) 3; case (#redemption) 4 } };
-  public func receiptKindOf(c : Nat8) : ?CT.ReceiptKind { switch (c) { case 1 ?#trade; case 2 ?#delivery; case 3 ?#issuance; case 4 ?#redemption; case _ null } };
+  public func receiptKindCode(k : CT.ReceiptKind) : Nat8 { switch (k) { case (#trade) 1; case (#delivery) 2; case (#issuance) 3; case (#redemption) 4; case (#fillLeg) 5; case (#cycleLeg) 6; case (#transferLeg) 7 } };
+  public func receiptKindOf(c : Nat8) : ?CT.ReceiptKind { switch (c) { case 1 ?#trade; case 2 ?#delivery; case 3 ?#issuance; case 4 ?#redemption; case 5 ?#fillLeg; case 6 ?#cycleLeg; case 7 ?#transferLeg; case _ null } };
   public func stateCode(s : CT.ActionState) : Nat8 { switch (s) { case (#announced) 1; case (#struck) 2; case (#paid) 3; case (#cancelled) 4 } };
   public func stateOf(c : Nat8) : ?CT.ActionState { switch (c) { case 1 ?#announced; case 2 ?#struck; case 3 ?#paid; case 4 ?#cancelled; case _ null } };
 
@@ -53,8 +54,23 @@ module {
       case (#subscribeRights(x)) { w.byte(8); w.nat(x.action); w.nat(x.holder); w.nat(x.rights); w.nat(x.day) };
       case (#pay(x)) { w.byte(9); w.nat(x.action); w.nat(x.day); w.nat(x.limit) };
       case (#certifyEntitlementFile(x)) { w.byte(10); w.nat(x.action); w.nat(x.day) };
+      case (#linkAccount(x)) { w.byte(11); w.nat(x.account); w.nat(x.holder) };
+      case (#admitLeg(x)) {
+        w.byte(12); w.nat(x.asset); w.nat(x.index); w.nat(x.legs);
+        w.nat(x.leg.kind); w.principal(x.leg.ledger); w.nat(x.leg.from); w.nat(x.leg.to); w.nat(x.leg.units); w.nat(x.leg.block);
+        w.len16(x.proof.siblings.size()); for (h in x.proof.siblings.vals()) w.blob(h);
+        w.nat(x.proof.peakIndex); w.len16(x.proof.peaks.size()); for (h in x.proof.peaks.vals()) w.blob(h);
+        w.nat(x.day)
+      };
     };
     true
+  };
+  /// A list of hashes as `admitLeg` writes it: its length (two bytes), then each as a blob.
+  func hashes(r : C.Reader) : ?[Blob] {
+    let ?n = r.len16() else return null;
+    let out = List.empty<Blob>();
+    for (_ in Nat.range(0, n)) { let ?h = r.blob() else return null; List.add(out, h) };
+    ?List.toArray(out)
   };
   func readV1(r : C.Reader) : ?CT.Command {
     let ?tag = r.byte() else return null;
@@ -78,13 +94,21 @@ module {
       case 8 { let ?action = r.nat() else return null; let ?holder = r.nat() else return null; let ?rights = r.nat() else return null; let ?day = r.nat() else return null; ?#subscribeRights({ action; holder; rights; day }) };
       case 9 { let ?action = r.nat() else return null; let ?day = r.nat() else return null; let ?limit = r.nat() else return null; ?#pay({ action; day; limit }) };
       case 10 { let ?action = r.nat() else return null; let ?day = r.nat() else return null; ?#certifyEntitlementFile({ action; day }) };
+      case 11 { let ?account = r.nat() else return null; let ?holder = r.nat() else return null; ?#linkAccount({ account; holder }) };
+      case 12 {
+        let ?asset = r.nat() else return null; let ?index = r.nat() else return null; let ?legs = r.nat() else return null;
+        let ?kind = r.nat() else return null; let ?ledger = r.principal() else return null; let ?from = r.nat() else return null; let ?to = r.nat() else return null;
+        let ?units = r.nat() else return null; let ?block = r.nat() else return null;
+        let ?siblings = hashes(r) else return null; let ?peakIndex = r.nat() else return null; let ?peaks = hashes(r) else return null; let ?day = r.nat() else return null;
+        ?#admitLeg({ asset; index; legs; leg = { kind; ledger; from; to; units; block }; proof = { siblings; peakIndex; peaks }; day })
+      };
       case _ null;
     }
   };
 
   public let registry : E.Registry<CT.Command> = { domainPrefix = "tachyon-custody-command"; current = 1; encoders = [{ version = 1; write = writeV1; read = readV1 }] };
   public func familyOf(c : CT.Command) : Text {
-    switch (c) { case (#registerHolder(_)) "registerHolder"; case (#registerAsset(_)) "registerAsset"; case (#recordSettlement(_)) "recordSettlement"; case (#reconcile(_)) "reconcile"; case (#announceAction(_)) "announceAction"; case (#cancelAction(_)) "cancelAction"; case (#strikeRecordDate(_)) "strikeRecordDate"; case (#subscribeRights(_)) "subscribeRights"; case (#pay(_)) "pay"; case (#certifyEntitlementFile(_)) "certifyEntitlementFile" }
+    switch (c) { case (#registerHolder(_)) "registerHolder"; case (#registerAsset(_)) "registerAsset"; case (#recordSettlement(_)) "recordSettlement"; case (#reconcile(_)) "reconcile"; case (#announceAction(_)) "announceAction"; case (#cancelAction(_)) "cancelAction"; case (#strikeRecordDate(_)) "strikeRecordDate"; case (#subscribeRights(_)) "subscribeRights"; case (#pay(_)) "pay"; case (#certifyEntitlementFile(_)) "certifyEntitlementFile"; case (#linkAccount(_)) "linkAccount"; case (#admitLeg(_)) "admitLeg" }
   };
 
   /// The entitlement file's bytes: the action, its asset and kind, the record and payment dates, then every

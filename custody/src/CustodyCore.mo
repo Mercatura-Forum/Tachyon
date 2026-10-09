@@ -28,6 +28,7 @@ import MC "mo:kernel/auth/MakerChecker";
 import RS "mo:kernel/rows/RowStore";
 import Page "mo:kernel/rows/Page";
 import R "mo:kernel/rows/StableRows";
+import MP "mo:kernel/proof/MmrProof";
 
 import CT "CustodyTypes";
 import K "CustodyCanonical";
@@ -57,6 +58,8 @@ module {
     Perm.p("custody.rights.subscribe", "entitlement", #update, #command("subscribeRights"), false, false, false),
     Perm.p("custody.action.pay", "action", #update, #command("pay"), false, false, false),
     Perm.p("custody.file.certify", "action", #approve, #command("certifyEntitlementFile"), false, false, true),
+    Perm.p("custody.account.link", "holder", #create, #command("linkAccount"), false, false, true),
+    Perm.p("custody.leg.admit", "position", #update, #command("admitLeg"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -65,8 +68,9 @@ module {
     ("custody.action.strike", "strikes an announced action's record date over the next slice of holders; every entitlement is computed from the positions and the terms two roles announced"),
     ("custody.rights.subscribe", "takes up rights a holder is entitled to, within them and by the deadline; the holder's own act, paid at the announced price"),
     ("custody.action.pay", "pays a struck action on its payment date over the next slice of entitlements; the units and the cash are the entitlements' and the caller chooses nothing"),
+    ("custody.leg.admit", "admits a leg of the book's settlement range only with its inclusion proof against the book's root; the holders, units and ledger are the leg's and the caller chooses nothing"),
   ] };
-  public let commandNames : [Text] = ["registerHolder", "registerAsset", "recordSettlement", "reconcile", "announceAction", "cancelAction", "strikeRecordDate", "subscribeRights", "pay", "certifyEntitlementFile"];
+  public let commandNames : [Text] = ["registerHolder", "registerAsset", "recordSettlement", "reconcile", "announceAction", "cancelAction", "strikeRecordDate", "subscribeRights", "pay", "certifyEntitlementFile", "linkAccount", "admitLeg"];
   public let methodNames : [Text] = ["approve", "reject"];
   public func permissionOf(c : CT.Command) : Auth.Permission {
     switch (Perm.byCommand(catalogue(), K.familyOf(c))) { case (?p) p; case null Runtime.trap("catalogue: no permission guards " # K.familyOf(c)) }
@@ -183,6 +187,15 @@ module {
     and 8 + 4 + 8 + 4 + 8 + 8 + 4 + 4 + 32 == 80 and 80 <= RECONCILIATION_ROW_BYTES
   };
 
+  /// A venue account linked to its holder (the custodian's attestation), keyed by the account.
+  public type LinkRow = { account : Nat; holder : Nat };
+  public let links : RS.Decl<LinkRow> = {
+    table = "links"; idBytes = 8; rowBytes = 16;
+    encode = func(x : LinkRow) : Blob { let b = R.buf(); R.putNat(b, x.account, 8); R.putNat(b, x.holder, 8); R.done(b, 16) };
+    decode = func(a : [Nat8]) : LinkRow { { account = R.getNat(a, 0, 8); holder = R.getNat(a, 8, 8) } };
+    indexes = [{ name = "byAccount"; keyBytes = 8; keyOf = func(_ : Nat, x : LinkRow) : ?Blob { ?R.key(x.account, 8) } }];
+  };
+
   // ═══════════════════════════════════════════════════════
   //  THE STATE
   // ═══════════════════════════════════════════════════════
@@ -192,11 +205,13 @@ module {
     holderRows : RS.Store; assetRows : RS.Store; positionRows : RS.Store; receiptRows : RS.Store; actionRows : RS.Store; entitlementRows : RS.Store; reconciliationRows : RS.Store; proposalRows : RS.Store;
     var holderBound : Nat; var nextAsset : Nat; var nextPosition : Nat; var nextReceipt : Nat; var nextAction : Nat; var nextEntitlement : Nat; var nextReconciliation : Nat;
     var policies : [Auth.DualPolicy];
+    linkRows : RS.Store; var nextLink : Nat;
   };
   public func newState() : State { newStateOver(DL.newState()) };
   public func newStateOver(log : DL.State) : State {
     { log; holderRows = RS.newStore(holders); assetRows = RS.newStore(assets); positionRows = RS.newStore(positions); receiptRows = RS.newStore(receipts); actionRows = RS.newStore(actions); entitlementRows = RS.newStore(entitlements); reconciliationRows = RS.newStore(reconciliations); proposalRows = RS.newStore(proposals);
-      var holderBound = 1; var nextAsset = 1; var nextPosition = 1; var nextReceipt = 1; var nextAction = 1; var nextEntitlement = 1; var nextReconciliation = 1; var policies = [] }
+      var holderBound = 1; var nextAsset = 1; var nextPosition = 1; var nextReceipt = 1; var nextAction = 1; var nextEntitlement = 1; var nextReconciliation = 1; var policies = [];
+      linkRows = RS.newStore(links); var nextLink = 1 }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
   func policyFor(s : State, permission : Text) : ?Auth.DualPolicy { Array.find<Auth.DualPolicy>(s.policies, func(p) { p.permission == permission }) };
@@ -213,6 +228,21 @@ module {
   public func positionsOf(s : State, a : CT.AssetId, cursor : ?Page.Cursor, limit : Nat) : Page.Result<(Nat, PositionRow)> { let (lo, hi) = R.prefixRange(a, 8, 8); RS.page(s.positionRows, positions, "byAssetHolder", lo, hi, cursor, limit) };
   public func receipt(s : State, kind : CT.ReceiptKind, id : Nat) : ?(Nat, ReceiptRow) { one(s.receiptRows, receipts, "byReceipt", receiptKey(kind, id)) };
   public func receiptById(s : State, id : Nat) : ?ReceiptRow { RS.get(s.receiptRows, receipts, id) };
+  /// The holder a venue account is linked to.
+  public func linkOf(s : State, account : Nat) : ?Nat { switch (one(s.linkRows, links, "byAccount", R.key(account, 8))) { case (?(_, l)) ?l.holder; case null null } };
+  /// A leg's bytes as the book's settlement range encodes it (book/src/BookCore.mo `legRows`): the kind, the ledger
+  /// (its length then its bytes, to 29), the accounts, the units and the block, eight bytes each. Written here again from
+  /// the book's SPEC §19, not imported: a leg the two encodings disagree on cannot prove.
+  public func legBytes(l : CT.Leg) : Blob {
+    let b = R.buf(); R.putNat(b, l.kind, 1);
+    let p = Principal.toBlob(l.ledger); R.putNat(b, p.size(), 1); for (x in p.vals()) R.putByte(b, x); var k = p.size(); while (k < 29) { R.putByte(b, 0); k += 1 };
+    R.putNat(b, l.from, 8); R.putNat(b, l.to, 8); R.putNat(b, l.units, 8); R.putNat(b, l.block, 8);
+    R.done(b, 63)
+  };
+  func legKind(k : Nat) : CT.ReceiptKind { if (k == 1) #fillLeg else if (k == 2) #cycleLeg else #transferLeg };
+  /// The host's anchor: the book's settlement root when its range held `legs` legs, if it has held that many.
+  public type Anchor = Nat -> ?Blob;
+  public let noAnchor : Anchor = func(_ : Nat) : ?Blob { null };
   public func action(s : State, id : CT.ActionId) : ?ActionRow { RS.get(s.actionRows, actions, id) };
   /// The asset's open action, if any. A page stops at its scan budget and may hold no row while the range still does
   /// (entries of actions since paid or cancelled), so the walk follows the cursor until a row or the end of the range.
@@ -266,8 +296,31 @@ module {
   };
   func ratioOk(n : Nat, d : Nat) : Bool { n > 0 and d > 0 };
 
-  public func validate(s : State, c : CT.Command) : ?CT.Error {
+  public func validate(s : State, c : CT.Command) : ?CT.Error { validateWith(s, noAnchor, c) };
+  /// Validation with the host's anchor (the book's settlement root), which a leg's admission needs.
+  public func validateWith(s : State, anchor : Anchor, c : CT.Command) : ?CT.Error {
     switch (c) {
+      case (#linkAccount(x)) {
+        if (holder(s, x.holder) == null) return ?#UnknownHolder(x.holder);
+        if (linkOf(s, x.account) != null) return ?#AccountLinked({ account = x.account });
+        null
+      };
+      case (#admitLeg(x)) {
+        let ?a = asset(s, x.asset) else return ?#UnknownAsset(x.asset);
+        if (not Principal.equal(a.ledger, x.leg.ledger)) return ?#InvalidTerms({ reason = "a leg on the asset's ledger" });
+        if (x.leg.units == 0 or x.leg.kind == 0 or x.leg.kind > 3) return ?#InvalidTerms({ reason = "a leg of a fill, a cycle or a transfer, of units" });
+        // the proof: the leg's bytes are leaf `index` of the range whose root the book had at `legs` legs
+        let ?root = (if (x.index < x.legs) anchor(x.legs) else null) else return ?#RootUnknown({ legs = x.legs });
+        if (not MP.verify(legBytes(x.leg), x.index, x.proof, root)) return ?#ProofRefused({ index = x.index });
+        let ?from = linkOf(s, x.leg.from) else return ?#AccountNotLinked({ account = x.leg.from });
+        if (linkOf(s, x.leg.to) == null) return ?#AccountNotLinked({ account = x.leg.to });
+        let kind = legKind(x.leg.kind);
+        if (receipt(s, kind, x.index) != null) return ?#ReceiptRecorded({ kind; id = x.index });
+        let held = position(s, x.asset, from);
+        if (held < x.leg.units) return ?#PositionShort({ asset = x.asset; holder = from; held; wanted = x.leg.units });
+        switch (openActionOf(s, x.asset)) { case (?aid) { switch (action(s, aid)) { case (?ac) { if (ac.state == #struck and x.day <= ac.paymentDate) return ?#ActionOpenOnAsset({ asset = x.asset; action = aid }) }; case null {} } }; case null {} };
+        null
+      };
       case (#registerHolder(x)) {
         if (x.holder == 0) return ?#InvalidTerms({ reason = "a holder id is above zero" });
         if (holder(s, x.holder) != null) return ?#DuplicateHolder(x.holder);
@@ -382,6 +435,21 @@ module {
         move(s, id, x.issuer, x.issuedSupply);
         [id]
       };
+      case (#linkAccount(x)) {
+        let id = s.nextLink; s.nextLink += 1;
+        RS.put(s.linkRows, links, id, { account = x.account; holder = x.holder });
+        [id]
+      };
+      case (#admitLeg(x)) {
+        // the holders are the links' (rows of this register); everything else is the leg's
+        let ?from = linkOf(s, x.leg.from) else Runtime.trap("apply: a link vanished after validation");
+        let ?to = linkOf(s, x.leg.to) else Runtime.trap("apply: a link vanished after validation");
+        let id = s.nextReceipt; s.nextReceipt += 1;
+        RS.put(s.receiptRows, receipts, id, { asset = x.asset; kind = legKind(x.leg.kind); id = x.index; block = x.leg.block; hash = MP.hashLeaf(legBytes(x.leg));
+          from; to; units = x.leg.units; day = x.day });
+        move(s, x.asset, from, -x.leg.units); move(s, x.asset, to, x.leg.units);
+        [id, from, to, x.leg.units]
+      };
       case (#recordSettlement(x)) {
         let id = s.nextReceipt; s.nextReceipt += 1;
         RS.put(s.receiptRows, receipts, id, { asset = x.asset; kind = x.receipt.kind; id = x.receipt.id; block = x.receipt.block; hash = x.receipt.hash; from = x.from; to = x.to; units = x.units; day = x.day });
@@ -495,9 +563,14 @@ module {
     (b.index, effects)
   };
   public func submit(s : State, auth : Authority, now : Nat64, caller : Principal, c : CT.Command, partition : ?Text, justification : Text) : Result<Outcome> {
+    submitWith(s, auth, noAnchor, now, caller, c, partition, justification)
+  };
+  /// A submission with the host's anchor: where the register is composed with the book (SPEC §19), a leg is
+  /// admitted against the book's own settlement root.
+  public func submitWith(s : State, auth : Authority, anchor : Anchor, now : Nat64, caller : Principal, c : CT.Command, partition : ?Text, justification : Text) : Result<Outcome> {
     let perm = permissionOf(c);
     if (not auth.hasGrant(caller, perm.id)) return #err(#auth(#NoGrant({ permission = perm.id })));
-    switch (validate(s, c)) { case (?e) return #err(#custody(e)); case null {} };
+    switch (validateWith(s, anchor, c)) { case (?e) return #err(#custody(e)); case null {} };
     switch (MC.resolvePolicy(perm, policyFor(s, perm.id))) {
       case (#refuse(e)) #err(#auth(e));
       case (#single) { let (block, effects) = appendExecuted(s, now, caller, null, K.registry.current, c); #ok(#executed({ block; effects })) };
@@ -602,6 +675,7 @@ module {
     table<ActionRow>("actions", s.actionRows, actions, s.nextAction);
     table<EntitlementRow>("entitlements", s.entitlementRows, entitlements, s.nextEntitlement);
     table<ReconciliationRow>("reconciliations", s.reconciliationRows, reconciliations, s.nextReconciliation);
+    table<LinkRow>("links", s.linkRows, links, s.nextLink);
     Fold.section(f, "proposals", func(w : C.Writer) { var i = 0; let n = DL.length(s.log); while (i < n) { switch (RS.get(s.proposalRows, proposals, i)) { case (?r) { w.nat(i); w.blob(MC.encodeProposalRow(r)) }; case null {} }; i += 1 } });
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)

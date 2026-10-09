@@ -26,8 +26,16 @@ module {
 
   /// A settled movement the venue receipted: a trade's asset leg or a delivery, from one holder to another, by the
   /// receipt's id and hash in the venue's Merkle mountain range.
-  public type ReceiptKind = { #trade; #delivery; #issuance; #redemption };
+  /// A leg admitted from the book's settlement range is its own kind, keyed by its index in the range: a gross fill's
+  /// leg, a cycle's net leg, or a transfer to or from the CCP (a pledge, collateral, a fund contribution, the skin).
+  public type ReceiptKind = { #trade; #delivery; #issuance; #redemption; #fillLeg; #cycleLeg; #transferLeg };
   public type Receipt = { kind : ReceiptKind; id : Nat; block : Nat; hash : Blob };
+  /// A leg of the book's settlement range (book/SPEC.md §19), as the book encodes it: its kind (1 a pre-funded party's
+  /// gross fill, 2 a cycle's net, 3 a transfer to or from the CCP), the ledger, the venue accounts it moves from and to,
+  /// the units, the block of the book's log that settled it.
+  public type Leg = { kind : Nat; ledger : Principal; from : Nat; to : Nat; units : Nat; block : Nat };
+  /// The leg's inclusion proof (the kernel's `MmrProof`): the siblings to its peak, the peaks highest first, its peak.
+  public type LegProof = { siblings : [Blob]; peakIndex : Nat; peaks : [Blob] };
 
   public type Kind = {
     #cashDividend : { perUnitMicro : Nat };
@@ -99,6 +107,11 @@ module {
     /// Pay the action on its payment date over the entitlements in slices: the units delivered or taken, the file.
     #pay : { action : ActionId; day : Day; limit : Nat };
     #certifyEntitlementFile : { action : ActionId; day : Day };
+    /// The custodian's attestation that a venue account is a holder's (four eyes).
+    #linkAccount : { account : Nat; holder : HolderId };
+    /// A leg of the book's settlement range admitted as a receipt: leg `index` of the range when it held `legs` legs,
+    /// with its inclusion proof; the holders are the linked holders of the leg's accounts, the units the leg's.
+    #admitLeg : { asset : AssetId; index : Nat; legs : Nat; leg : Leg; proof : LegProof; day : Day };
   };
 
   public type Effects = [Nat];
@@ -124,6 +137,10 @@ module {
     #ActionOpenOnAsset : { asset : AssetId; action : ActionId };
     #TooManyHolders : { max : Nat };
     #InvalidAmount : { field : Text };
+    #AccountNotLinked : { account : Nat };
+    #AccountLinked : { account : Nat };
+    #RootUnknown : { legs : Nat };
+    #ProofRefused : { index : Nat };
   };
 
   public let CODE_BYTES : Nat = 12;
@@ -135,5 +152,5 @@ module {
 
   public func kindText(k : Kind) : Text { switch (k) { case (#cashDividend(_)) "cashDividend"; case (#split(_)) "split"; case (#bonus(_)) "bonus"; case (#rights(_)) "rights"; case (#redemption(_)) "redemption" } };
   public func stateText(s : ActionState) : Text { switch (s) { case (#announced) "announced"; case (#struck) "struck"; case (#paid) "paid"; case (#cancelled) "cancelled" } };
-  public func receiptKindText(k : ReceiptKind) : Text { switch (k) { case (#trade) "trade"; case (#delivery) "delivery"; case (#issuance) "issuance"; case (#redemption) "redemption" } };
+  public func receiptKindText(k : ReceiptKind) : Text { switch (k) { case (#trade) "trade"; case (#delivery) "delivery"; case (#issuance) "issuance"; case (#redemption) "redemption"; case (#fillLeg) "fillLeg"; case (#cycleLeg) "cycleLeg"; case (#transferLeg) "transferLeg" } };
 }
