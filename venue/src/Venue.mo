@@ -56,13 +56,15 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   S.setPolicies(ss, duals(S.catalogue()));
 
   let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "surv.scan", "surv.report.seal",
-    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle"];
+    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call", "book.statements.seal", "book.maker.settle", "book.bond.valuedate"];
   let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
-    "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote"];
+    "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute", "book.member.reconcile", "book.maker.quote", "book.maker.massquote",
+    "book.certificate.retire", "book.right.exercise"];
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
     "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
     "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close",
-    "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply"];
+    "book.fees.schedule", "book.maker.register", "book.index.define", "book.index.review", "book.action.apply",
+    "book.terms.set", "book.nav.define", "book.receipt.issue", "book.receipt.cancel"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -156,6 +158,16 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   public shared (msg) func massQuote(account : Nat, sides : [T.QuoteSide]) : async Text {
     let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
     bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #massQuote({ account; member = callerMember(msg.caller); trader; sides }), null, ""))
+  };
+  /// A certificate's retirement and a right's exercise by a trader of the account's member (SPEC §31, §32); the member and
+  /// the trader are the caller's.
+  public shared (msg) func retire(account : Nat, instrument : Nat, qty : Nat, beneficiary : Blob) : async Text {
+    let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #retire({ account; member = callerMember(msg.caller); trader; instrument; qty; beneficiary }), null, ""))
+  };
+  public shared (msg) func exercise(account : Nat, instrument : Nat, qty : Nat) : async Text {
+    let trader = switch (X.traderByPrincipal(xs, msg.caller)) { case (?(id, _)) id; case null 0 };
+    bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #exercise({ account; member = callerMember(msg.caller); trader; instrument; qty }), null, ""))
   };
   /// A member's attestation of its accounts' balances as of a market day (SPEC §24); the member is the caller's.
   public shared (msg) func reconcile(day : Nat, balances : [T.Attested]) : async Text {
@@ -267,6 +279,44 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     let rows = List.empty<B.PathRow>();
     for (id in Nat.range(start, stop)) { switch (B.pathOf(bs, id)) { case (?r) { if (r.index == i) List.add(rows, r) }; case null {} } };
     { rows = List.toArray(rows); next = if (stop >= bs.nextPath) 0 else stop }
+  };
+  // ─── the instrument classes (SPEC §28 to §32) ─────────────────────────────────────────────
+  /// An instrument's class terms and, for a bond, its value date: public reference data.
+  public query func terms(instrument : Nat) : async ?{ terms : T.Terms; valueDate : Nat } {
+    switch (B.termsOf(bs, instrument)) { case (?t) ?{ terms = t; valueDate = B.valueDateOf(bs, instrument) }; case null null }
+  };
+  /// A fund's iNAV row and basket (§29): public, as the index levels are.
+  public query func nav(fund : Nat) : async ?{ nav : B.NavRow; basket : [B.BasketRow] } {
+    switch (B.navOf(bs, fund)) { case (?v) ?{ nav = v; basket = B.basketOf(bs, fund) }; case null null }
+  };
+  /// A fund's iNAV path in pages of at most 500 rows examined, as `indexPath`.
+  public query func navPath(fund : Nat, from : Nat, limit : Nat) : async { rows : [B.PathRow]; next : Nat } {
+    let start = Nat.max(from, 1);
+    let stop = Nat.min(bs.nextNavPath, start + Nat.min(Nat.max(limit, 1), 500));
+    let rows = List.empty<B.PathRow>();
+    for (id in Nat.range(start, stop)) { switch (B.navPathOf(bs, id)) { case (?r) { if (r.index == fund) List.add(rows, r) }; case null {} } };
+    { rows = List.toArray(rows); next = if (stop >= bs.nextNavPath) 0 else stop }
+  };
+  /// A ledger's units in the book (§28): public, an aggregate naming no holder.
+  public query func supply(ledger : Principal) : async Nat { B.supplyOf(bs, ledger) };
+  /// A receipt, a retirement, an entitlement: each names an account, so each is read by a trader of that account's
+  /// member, the regulator and the directors (an entitlement also by a trader of the issuer's member, which it pays).
+  /// The refusal says nothing of what exists. Updates: a query's caller is not authenticated.
+  func overseer(p : Principal) : Bool { Principal.equal(p, init.regulator) or isDirector(p) };
+  public shared (msg) func receipt(id : Nat) : async { #ok : B.Receipt; #err : Text } {
+    switch (B.receiptOf(bs, id)) { case (?r) { if (overseer(msg.caller) or ownsAccount(msg.caller, r.account)) #ok(r) else #err("NotYours") }; case null #err("NotYours") }
+  };
+  public shared (msg) func retirement(id : Nat) : async { #ok : B.Retirement; #err : Text } {
+    switch (B.retirementOf(bs, id)) { case (?r) { if (overseer(msg.caller) or ownsAccount(msg.caller, r.account)) #ok(r) else #err("NotYours") }; case null #err("NotYours") }
+  };
+  public shared (msg) func entitlement(id : Nat) : async { #ok : B.Entitlement; #err : Text } {
+    switch (B.entitlementOf(bs, id)) {
+      case (?e) {
+        let issuerMember = switch (B.termsOf(bs, e.instrument)) { case (?#right(r)) r.issuerMember; case (_) 0 };
+        if (overseer(msg.caller) or ownsAccount(msg.caller, e.account) or (issuerMember != 0 and activeTrader(msg.caller) == ?issuerMember)) #ok(e) else #err("NotYours")
+      };
+      case null #err("NotYours");
+    }
   };
   /// The settlement range's leaf count and root (SPEC §19): public, a hash that names nothing.
   public query func settlementRoot() : async { legs : Nat; root : Blob } { let (legs, root) = B.settlementRoot(bs); { legs; root } };
