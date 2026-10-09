@@ -38,7 +38,13 @@ plant "uncross price" '^(B\|[0-9]+\|[0-9]+\|uncross\|15,1,)([1-9][0-9]*)' '\g<1>
 plant "phase" '^(I\|1\|)continuous' '\g<1>auction'
 plant "risk use" '^(U\|2\|0\|0\|0\|)([1-9][0-9]*)' '\g<1>1'
 plant "kill switch" '^(K\|1\|2\|0\|)0' '\g<1>1'
+ref="$here/integration/feed_book.py"
+plant "feed message dropped" '^F\|100\|.*$' 'F-removed'
+plant "feed message altered" '^(F\|200\|[0-9a-f]{30})[0-9]' '\g<1>a'
+plant "visible book altered" '^(V\|[0-9]+\|)[0-9]' '\g<1>a'
 ref="$here/integration/regulator_replay.py"
+plant "drop copy entry altered" '^(D\|1\|[0-9]+\|[01]\|)[0-9]' '\g<1>a'
+plant "day file altered" '^(Y\|[0-9]+\|[0-9a-f]{40})[0-9]' '\g<1>a'
 plant "block byte" '^(L\|500\|.{60}[0-9a-f]*?)([1-9a-f])' '\g<1>0'
 plant "block dropped" '^L\|700\|.*$' 'L-removed'
 plant "fingerprint" '^(fingerprint\|book\|)(.)' '\g<1>X'

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """episodes_parts.py: writes book/test/BookEpisodesNN.test.mo (and its .verify.sh), the 10,000 random episodes of the
 book's acceptance in parts. Each part is its own process: a WASI battery is one message, so the heap it allocates is never
-collected, and 840 episodes of twenty commands fill most of a process's capped memory. Every part is the same program
-with its own part number (it seeds the generator); the reference checks every part's log.
+collected; with the feed's visible book digested after every act, 840 episodes of twenty commands outgrew a
+process's capped memory, so the 10,080 episodes run as 24 parts of 420. Every part is the same program with its own part
+number (it seeds the generator); the reference and the feed's consumer check every part's log.
 
     python3 book/tools/episodes_parts.py        (rewrites the parts; the committed files must equal its output)
 
@@ -10,7 +11,7 @@ Attribution: Thebes Core Team.
 """
 import os
 
-PARTS, PER, STEPS = 12, 840, 20
+PARTS, PER, STEPS = 24, 420, 20
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEST = os.path.join(HERE, "..", "test")
 
@@ -31,15 +32,17 @@ w.seed := w.seed ^ Nat64.fromNat(0xE9_0000 + {k});
 let commands = w.episodes({per}, {steps}, 60);
 Debug.print("count: episodes of random commands judged by the book and the reference = " # Nat.toText(w.seenCount("episodes")));
 Debug.print("count: random commands in the episodes = " # Nat.toText(commands));
-w.printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "uncrossed books checked", "checkpoints"]);
+w.printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "uncrossed books checked", "checkpoints", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "feed digests printed"]);
 if (w.failures > 0) {{ Debug.print("BOOK EPISODES {k:02d} FAILED: " # Nat.toText(w.failures)); assert false }} else Debug.print("BOOK EPISODES {k:02d} GREEN");
 '''
 VERIFY = '''#!/usr/bin/env bash
-# The off-chain check of a Book battery: the Python reference book replays every stream from the commands alone with
-# its own code and requires every outcome, every block of the log, every order and every balance equal.
+# The off-chain checks of a Book battery: the Python reference book replays every stream from the commands alone with
+# its own code and requires every outcome, every block of the log, every order and every balance equal; the feed's
+# consumer holds the visible book from the public feed alone and requires it equal to the book's after every act.
 set -eu
 here="$(cd "$(dirname "$0")/.." && pwd)"
 python3 "$here/integration/reference_book.py" "$1"
+python3 "$here/integration/feed_book.py" "$1"
 '''
 
 for k in range(1, PARTS + 1):

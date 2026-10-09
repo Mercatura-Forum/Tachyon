@@ -84,8 +84,8 @@
   "id": "Z10",
   "file": "book/src/BookCore.mo",
   "mutant": "the due clear not recorded before a command is judged",
-  "old": "  public func submit(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {\n    ignore flushDue(s, now, caller);\n",
-  "new": "  public func submit(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {\n",
+  "old": "  func submitAt(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {\n    ignore flushDueAt(s, now, caller);\n",
+  "new": "  func submitAt(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {\n",
   "test": "Book",
   "property": "the due clear not recorded before a command is judged"
  },
@@ -339,6 +339,123 @@
   "property": "the indicative price is held against the reference price, never the last trade, unlike the uncross",
   "old": "switch (L.indicative(bids, asks, i.lot, if (i.lastPrice != 0) i.lastPrice else i.referencePrice)) {",
   "new": "switch (L.indicative(bids, asks, i.lot, i.referencePrice)) {",
+  "test": "Book"
+ },
+ {
+  "id": "Z39",
+  "file": "book/src/BookFeed.mo",
+  "mutant": "the feed's add shows the order's price as its quantity",
+  "property": "the feed's add shows the order's price as its quantity",
+  "old": "w.byte(4); w.nat(e[1]); w.nat(x.instrument); w.byte(if (x.side == #buy) 1 else 2); w.nat(e[3]); w.nat(e[4]); list(w, own);",
+  "new": "w.byte(4); w.nat(e[1]); w.nat(x.instrument); w.byte(if (x.side == #buy) 1 else 2); w.nat(e[3]); w.nat(e[3]); list(w, own);",
+  "test": "Book"
+ },
+ {
+  "id": "Z40",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a placed iceberg is recorded as showing its whole quantity",
+  "property": "a placed iceberg is recorded as showing its whole quantity",
+  "old": "let shows = if (status == #live) (if (x.peak == 0) x.qty else Nat.min(x.peak, x.qty)) else 0;",
+  "new": "let shows = if (status == #live) x.qty else 0;",
+  "test": "Book"
+ },
+ {
+  "id": "Z41",
+  "file": "book/src/BookCore.mo",
+  "mutant": "an approval's blocks are left out of the feed until the next act",
+  "property": "an approval's blocks are left out of the feed until the next act",
+  "old": "    let r = approveAt(s, xs, auth, now, checker, id); feedTo(s); r",
+  "new": "    approveAt(s, xs, auth, now, checker, id)",
+  "test": "Book"
+ },
+ {
+  "id": "Z42",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a clear does not say what its traded icebergs show",
+  "property": "a clear does not say what its traded icebergs show",
+  "old": "      let shown = shownAfter(s, pairs);\n      List.add(fx, shown.size());",
+  "new": "      let shown : [(Nat, Nat)] = [];\n      List.add(fx, shown.size());",
+  "test": "Book"
+ },
+ {
+  "id": "Z43",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the drop copy leaves out the members whose orders a clear filled",
+  "property": "the drop copy leaves out the members whose orders a clear filled",
+  "old": "              for (_ in Nat.range(0, np)) { touched(e[p]); touched(e[p + 1]); p += 3 };\n              let nc = e[p];",
+  "new": "              for (_ in Nat.range(0, np)) { p += 3 };\n              let nc = e[p];",
+  "test": "Book"
+ },
+ {
+  "id": "Z44",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the drop copy gives the member its own blocks as their public messages",
+  "property": "the drop copy gives the member its own blocks as their public messages",
+  "old": "let bytes = if (row.own) { switch (DL.rawBlock(s.log, row.block))",
+  "new": "let bytes = if (false) { switch (DL.rawBlock(s.log, row.block))",
+  "test": "Book"
+ },
+ {
+  "id": "Z45",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the drop copy's pages run on into the next member's entries",
+  "property": "the drop copy's pages run on into the next member's entries",
+  "old": "R.key2(member, 8, from, 8), R.key2(member, 8, 2 ** 64 - 1, 8), cursor, want + 1 - List.size(rows))",
+  "new": "R.key2(member, 8, from, 8), R.key2(member + 1, 8, 2 ** 64 - 1, 8), cursor, want + 1 - List.size(rows))",
+  "test": "Book"
+ },
+ {
+  "id": "Z46",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the session's low is never lowered after the first trade",
+  "property": "the session's low is never lowered after the first trade",
+  "old": "high = Nat.max(x.high, p); low = if (x.trades == 0) p else Nat.min(x.low, p);",
+  "new": "high = Nat.max(x.high, p); low = if (x.trades == 0) p else x.low;",
+  "test": "Book"
+ },
+ {
+  "id": "Z47",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a day may be sealed again",
+  "property": "a day may be sealed again",
+  "old": "if (x.day <= s.lastSealed) return ?#InvalidTerms({ reason = \"a day later than the last sealed\" });",
+  "new": "if (x.day < s.lastSealed) return ?#InvalidTerms({ reason = \"a day later than the last sealed\" });",
+  "test": "Book"
+ },
+ {
+  "id": "Z48",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the day's file leaves out the reference price",
+  "property": "the day's file leaves out the reference price",
+  "old": "for (v in [r.stats.first, r.stats.high, r.stats.low, r.stats.last, r.stats.closing, r.stats.volume, r.stats.value, r.stats.trades, r.reference].vals()) w.nat(v);",
+  "new": "for (v in [r.stats.first, r.stats.high, r.stats.low, r.stats.last, r.stats.closing, r.stats.volume, r.stats.value, r.stats.trades].vals()) w.nat(v);",
+  "test": "Book"
+ },
+ {
+  "id": "Z49",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the feed's chain restarts at every block",
+  "property": "the feed's chain restarts at every block",
+  "old": "      let h = F.chain(s.feedHead, F.message(b));",
+  "new": "      let h = F.chain(F.genesis(), F.message(b));",
+  "test": "Book"
+ },
+ {
+  "id": "Z50",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a seal does not begin a new session",
+  "property": "a seal does not begin a new session",
+  "old": "RS.put(s.statStore, statRows, r.instrument, NO_STATS) };",
+  "new": "ignore r };",
+  "test": "Book"
+ },
+ {
+  "id": "Z51",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a cancel is not in the drop copy of the order's member",
+  "property": "a cancel is not in the drop copy of the order's member",
+  "old": "          case (#cancelOrder(c)) { switch (order(s, c.order)) { case (?o) own(o.member); case null {} } };",
+  "new": "          case (#cancelOrder(c)) { ignore c };",
   "test": "Book"
  }
 ]
