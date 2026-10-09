@@ -248,6 +248,9 @@ class ThebesChain:
         raise ChainError("the chain's clock is its own: a battery rolls the business date and waits on the chain for a deadline")
 
     def cid_of(self, principal):
+        """A contract's number, from the number itself or from its principal."""
+        if isinstance(principal, int):
+            return principal
         b = principal.bytes if isinstance(principal, Principal) else bytes(principal)
         if b in self.cids:
             return self.cids[b]
