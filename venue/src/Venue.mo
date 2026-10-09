@@ -55,10 +55,13 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   B.setPolicies(bs, duals(B.catalogue()));
   S.setPolicies(ss, duals(S.catalogue()));
 
-  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "surv.scan", "surv.report.seal"];
-  let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return"];
+  let schedulerActs : [Text] = ["exchange.segment.advance", "exchange.instrument.reference", "book.instrument.trading", "book.instrument.reference", "book.batch.flush", "book.sweep.endofday", "book.sweep.expire", "book.instrument.phase", "book.auction.uncross", "book.kill.sweep", "book.day.seal", "surv.scan", "surv.report.seal",
+    "book.cycle.cut", "book.cycle.settle", "book.cycle.closeout", "book.fund.call"];
+  let traderActs : [Text] = ["exchange.account.open", "exchange.account.close", "book.funds.withdraw", "book.order.place", "book.order.cancel", "book.order.amend", "book.order.masscancel", "book.kill.set", "book.borrow.return",
+    "book.collateral.post", "book.collateral.withdraw", "book.fund.contribute"];
   let operatorBookActs : [Text] = ["book.instrument.open", "book.instrument.halt", "book.instrument.resume", "book.kill.set", "book.kill.revive", "book.risk.limits",
-    "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report"];
+    "book.insider.blackout", "book.insider.lift", "surv.params", "surv.case.close", "surv.case.report",
+    "book.clearing.terms", "book.clearing.margin", "book.clearing.admit", "book.clearing.designate", "book.fund.skin", "book.default.declare", "book.default.close"];
   func among(xs_ : [Text], x : Text) : Bool { Array.find<Text>(xs_, func(y) { y == x }) != null };
   func isDirector(p : Principal) : Bool { Array.find<Principal>(init.directors, func(d) { Principal.equal(d, p) }) != null };
   func activeTrader(p : Principal) : ?Nat {
@@ -136,6 +139,13 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
     bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #kill({ member; trader; reason }), null, ""))
   };
 
+  /// A clearing member's own acts (SPEC §18, §21), typed: collateral posted from or withdrawn to its settlement account, its
+  /// fund contribution paid. The member is the caller's.
+  func callerMember(p : Principal) : Nat { switch (activeTrader(p)) { case (?m) m; case null 0 } };
+  public shared (msg) func postCollateral(amount : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #postCollateral({ member = callerMember(msg.caller); amount }), null, "")) };
+  public shared (msg) func withdrawCollateral(amount : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #withdrawCollateral({ member = callerMember(msg.caller); amount }), null, "")) };
+  public shared (msg) func contributeFund(amount : Nat) : async Text { bOut(B.submit(bs, xs, auth, chainNow(), msg.caller, #contributeFund({ member = callerMember(msg.caller); amount }), null, "")) };
+
   // ─── the random end of call auctions ───────────────────────────────────────────────────────
   transient let ic : actor { raw_rand : () -> async Blob } = actor "aaaaa-aa";
   transient var ending = false;
@@ -196,6 +206,38 @@ persistent actor class Venue(init : { operator : Principal; directors : [Princip
   };
   public shared (msg) func myBalance(account : Nat, ledger : Principal) : async ?T.Balance {
     if (ownsAccount(msg.caller, account)) ?B.balance(bs, account, ledger) else null
+  };
+
+  // ─── the clearing (SPEC §18 to §21), scoped ───────────────────────────────────────────────────
+  /// The caller's member's clearing row and the shares the CCP holds for it; nothing for a caller of no clearing member.
+  public shared (msg) func myClearing() : async ?{ member : B.ClearingMember; custody : [B.CustodyRow] } {
+    let ?m = activeTrader(msg.caller) else return null;
+    switch (B.clearingMember(bs, m)) { case (?(_, r)) ?{ member = r; custody = B.custodyRowsOf(bs, m) }; case null null }
+  };
+  /// The settlement range's leaf count and root (SPEC §19): public, a hash that names nothing.
+  public query func settlementRoot() : async { legs : Nat; root : Blob } { let (legs, root) = B.settlementRoot(bs); { legs; root } };
+  /// Leg `index` and its inclusion proof against the root at `legs` legs (0 for the present one): to the regulator and the
+  /// directors; to a trader for a leg between its member's own accounts and the CCP's. A leg names both its accounts, so
+  /// a leg with another member's account is not a member's to read, and the refusal says nothing of what exists.
+  /// An update: a query's caller is not authenticated.
+  public shared (msg) func settlementProof(index : Nat, legs : Nat) : async { #ok : { leg : B.Leg; proof : { siblings : [Blob]; peakIndex : Nat; peaks : [Blob] } }; #err : Text } {
+    let n = if (legs == 0) B.settlementRoot(bs).0 else legs;
+    let ccp = switch (B.clearingTerms(bs)) { case (?t) t.ccpAccount; case null 0 };
+    let side = func(a : Nat) : Bool { ownsAccount(msg.caller, a) or (ccp != 0 and a == ccp) };
+    let mayRead = func(l : B.Leg) : Bool {
+      Principal.equal(msg.caller, init.regulator) or isDirector(msg.caller) or (side(l.from) and side(l.to) and (ownsAccount(msg.caller, l.from) or ownsAccount(msg.caller, l.to)))
+    };
+    switch (B.settlementProofAt(bs, index, n)) {
+      case (?p) { if (mayRead(p.leg)) #ok({ leg = p.leg; proof = p.proof }) else #err("NotYourLeg") };
+      case null #err("NotYourLeg");
+    }
+  };
+  /// The clearing's figures (the CCP's commitment and skin-in-the-game, the open and last settled cycles) and its members'
+  /// rows, to the directors and the regulator.
+  public shared (msg) func clearingState() : async { #ok : { committed : Nat; skin : Nat; cycle : Nat; settled : Nat; members : [B.ClearingMember] }; #err : Text } {
+    if (not (Principal.equal(msg.caller, init.regulator) or isDirector(msg.caller))) return #err("NotTheRegulator");
+    let (committed, skin, cycle, settled, _) = B.clearingFigures(bs);
+    #ok({ committed; skin; cycle; settled; members = B.clearingMembers(bs) })
   };
 
   // ─── the desk's rows, to the desk and the regulator only (no tipping off) ─────────────────────
