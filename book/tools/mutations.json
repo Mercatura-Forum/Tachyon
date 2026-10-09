@@ -57,7 +57,7 @@
   "id": "Z07",
   "file": "book/src/BookCore.mo",
   "mutant": "the buyer's difference between its limit and the clear's price kept",
-  "old": "credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);",
+  "old": "        credit(s, bo.account, i0.cashLedger, bo.held - after - v);\n",
   "new": "",
   "test": "Book",
   "property": "the buyer's difference between its limit and the clear's price kept"
@@ -754,5 +754,140 @@
   "old": "        if (k.trader == 0) { switch (clearingMember(s, k.member)) { case (?(_, r)) { if (r.status == 2) return ?#InvalidTerms({ reason = \"a member in default is closed through the waterfall first\" }) }; case null {} } };\n",
   "new": "",
   "test": "BookClearing"
+ },
+ {
+  "id": "F01",
+  "file": "book/src/BookCore.mo",
+  "mutant": "half-up",
+  "property": "a fee is quantised half-even",
+  "old": "    if (2 * r > PPM) q + 1 else if (2 * r < PPM) q else q + q % 2\n",
+  "new": "    if (2 * r >= PPM) q + 1 else q\n",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F02",
+  "file": "book/src/BookCore.mo",
+  "mutant": "split equally",
+  "property": "a fee is split by the levies' rates",
+  "old": "Rounding.allocate(fee, Array.map<T.Levy, Nat>(levies, func(l) { l.ppm }))",
+  "new": "Rounding.allocate(fee, Array.map<T.Levy, Nat>(levies, func(_) { 1 }))",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F03",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no unit a lot",
+  "property": "a buy holds a unit a lot for its fills' rounding",
+  "old": "    if (ppm == 0) price * qty else price * qty + ceilDiv(price * qty * ppm, PPM) + qty / i.lot\n",
+  "new": "    if (ppm == 0) price * qty else price * qty + ceilDiv(price * qty * ppm, PPM)\n",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F04",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the seller's fee not charged",
+  "property": "a pre-funded seller pays its fee",
+  "old": "    if (am == null) payFee(s, inst, ao.account, i0.cashLedger, feeS);\n",
+  "new": "",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F05",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the fee not owed",
+  "property": "a clearing buyer's member owes its fee in the cycle",
+  "old": "      case (?m) { owe(s, m, s.cycleNo, 0, v + feeB); owePayable(s, inst, feeB);",
+  "new": "      case (?m) { owe(s, m, s.cycleNo, 0, v); owePayable(s, inst, feeB);",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F06",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the levies never paid",
+  "property": "the CCP pays the levies at the cycle",
+  "old": "      if (not payers) {\n        var id = 1;",
+  "new": "      if (false) {\n        var id = 1;",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F07",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the fee left out of the line",
+  "property": "a statement line carries the fee",
+  "old": "    appendStatement(s, bo.member, b, #buy, q, p, feeB);",
+  "new": "    appendStatement(s, bo.member, b, #buy, q, p, 0);",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F08",
+  "file": "book/src/BookCore.mo",
+  "mutant": "available only",
+  "property": "a reconciliation compares all an account holds",
+  "old": "          let book = have.available + have.held;",
+  "new": "          let book = have.available;",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F09",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no minimum",
+  "property": "presence needs the minimum quantity on each side",
+  "old": "b.status == #live and a.status == #live and b.remaining >= m.minQty and a.remaining >= m.minQty and a.price > b.price",
+  "new": "b.status == #live and a.status == #live and a.price > b.price",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F10",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no maximum spread",
+  "property": "presence needs the spread within the maximum",
+  "old": "\n          and (a.price - b.price) * 20_000 <= m.maxSpreadBps * (a.price + b.price);",
+  "new": ";",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F11",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the old sides left live",
+  "property": "a quote replaces the maker's live quote",
+  "old": "      for (oid in [mk.bid, mk.ask].vals()) { switch (order(s, oid)) { case (?o) { if (isLiveish(o)) { close(s, oid, o, #cancelled); List.add(cancelled, oid) } }; case null {} } };\n",
+  "new": "",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F12",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a rebate regardless",
+  "property": "a rebate only when the obligation was met",
+  "old": "              if (met and due > 0 and m.account != 0",
+  "new": "              if (due > 0 and m.account != 0",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F13",
+  "file": "book/src/BookCore.mo",
+  "mutant": "every second counted",
+  "property": "the session accrues only while trading continuously",
+  "old": "sessionNs = m.sessionNs + (if (m.cont) dt else 0)",
+  "new": "sessionNs = m.sessionNs + dt",
+  "test": "BookMarketsStreams"
+ },
+ {
+  "id": "F14",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a schedule under an open buy",
+  "property": "a schedule changes only with no buy open",
+  "old": "        if (openBuy(s, x.instrument)) return ?#InvalidTerms({ reason = \"an instrument with no open buy\" });\n",
+  "new": "",
+  "test": "BookMarkets"
+ },
+ {
+  "id": "F15",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the old funds not counted",
+  "property": "a replacement counts the old quote's funds as released",
+  "old": "      cashNeed += buyHold(s, i, q.instrument, q.bidPrice, q.qty); cashFreed += oldBidHeld;",
+  "new": "      cashNeed += buyHold(s, i, q.instrument, q.bidPrice, q.qty);",
+  "test": "BookMarkets"
  }
 ]
