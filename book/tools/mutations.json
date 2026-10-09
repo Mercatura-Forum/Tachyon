@@ -1,0 +1,200 @@
+[
+ {
+  "id": "Z01",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "a tie in volume and imbalance goes to the higher price",
+  "old": "(imb == bimb and p < bp)",
+  "new": "(imb == bimb and p > bp)",
+  "test": "Book",
+  "property": "a tie in volume and imbalance goes to the higher price"
+ },
+ {
+  "id": "Z02",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "the latest priority batch fills first",
+  "old": "let bs = Array.sort<Nat64>(List.toArray(prios), Nat64.compare);",
+  "new": "let bs = Array.sort<Nat64>(List.toArray(prios), func(a, b) { Nat64.compare(b, a) });",
+  "test": "Book",
+  "property": "the latest priority batch fills first"
+ },
+ {
+  "id": "Z03",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "pro rata's rounding lots go to the greatest key first",
+  "old": "if (a.1 > b.1) #less else if (a.1 < b.1) #greater else cmpKey(a.0.key, b.0.key)",
+  "new": "if (a.1 > b.1) #less else if (a.1 < b.1) #greater else cmpKey(b.0.key, a.0.key)",
+  "test": "Book",
+  "property": "pro rata's rounding lots go to the greatest key first"
+ },
+ {
+  "id": "Z04",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "fill-or-kill not enforced",
+  "old": "        if (o.fok) {\n",
+  "new": "        if (o.fok and false) {\n",
+  "test": "Book",
+  "property": "fill-or-kill not enforced"
+ },
+ {
+  "id": "Z05",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a triggered stop not judged for self-trade",
+  "old": "              if (crossing.size() > 0) {\n                if (o.selfTrade != #cancelIncoming)",
+  "new": "              if (crossing.size() > 1_000_000) {\n                if (o.selfTrade != #cancelIncoming)",
+  "test": "Book",
+  "property": "a triggered stop not judged for self-trade"
+ },
+ {
+  "id": "Z06",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a walk stops after its first page (stale entries then hide the live rows after them)",
+  "old": "switch (p.next) { case (?n) cursor := ?n; case null { if (not met) Map.add(s.marks, Blob.compare, mk, hi); break w } };",
+  "new": "switch (p.next) { case (?_) break w; case null { if (not met) Map.add(s.marks, Blob.compare, mk, hi); break w } };",
+  "test": "Book",
+  "property": "a walk stops after its first page (stale entries then hide the live rows after them)"
+ },
+ {
+  "id": "Z07",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the buyer's difference between its limit and the clear's price kept",
+  "old": "                    credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);\n",
+  "new": "",
+  "test": "Book",
+  "property": "the buyer's difference between its limit and the clear's price kept"
+ },
+ {
+  "id": "Z08",
+  "file": "book/src/BookCore.mo",
+  "mutant": "an iceberg's priority not refreshed when its peak fills",
+  "old": "if (o.peak != 0 and o.remaining > 0 and f >= Nat.min(o.peak, o.remaining + f)) putOrder(s, oid, { o with prio = time });",
+  "new": "if (o.peak != 0 and o.remaining > 0 and f >= Nat.min(o.peak, o.remaining + f)) putOrder(s, oid, { o with prio = o.prio });",
+  "test": "Book",
+  "property": "an iceberg's priority not refreshed when its peak fills"
+ },
+ {
+  "id": "Z09",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a fill does not cancel the linked order",
+  "old": "                        case (?o) { cancelOco(s, o, cancelled); if (o.status == #filled",
+  "new": "                        case (?o) { if (o.status == #filled",
+  "test": "Book",
+  "property": "a fill does not cancel the linked order"
+ },
+ {
+  "id": "Z10",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the due clear not recorded before a command is judged",
+  "old": "  public func submit(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {\n    ignore flushDue(s, now, caller);\n",
+  "new": "  public func submit(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {\n",
+  "test": "Book",
+  "property": "the due clear not recorded before a command is judged"
+ },
+ {
+  "id": "Z11",
+  "file": "book/src/BookCore.mo",
+  "mutant": "immediate orders survive the clear",
+  "old": "      for ((id, o) in List.values(ends)) { if (o.status == #live) { close(s, id, o, #cancelled); List.add(cancelled, id) } };\n",
+  "new": "",
+  "test": "Book",
+  "property": "immediate orders survive the clear"
+ },
+ {
+  "id": "Z12",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the dated sweep cancels orders of the day itself",
+  "old": "R.key2(x.day - 1, 4, MAXP, 8)",
+  "new": "R.key2(x.day, 4, MAXP, 8)",
+  "test": "Book",
+  "property": "the dated sweep cancels orders of the day itself"
+ },
+ {
+  "id": "Z13",
+  "file": "book/src/BookCore.mo",
+  "mutant": "self-trade not checked at entry",
+  "old": "        if (crossing.size() > 0 and x.selfTrade == #cancelIncoming) return ?#SelfTradePrevented({ resting = crossing[0].0 });\n",
+  "new": "",
+  "test": "Book",
+  "property": "self-trade not checked at entry"
+ },
+ {
+  "id": "Z14",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "a market buy's collar not rounded down to the tick",
+  "old": "        target - target % tickAt(bands, target)\n",
+  "new": "        target\n",
+  "test": "Book",
+  "property": "a market buy's collar not rounded down to the tick"
+ },
+ {
+  "id": "Z15",
+  "file": "book/src/BookLogic.mo",
+  "mutant": "time before price: the long side filled from its least aggressive price",
+  "old": "let ps = Array.sort<Nat>(List.toArray(prices), func(a, b) { if (moreAggressive(a, b)) #less else if (moreAggressive(b, a)) #greater else #equal });",
+  "new": "let ps = Array.sort<Nat>(List.toArray(prices), func(a, b) { if (moreAggressive(a, b)) #greater else if (moreAggressive(b, a)) #less else #equal });",
+  "test": "Book",
+  "property": "time before price: the long side filled from its least aggressive price"
+ },
+ {
+  "id": "Z16",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a larger quantity at the same price keeps its priority",
+  "old": "let keeps = x.price == o.price and x.qty <= o.remaining;",
+  "new": "let keeps = x.price == o.price;",
+  "test": "Book",
+  "property": "a larger quantity at the same price keeps its priority"
+ },
+ {
+  "id": "Z17",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a sell trailing stop never moves up",
+  "old": "              if (floor > o.stopPrice) floor else o.stopPrice",
+  "new": "              if (floor < o.stopPrice) floor else o.stopPrice",
+  "test": "Book",
+  "property": "a sell trailing stop never moves up"
+ },
+ {
+  "id": "Z18",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the end of day sweeps one page of the day index",
+  "old": "sweep(s, DAY, \"\", lo, hi, Nat.min(x.limit, T.MAX_SWEEP), 11)",
+  "new": "sweep(s, DAY, \"\", lo, hi, Nat.min(x.limit, 100), 11)",
+  "test": "Book",
+  "property": "the end of day sweeps one page of the day index"
+ },
+ {
+  "id": "Z19",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a write does not lower its range's mark",
+  "property": "a write does not lower its range's mark",
+  "old": "case (?m) { if (Blob.compare(key, m) == #less) Map.add(s.marks, Blob.compare, mk, key) }; case null {} };",
+  "new": "case (?m) { if (false) Map.add(s.marks, Blob.compare, mk, key) }; case null {} };",
+  "test": "Book"
+ },
+ {
+  "id": "Z20",
+  "file": "book/src/BookCore.mo",
+  "mutant": "upkeep never compacts",
+  "property": "upkeep never compacts",
+  "old": "    if (stale < UPKEEP_MIN_STALE or stale < live) return 0;",
+  "new": "    if (true) return 0;",
+  "test": "BookEpisodes01"
+ },
+ {
+  "id": "Z21",
+  "file": "book/src/BookCore.mo",
+  "mutant": "stops trigger on the reference price instead of the last trade",
+  "property": "stops trigger on the reference price instead of the last trade",
+  "old": "let hit = switch (side) { case (#buy) i.lastPrice >= o.stopPrice; case (#sell) i.lastPrice <= o.stopPrice };",
+  "new": "let hit = switch (side) { case (#buy) i.referencePrice >= o.stopPrice; case (#sell) i.referencePrice <= o.stopPrice };",
+  "test": "Book"
+ },
+ {
+  "id": "Z22",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the fingerprint in slices leaves out the proposal rows",
+  "property": "the fingerprint in slices leaves out the proposal rows",
+  "old": "case 9 { w.text(\"proposals\"); run.part := 10; run.cursor := 0 };",
+  "new": "case 9 { w.text(\"proposals\"); run.part := 11; run.cursor := 0 };",
+  "test": "Book"
+ }
+]
