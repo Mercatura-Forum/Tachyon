@@ -545,3 +545,44 @@ past it, orders and quotes are refused. By the deadline a trader of the holder's
 holds free, in multiples of den: the rights leave the book, the subscription (price × the new shares) moves from the
 holder's cash to the issuer's (a leg of kind 7), and the entitlement (the rights, the new shares, the payment) is
 recorded for the custody register, which delivers the shares.
+
+## 33. Attested prices
+
+Three attestors are registered under four eyes. Each records, once a market day, its price for a derivative for that
+day; a price for any other day is refused, so no position is ever marked at a stale price. A derivative's **daily
+settlement price** is the median of the three attestors' prices for the day (the median of
+three); a daily settlement is refused until all three have attested. The prices are public through the venue.
+
+## 34. Futures
+
+A future is an instrument of class `future` on an index the book computes (§26): its multiplier, its expiry day and its
+initial margin rate in basis points of notional; quoted in hundredths of an index point, as the index's level. The CCP
+(§18) is the counterparty: only clearing members' designated accounts trade derivatives, and a derivative's sale is a
+position, never a short sale. An order holds its initial margin (contracts × price × multiplier × rate, rounded up) on
+either side, within its member's collateral and credit line with every other requirement (§18, the positions' margin
+included); nothing is paid or delivered at the fill.
+
+**Positions.** A fill nets into each account's position (a buy reduces a short first). Every position is marked at the
+contract's **mark** (its last settlement price; the reference price before the first): a trade at price p is marked at
+once, the buyer owed (or owing) (mark − p) × contracts × multiplier and the seller the opposite, in the open cycle.
+Open interest is conserved: the long contracts equal the short ones.
+
+**Daily settlement.** After the close the scheduler settles the contract's positions in slices from a stored cursor
+(the run's price fixed when it begins; trading may not reopen within a run): each position is owed or owes (price −
+mark) × contracts × multiplier in the open cycle and is marked at the price; its margin is recomputed at it. The
+amounts net with every other obligation and settle at the cycle (§19), failing and defaulting as any (§20, §21).
+
+**Expiry.** On the expiry day the price is the index's level in the fold (the EGX30 future's final settlement on the
+index, cash-settled through a CCP); after the last variation every position closes and the contract takes no
+further order.
+
+## 35. Options
+
+An option is an instrument of class `option`: European, on an index, settled in cash; its strike in hundredths of a
+point, call or put, multiplier, expiry, and the writer's margin rates a and b. The buyer owes the premium (price ×
+contracts × multiplier) in the open cycle and its writer is owed it. A buy holds the premium as margin until filled; a
+writer's order and position hold the premium at the mark plus the greater of a × the index's level less what the option
+is out of the money and b × the level for a call or b × the strike for a put, × contracts × multiplier, rounded up (the
+margin for short broad-based index options). The daily settlement marks the positions at the attested premium and recomputes the writers' margin. On the expiry
+day each option pays its intrinsic value at the index's level, max(level − strike, 0) for a call and max(strike − level,
+0) for a put, × contracts × multiplier, from its writers to its holders in the open cycle; every position closes.

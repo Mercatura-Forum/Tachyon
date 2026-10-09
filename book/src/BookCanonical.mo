@@ -43,6 +43,8 @@ module {
       case (#receipt(x)) { w.byte(2); w.len16(x.warehouses.size()); for (h in x.warehouses.vals()) w.nat(h) };
       case (#certificate(x)) { w.byte(3); w.blob(x.registry) };
       case (#right(x)) { w.byte(4); w.nat(x.underlying); w.nat(x.price); w.nat(x.num); w.nat(x.den); w.nat(x.deadline); w.nat(x.issuer); w.nat(x.issuerMember) };
+      case (#future(x)) { w.byte(5); w.nat(x.index); w.nat(x.multiplier); w.nat(x.expiry); w.nat(x.imBps) };
+      case (#option(x)) { w.byte(6); w.nat(x.index); w.nat(x.strike); w.bool(x.call); w.nat(x.multiplier); w.nat(x.expiry); w.nat(x.aBps); w.nat(x.bBps) };
     }
   };
   public func basisCode(b : T.DayBasis) : Nat8 { switch (b) { case (#act365) 1; case (#thirty360) 2; case (#actActIcma) 3 } };
@@ -67,6 +69,15 @@ module {
         let ?den = r.nat() else return null; let ?deadline = r.nat() else return null; let ?issuer = r.nat() else return null;
         let ?issuerMember = r.nat() else return null;
         ?#right({ underlying; price; num; den; deadline; issuer; issuerMember })
+      };
+      case 5 {
+        let ?index = r.nat() else return null; let ?multiplier = r.nat() else return null; let ?expiry = r.nat() else return null; let ?imBps = r.nat() else return null;
+        ?#future({ index; multiplier; expiry; imBps })
+      };
+      case 6 {
+        let ?index = r.nat() else return null; let ?strike = r.nat() else return null; let ?call = r.bool() else return null;
+        let ?multiplier = r.nat() else return null; let ?expiry = r.nat() else return null; let ?aBps = r.nat() else return null; let ?bBps = r.nat() else return null;
+        ?#option({ index; strike; call; multiplier; expiry; aBps; bBps })
       };
       case _ null;
     }
@@ -163,6 +174,9 @@ module {
       case (#retire(x)) { w.byte(56); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.nat(x.instrument); w.nat(x.qty); w.blob(x.beneficiary) };
       case (#exercise(x)) { w.byte(57); w.nat(x.account); w.nat(x.member); w.nat(x.trader); w.nat(x.instrument); w.nat(x.qty) };
       case (#valueDate(x)) { w.byte(58); w.nat(x.instrument); w.nat(x.day) };
+      case (#setAttestors(x)) { w.byte(59); w.len16(x.attestors.size()); for (p in x.attestors.vals()) w.principal(p) };
+      case (#attestPrice(x)) { w.byte(60); w.nat(x.attestor); w.nat(x.instrument); w.nat(x.day); w.nat(x.price) };
+      case (#settleDerivatives(x)) { w.byte(61); w.nat(x.instrument); w.nat(x.day); w.nat(x.limit) };
     };
     true
   };
@@ -294,6 +308,18 @@ module {
         ?#exercise({ account; member; trader; instrument; qty })
       };
       case 58 { let ?instrument = r.nat() else return null; let ?day = r.nat() else return null; ?#valueDate({ instrument; day }) };
+      case 59 {
+        let ?n = r.len16() else return null;
+        let out = List.empty<Principal>();
+        for (_ in Nat.range(0, n)) { let ?p = r.principal() else return null; List.add(out, p) };
+        ?#setAttestors({ attestors = List.toArray(out) })
+      };
+      case 60 {
+        let ?attestor = r.nat() else return null; let ?instrument = r.nat() else return null; let ?day = r.nat() else return null;
+        let ?price = r.nat() else return null;
+        ?#attestPrice({ attestor; instrument; day; price })
+      };
+      case 61 { let ?instrument = r.nat() else return null; let ?day = r.nat() else return null; let ?limit = r.nat() else return null; ?#settleDerivatives({ instrument; day; limit }) };
       case _ null;
     }
   };
@@ -306,7 +332,8 @@ module {
     "contributeFund", "fundSkin", "declareDefault", "closeDefault",
     "setFeeSchedule", "sealStatements", "reconcileMember", "registerMaker", "quote", "massQuote", "settleMakers",
     "defineIndex", "reviewIndex", "corporateAction", "tripBreaker",
-    "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "retire", "exercise", "valueDate"];
+    "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "retire", "exercise", "valueDate",
+    "setAttestors", "attestPrice", "settleDerivatives"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -323,6 +350,7 @@ module {
       case (#defineIndex(_)) "defineIndex"; case (#reviewIndex(_)) "reviewIndex"; case (#corporateAction(_)) "corporateAction"; case (#tripBreaker(_)) "tripBreaker";
       case (#setTerms(_)) "setTerms"; case (#defineNav(_)) "defineNav"; case (#issueReceipt(_)) "issueReceipt"; case (#cancelReceipt(_)) "cancelReceipt";
       case (#retire(_)) "retire"; case (#exercise(_)) "exercise"; case (#valueDate(_)) "valueDate";
+      case (#setAttestors(_)) "setAttestors"; case (#attestPrice(_)) "attestPrice"; case (#settleDerivatives(_)) "settleDerivatives";
     }
   };
 

@@ -122,6 +122,9 @@ module {
     Perm.p("book.certificate.retire", "certificate", #close, #command("retire"), false, false, false),
     Perm.p("book.right.exercise", "right", #update, #command("exercise"), false, false, false),
     Perm.p("book.bond.valuedate", "instrument", #update, #command("valueDate"), false, false, false),
+    Perm.p("book.attestors.set", "price", #update, #command("setAttestors"), false, false, true),
+    Perm.p("book.price.attest", "price", #create, #command("attestPrice"), false, false, false),
+    Perm.p("book.derivatives.settle", "position", #update, #command("settleDerivatives"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -159,6 +162,8 @@ module {
     ("book.maker.settle", "the scheduler closes the makers' period at the day's end; presence and rebates are the fold's, none typed"),
     ("book.breaker.trip", "the market-wide breaker, recorded by the book itself in the block after the one that moved an index; no principal submits it"),
     ("book.certificate.retire", "a trader of the account's member retires certificates the account holds free; they leave circulation and nothing else moves"),
+    ("book.price.attest", "an attestor records its own price for a derivative on the market day, once; the daily price is the median of the three"),
+    ("book.derivatives.settle", "the scheduler settles a closed derivative's positions at the attested price or, at expiry, the index's level; every amount is the fold's"),
     ("book.bond.valuedate", "the scheduler records a bond's value date for the market day, the day the exchange's calendar gives; it moves nothing"),
     ("book.right.exercise", "a trader of the account's member exercises rights the account holds free by the deadline, paying the subscription from its own cash"),
   ] };
@@ -569,6 +574,8 @@ module {
         case (#receipt(t)) (2, [0, 0, 0, 0, 0, 0, 0], t.warehouses, zero32());
         case (#certificate(t)) (3, [0, 0, 0, 0, 0, 0, 0], [], t.registry);
         case (#right(t)) (4, [t.underlying, t.price, t.num, t.den, t.deadline, t.issuer, t.issuerMember], [], zero32());
+        case (#future(t)) (5, [t.index, t.multiplier, t.expiry, t.imBps, 0, 0, 0], [], zero32());
+        case (#option(t)) (6, [t.index, t.strike, if (t.call) 1 else 0, t.multiplier, t.expiry, t.aBps, t.bBps], [], zero32());
       };
       R.putNat(b, k, 1); for (v in f.vals()) R.putNat(b, v, 8); R.putNat(b, hs.size(), 1);
       for (j in Nat.range(0, T.MAX_WAREHOUSES)) R.putNat(b, if (j < hs.size()) hs[j] else 0, 8);
@@ -580,7 +587,9 @@ module {
         case 1 { #bond({ couponBps = f[0]; perYear = f[1]; basis = switch (K.basisOf(Nat8.fromNat(f[2]))) { case (?x) x; case null Runtime.trap("terms: a day count") }; maturity = f[3]; settleDays = f[4] }) };
         case 2 { #receipt({ warehouses = Array.tabulate<Nat>(R.getNat(a, 57, 1), func(j) { R.getNat(a, 58 + 8 * j, 8) }) }) };
         case 3 { #certificate({ registry = R.getBlob(a, 122, 32) }) };
-        case _ { #right({ underlying = f[0]; price = f[1]; num = f[2]; den = f[3]; deadline = f[4]; issuer = f[5]; issuerMember = f[6] }) };
+        case 4 { #right({ underlying = f[0]; price = f[1]; num = f[2]; den = f[3]; deadline = f[4]; issuer = f[5]; issuerMember = f[6] }) };
+        case 5 { #future({ index = f[0]; multiplier = f[1]; expiry = f[2]; imBps = f[3] }) };
+        case _ { #option({ index = f[0]; strike = f[1]; call = f[2] == 1; multiplier = f[3]; expiry = f[4]; aBps = f[5]; bBps = f[6] }) };
       }
     };
     indexes = [];
@@ -655,6 +664,61 @@ module {
     decode = func(a : [Nat8]) : ValueDate { { day = R.getNat(a, 0, 8) } };
     indexes = [];
   };
+  // ── derivatives (SPEC §33 to §35) ──
+  /// The three attestors, by their number (1 to 3).
+  public type Attestor = { attestor : Principal };
+  public let attestorRows : RS.Decl<Attestor> = {
+    table = "attestors"; idBytes = 8; rowBytes = 30;
+    encode = func(x : Attestor) : Blob { let b = R.buf(); putPrincipal(b, x.attestor); R.done(b, 30) };
+    decode = func(a : [Nat8]) : Attestor { { attestor = getPrincipal(a, 0) } };
+    indexes = [];
+  };
+  /// An attested price: the derivative, the market day, the attestor's number, the price.
+  public type Attestation = { instrument : Nat; day : Nat; attestor : Nat; price : Nat };
+  func attestKey(inst : Nat, day : Nat, n : Nat) : Blob { let b = R.buf(); R.putNat(b, inst, 8); R.putNat(b, day, 8); R.putNat(b, n, 1); R.done(b, 17) };
+  public let attestationRows : RS.Decl<Attestation> = {
+    table = "attestations"; idBytes = 8; rowBytes = 25;
+    encode = func(x : Attestation) : Blob { let b = R.buf(); R.putNat(b, x.instrument, 8); R.putNat(b, x.day, 8); R.putNat(b, x.attestor, 1); R.putNat(b, x.price, 8); R.done(b, 25) };
+    decode = func(a : [Nat8]) : Attestation { { instrument = R.getNat(a, 0, 8); day = R.getNat(a, 8, 8); attestor = R.getNat(a, 16, 1); price = R.getNat(a, 17, 8) } };
+    indexes = [{ name = "byKey"; keyBytes = 17; keyOf = func(_ : Nat, x : Attestation) : ?Blob { ?attestKey(x.instrument, x.day, x.attestor) } }];
+  };
+  /// An account's position in a derivative against the CCP: its member, long or short, the contracts, the price it is
+  /// marked at, its initial margin.
+  public type Position = { account : Nat; instrument : Nat; member : Nat; long : Bool; qty : Nat; mark : Nat; im : Nat };
+  public let POSITION_ROW_BYTES = 49;   // account, instrument, member 8 each, long 1, quantity, mark, margin 8 each
+  public let positionRows : RS.Decl<Position> = {
+    table = "positions"; idBytes = 8; rowBytes = POSITION_ROW_BYTES;
+    encode = func(x : Position) : Blob {
+      let b = R.buf(); for (v in [x.account, x.instrument, x.member].vals()) R.putNat(b, v, 8); R.putBool(b, x.long);
+      for (v in [x.qty, x.mark, x.im].vals()) R.putNat(b, v, 8); R.done(b, POSITION_ROW_BYTES)
+    };
+    decode = func(a : [Nat8]) : Position {
+      { account = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); member = R.getNat(a, 16, 8); long = R.getBool(a, 24); qty = R.getNat(a, 25, 8); mark = R.getNat(a, 33, 8); im = R.getNat(a, 41, 8) }
+    };
+    indexes = [{ name = "byKey"; keyBytes = 16; keyOf = func(_ : Nat, x : Position) : ?Blob { ?R.key2(x.account, 8, x.instrument, 8) } },
+               { name = "open"; keyBytes = 16; keyOf = func(_ : Nat, x : Position) : ?Blob { if (x.qty > 0) ?R.key2(x.instrument, 8, x.account, 8) else null } }];
+  };
+  /// A derivative's settlement state, by its instrument id: the mark (the last settlement price), the last day settled
+  /// whole, the run in progress (its day, its price, the last account settled, what it has owed members and what it has
+  /// charged them so far: the CCP's open balance within the run), whether it expired.
+  public type Deriv = { mark : Nat; settled : Nat; runDay : Nat; runPrice : Nat; cursor : Nat; runTo : Nat; runBy : Nat; expired : Bool };
+  public let derivRows : RS.Decl<Deriv> = {
+    table = "derivatives"; idBytes = 8; rowBytes = 57;
+    encode = func(x : Deriv) : Blob { let b = R.buf(); for (v in [x.mark, x.settled, x.runDay, x.runPrice, x.cursor, x.runTo, x.runBy].vals()) R.putNat(b, v, 8); R.putBool(b, x.expired); R.done(b, 57) };
+    decode = func(a : [Nat8]) : Deriv {
+      { mark = R.getNat(a, 0, 8); settled = R.getNat(a, 8, 8); runDay = R.getNat(a, 16, 8); runPrice = R.getNat(a, 24, 8); cursor = R.getNat(a, 32, 8);
+        runTo = R.getNat(a, 40, 8); runBy = R.getNat(a, 48, 8); expired = R.getBool(a, 56) }
+    };
+    indexes = [];
+  };
+  /// A clearing member's positions' initial margin, by its member number.
+  public type MemberIm = { im : Nat };
+  public let memberImRows : RS.Decl<MemberIm> = {
+    table = "positionmargin"; idBytes = 8; rowBytes = 8;
+    encode = func(x : MemberIm) : Blob { let b = R.buf(); R.putNat(b, x.im, 8); R.done(b, 8) };
+    decode = func(a : [Nat8]) : MemberIm { { im = R.getNat(a, 0, 8) } };
+    indexes = [];
+  };
   func ledgerKey(p : Principal) : Blob { let b = R.buf(); putPrincipal(b, p); R.done(b, PRINCIPAL_BYTES) };
   public let E18 = 1_000_000_000_000_000_000;
   public let E9 = 1_000_000_000;
@@ -712,7 +776,7 @@ module {
     and 8 + 8 + 1 <= KILL_ROW_BYTES and 8 * 5 == LIMIT_ROW_BYTES
     and 32 <= REF_ROW_BYTES and 1 <= DUE_ROW_BYTES
     and 8 * 4 + 32 + 8 * 2 + 1 == INDEX_ROW_BYTES
-    and 1 + 7 * 8 + 1 + T.MAX_WAREHOUSES * 8 + 32 == TERMS_ROW_BYTES and 8 * 4 + 1 + 32 == RECEIPT_ROW_BYTES and PRINCIPAL_BYTES + 8 == SUPPLY_ROW_BYTES
+    and 1 + 7 * 8 + 1 + T.MAX_WAREHOUSES * 8 + 32 == TERMS_ROW_BYTES and 8 * 4 + 1 + 32 == RECEIPT_ROW_BYTES and PRINCIPAL_BYTES + 8 == SUPPLY_ROW_BYTES and 8 * 3 + 1 + 8 * 3 == POSITION_ROW_BYTES
     and 1 + 4 * (8 + 4) == FEE_ROW_BYTES and 9 * 8 + 2 + 8 * 3 == MAKER_ROW_BYTES
     and 8 * 12 + 1 == CLEARING_ROW_BYTES and 1 + PRINCIPAL_BYTES + 8 * 4 == LEG_ROW_BYTES and 8 + 8 + PRINCIPAL_BYTES + 8 * 6 == TERMS_BYTES
   };
@@ -761,6 +825,10 @@ module {
     termsStore : RS.Store; navStore : RS.Store; basketStore : RS.Store; var nextBasket : Nat; navPathStore : RS.Store; var nextNavPath : Nat;
     receiptStore : RS.Store; var nextReceipt : Nat; retireStore : RS.Store; var nextRetire : Nat; entitlementStore : RS.Store; var nextEntitlement : Nat;
     supplyStore : RS.Store; var nextSupply : Nat; valueDateStore : RS.Store;
+    /// Derivatives (SPEC §33 to §35): the attestors, the attestations, the positions, each derivative's settlement state,
+    /// each member's positions' margin.
+    attestorStore : RS.Store; attestationStore : RS.Store; var nextAttestation : Nat; positionStore : RS.Store; var nextPosition : Nat;
+    derivStore : RS.Store; memberImStore : RS.Store;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -796,6 +864,8 @@ module {
       termsStore = RS.newStore(termsRows); navStore = RS.newStore(navRows); basketStore = RS.newStore(basketRows); var nextBasket = 1; navPathStore = RS.newStore(navPathRows); var nextNavPath = 1;
       receiptStore = RS.newStore(receiptRows); var nextReceipt = 1; retireStore = RS.newStore(retireRows); var nextRetire = 1; entitlementStore = RS.newStore(entitlementRows); var nextEntitlement = 1;
       supplyStore = RS.newStore(supplyRows); var nextSupply = 1; valueDateStore = RS.newStore(valueDateRows);
+      attestorStore = RS.newStore(attestorRows); attestationStore = RS.newStore(attestationRows); var nextAttestation = 1; positionStore = RS.newStore(positionRows); var nextPosition = 1;
+      derivStore = RS.newStore(derivRows); memberImStore = RS.newStore(memberImRows);
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -1169,7 +1239,7 @@ module {
     switch (bondOf(s, inst)) { case (?b) ceilDiv(T.BOND_FACE * qty * b.couponBps * 31 * (12 / b.perYear), 10_000 * 360); case null 0 }
   };
   /// An order's value: its clean value and, for a bond, the most it can accrue.
-  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty + accrualBound(s, inst, qty) };
+  func valueOf(s : State, inst : Nat, price : Nat, qty : Nat) : Nat { price * qty * multiplierOf(s, inst) + accrualBound(s, inst, qty) };
   /// A ledger's units in the book (SPEC §28), and their change.
   public func supplyOf(s : State, ledger : Principal) : Nat { switch (one(s.supplyStore, supplyRows, "byLedger", ledgerKey(ledger))) { case (?(_, r)) r.units; case null 0 } };
   func moveSupply(s : State, ledger : Principal, up : Nat, down : Nat) {
@@ -1195,8 +1265,22 @@ module {
         null
       };
       case (?#right(r)) { if (today > r.deadline) ?#InvalidTerms({ reason = "rights past their deadline" }) else null };
+      case (?#future(_) or ?#option(_)) {
+        let expired = switch (derivOf(s, inst)) { case (?d) d.expired; case null false };
+        if (today > expiryOf(s, inst) or expired) ?#InvalidTerms({ reason = "a contract before its expiry" }) else null
+      };
       case (_) null;
     }
+  };
+  /// What refuses a derivative's terms (§34, §35): an index the book computes, a multiplier, an expiry not past, the
+  /// clearing in the instrument's currency.
+  func derivTermsRefusal(s : State, i : T.Instrument, index : Nat, multiplier : Nat, expiry : Nat, today : Nat) : ?T.Error {
+    if (indexRowOf(s, index) == null) return ?#InvalidTerms({ reason = "an index the book computes" });
+    if (multiplier == 0) return ?#InvalidTerms({ reason = "a multiplier above zero" });
+    if (expiry < today) return ?#InvalidTerms({ reason = "an expiry not past" });
+    let ?t = s.clearing else return ?#InvalidTerms({ reason = "a derivative cleared by the venue's CCP" });
+    if (not Principal.equal(i.cashLedger, t.cashLedger)) return ?#InvalidTerms({ reason = "a derivative settled in the clearing currency" });
+    null
   };
   public func navOf(s : State, fund : Nat) : ?NavRow { RS.get(s.navStore, navRows, fund) };
   public func basketOf(s : State, fund : Nat) : [BasketRow] {
@@ -1233,6 +1317,67 @@ module {
   public func receiptOf(s : State, id : Nat) : ?Receipt { RS.get(s.receiptStore, receiptRows, id) };
   public func retirementOf(s : State, id : Nat) : ?Retirement { RS.get(s.retireStore, retireRows, id) };
   public func entitlementOf(s : State, id : Nat) : ?Entitlement { RS.get(s.entitlementStore, entitlementRows, id) };
+
+  // ─── derivatives (SPEC §33 to §35) ─────────────────────────────────────────────────────────
+  public type Future = { index : Nat; multiplier : Nat; expiry : Nat; imBps : Nat };
+  public type OptionTerms = { index : Nat; strike : Nat; call : Bool; multiplier : Nat; expiry : Nat; aBps : Nat; bBps : Nat };
+  func futureOf(s : State, inst : Nat) : ?Future { switch (termsOf(s, inst)) { case (?#future(f)) ?f; case (_) null } };
+  func optionOf(s : State, inst : Nat) : ?OptionTerms { switch (termsOf(s, inst)) { case (?#option(o)) ?o; case (_) null } };
+  public func isDerivative(s : State, inst : Nat) : Bool { switch (termsOf(s, inst)) { case (?#future(_) or ?#option(_)) true; case (_) false } };
+  /// A contract's multiplier (1 for anything not a derivative), its expiry and its index.
+  func multiplierOf(s : State, inst : Nat) : Nat { switch (termsOf(s, inst)) { case (?#future(f)) f.multiplier; case (?#option(o)) o.multiplier; case (_) 1 } };
+  func expiryOf(s : State, inst : Nat) : Nat { switch (termsOf(s, inst)) { case (?#future(f)) f.expiry; case (?#option(o)) o.expiry; case (_) 0 } };
+  func indexOfDeriv(s : State, inst : Nat) : Nat { switch (termsOf(s, inst)) { case (?#future(f)) f.index; case (?#option(o)) o.index; case (_) 0 } };
+  public func derivOf(s : State, inst : Nat) : ?Deriv { RS.get(s.derivStore, derivRows, inst) };
+  func indexLevel(s : State, index : Nat) : Nat { switch (indexRowOf(s, index)) { case (?x) x.level; case null 0 } };
+  public func attestorOf(s : State, n : Nat) : ?Principal { switch (RS.get(s.attestorStore, attestorRows, n)) { case (?a) ?a.attestor; case null null } };
+  func attestationOf(s : State, inst : Nat, day : Nat, n : Nat) : ?Attestation { switch (one(s.attestationStore, attestationRows, "byKey", attestKey(inst, day, n))) { case (?(_, a)) ?a; case null null } };
+  /// The daily price (§33): the median of the three attestors' prices for the day, when all three attested.
+  public func attestedPrice(s : State, inst : Nat, day : Nat) : ?Nat {
+    switch (attestationOf(s, inst, day, 1), attestationOf(s, inst, day, 2), attestationOf(s, inst, day, 3)) {
+      case (?a, ?b, ?c) { let x = a.price; let y = b.price; let z = c.price; ?Nat.max(Nat.min(x, y), Nat.min(Nat.max(x, y), z)) };
+      case (_) null;
+    }
+  };
+  public func positionOf(s : State, account : Nat, inst : Nat) : ?(Nat, Position) { one(s.positionStore, positionRows, "byKey", R.key2(account, 8, inst, 8)) };
+  public func memberImOf(s : State, member : Nat) : Nat { switch (RS.get(s.memberImStore, memberImRows, member)) { case (?x) x.im; case null 0 } };
+  /// An option's intrinsic value at the index's level (§35), in hundredths of a point.
+  func intrinsic(o : OptionTerms, u : Nat) : Nat { if (o.call) (if (u > o.strike) u - o.strike else 0) else (if (o.strike > u) o.strike - u else 0) };
+  /// An option writer's margin on `qty` contracts (§35): the premium at `premium` and the greater of a × the index less
+  /// what the option is out of the money and b × the index (a call) or b × the strike (a put), × the multiplier, rounded
+  /// up.
+  func writerIm(o : OptionTerms, qty : Nat, premium : Nat, u : Nat) : Nat {
+    let otm = if (o.call) (if (o.strike > u) o.strike - u else 0) else (if (u > o.strike) u - o.strike else 0);
+    let a = o.aBps * u; let away = otm * 10_000;
+    let risk = Nat.max(if (a > away) a - away else 0, o.bBps * (if (o.call) u else o.strike));
+    ceilDiv(qty * o.multiplier * (premium * 10_000 + risk), 10_000)
+  };
+  /// The initial margin of a position or an order on a derivative (§34, §35): a future's notional at `price` × its rate,
+  /// rounded up, either side; an option's premium for a buyer; a writer's margin for a seller.
+  func derivIm(s : State, inst : Nat, long : Bool, qty : Nat, price : Nat) : Nat {
+    switch (termsOf(s, inst)) {
+      case (?#future(f)) ceilDiv(qty * price * f.multiplier * f.imBps, 10_000);
+      case (?#option(o)) { if (long) qty * price * o.multiplier else writerIm(o, qty, price, indexLevel(s, o.index)) };
+      case (_) 0;
+    }
+  };
+  func putMemberIm(s : State, member : Nat, up : Nat, down : Nat) {
+    RS.put(s.memberImStore, memberImRows, member, { im = memberImOf(s, member) + up - down });
+  };
+  /// A fill of `qty` contracts at `price` for `account` netted into its position (§34): a buy reduces a short first, a sale
+  /// a long; what is new is marked at the derivative's mark. The position's margin follows; the member's with it.
+  func movePosition(s : State, account : Nat, member : Nat, inst : Nat, buy : Bool, qty : Nat) {
+    let mark = switch (derivOf(s, inst)) { case (?d) d.mark; case null 0 };
+    let (id, p) = switch (positionOf(s, account, inst)) {
+      case (?(i, x)) (i, x);
+      case null { let i = s.nextPosition; s.nextPosition += 1; (i, { account; instrument = inst; member; long = buy; qty = 0; mark; im = 0 }) };
+    };
+    let (long, q) = if (p.qty == 0) (buy, qty) else if (p.long == buy) (p.long, p.qty + qty) else if (p.qty >= qty) (p.long, p.qty - qty) else (buy, qty - p.qty);
+    // every position is marked at its derivative's mark: a settlement marks them all, and no fill lands within one
+    let im = if (q == 0) 0 else derivIm(s, inst, long, q, mark);
+    RS.put(s.positionStore, positionRows, id, { p with long; qty = q; im; mark });
+    putMemberIm(s, member, im, p.im);
+  };
 
   // ─── market makers (SPEC §25) ──────────────────────────────────────────────────────────────
   public func makerOf(s : State, member : Nat, inst : Nat) : ?(Nat, Maker) { one(s.makerStore, makerRows, "byKey", R.key2(member, 8, inst, 8)) };
@@ -1290,6 +1435,7 @@ module {
       let ?i = instrument(s, q.instrument) else return ?#UnknownInstrument({ instrument = q.instrument });
       if (i.phase == #halted) return ?#InstrumentHalted({ instrument = q.instrument });
       switch (classRefusal(s, q.instrument, X.marketTime(xs, now).0)) { case (?e) return ?e; case null {} };
+      if (isDerivative(s, q.instrument)) return ?#InvalidTerms({ reason = "a derivative is quoted on no pre-funded account" });
       if (blackedOut(s, xs, account, q.instrument, now)) return ?#InsiderBlackout({ instrument = q.instrument });
       if (q.qty == 0 or q.qty % i.lot != 0) return ?#NotALot({ qty = q.qty; lot = i.lot });
       let n = Text.encodeUtf8(q.ref).size();
@@ -1438,7 +1584,7 @@ module {
   /// line (`release` of collateral taken out first).
   func marginRefusal(s : State, r : ClearingMember, add : Nat, drop : Nat, release : Nat) : ?T.Error {
     if (r.fund < r.fundRequired) return ?#FundShort({ required = r.fundRequired; paid = r.fund });
-    let required = r.imOrders + add - drop + variationOf(s, r);
+    let required = r.imOrders + add - drop + variationOf(s, r) + memberImOf(s, r.member);
     let available = r.collateral + r.creditLine - release;
     if (required > available) ?#MarginShort({ required; available }) else null
   };
@@ -1463,6 +1609,11 @@ module {
   /// An order's clearing records as it changes (SPEC §18): a clearing buy's initial margin (what it holds) in its member's
   /// row and its open value in the CCP's commitment; a clearing sale's or a close-out's held shares in the custody row.
   func clearingMove(s : State, id : Nat, o : T.Order, v0 : Nat, v1 : Nat, h0 : Nat) {
+    switch (clearingOf(s, o.account)) {
+      // a derivative's order holds margin on either side and commits the CCP to nothing: no value moves at its fill
+      case (?m) { if (isDerivative(s, o.instrument)) { updateMember(s, m, func(r : ClearingMember) : ClearingMember { { r with imOrders = r.imOrders + o.held - h0 } }); return } };
+      case null {};
+    };
     switch (clearingOf(s, o.account)) {
       case (?m) {
         switch (o.side) {
@@ -1639,6 +1790,7 @@ module {
       case (#setTrading(x)) {
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
         if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });
+        switch (derivOf(s, x.instrument)) { case (?d) { if (x.open and d.runDay != 0) return ?#InvalidTerms({ reason = "a derivative's settlement run finished first" }) }; case null {} };
         if (i.interruptUntil != 0) return ?#InvalidTerms({ reason = "an interruption ends by its uncross" });
         if (x.open == (i.phase == #continuous)) return ?#InvalidTerms({ reason = "the instrument is already so" });
         null
@@ -1680,6 +1832,10 @@ module {
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
         if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });
         switch (classRefusal(s, x.instrument, X.marketTime(xs, now).0)) { case (?e) return ?e; case null {} };
+        if (isDerivative(s, x.instrument)) {
+          if (clearingOf(s, x.account) == null) return ?#InvalidTerms({ reason = "a derivative traded on a clearing account" });
+          if (x.shortSale) return ?#InvalidTerms({ reason = "a derivative's sale is a position, never a short sale" });
+        };
         switch (killedFor(s, x.member, x.trader)) { case (?k) return ?#Killed({ kill = k }); case null {} };
         if (blackedOut(s, xs, x.account, x.instrument, now)) return ?#InsiderBlackout({ instrument = x.instrument });
         if (x.qty == 0 or x.qty % i.lot != 0) return ?#NotALot({ qty = x.qty; lot = i.lot });
@@ -1718,7 +1874,7 @@ module {
         };
         // short sales (SPEC §17): flagged, a limit at or above the floor; unflagged, no more than the account owns free
         if (x.shortSale and x.side == #buy) return ?#InvalidTerms({ reason = "a short sale sells" });
-        if (x.side == #sell) {
+        if (x.side == #sell and not isDerivative(s, x.instrument)) {
           if (x.shortSale) {
             let limited = x.kind == #limit or x.kind == #ioc or x.kind == #fok or x.kind == #stopLimit;
             if (not limited or x.price < shortFloor(i)) return ?#ShortSalePrice({ price = x.price; floor = shortFloor(i) });
@@ -1950,6 +2106,8 @@ module {
       };
       case (#cutCycle(x)) {
         let ?t = s.clearing else return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        // a derivative's run owes members part of what it will charge others: no cycle is cut until it finishes (§34)
+        for (i in s.instrumentList.vals()) { switch (derivOf(s, i)) { case (?d) { if (d.runDay != 0) return ?#InvalidTerms({ reason = "a derivative's settlement run finished first" }) }; case null {} } };
         if (x.cycle != s.cycleNo) return ?#InvalidTerms({ reason = "the open cycle" });
         if (t.cycleDays == 0) {
           if (x.settleDay != 0) return ?#InvalidTerms({ reason = "a cycle of seconds settles at once" });
@@ -2122,6 +2280,15 @@ module {
             };
           };
           case (#certificate(c)) { if (c.registry.size() != 32) return ?#InvalidTerms({ reason = "the registry's 32-byte hash" }) };
+          case (#future(f)) {
+            switch (derivTermsRefusal(s, i, f.index, f.multiplier, f.expiry, today)) { case (?e) return ?e; case null {} };
+            if (f.imBps == 0 or f.imBps > 10_000) return ?#InvalidTerms({ reason = "an initial margin of 1 to 10,000 basis points" });
+          };
+          case (#option(o)) {
+            switch (derivTermsRefusal(s, i, o.index, o.multiplier, o.expiry, today)) { case (?e) return ?e; case null {} };
+            if (o.strike == 0) return ?#InvalidTerms({ reason = "a strike above zero" });
+            if (o.bBps == 0 or o.bBps > o.aBps or o.aBps > 10_000) return ?#InvalidTerms({ reason = "margin rates with 0 < b <= a <= 10,000" });
+          };
           case (#right(r)) {
             if (r.underlying == x.instrument or instrument(s, r.underlying) == null) return ?#InvalidTerms({ reason = "an underlying instrument the book trades" });
             if (r.price == 0 or r.num == 0 or r.den == 0) return ?#InvalidTerms({ reason = "a subscription price and ratio above zero" });
@@ -2201,6 +2368,35 @@ module {
         if (cb.available < pay) return ?#InsufficientFunds({ ledger = i.cashLedger; available = cb.available; wanted = pay });
         null
       };
+      case (#setAttestors(x)) {
+        if (x.attestors.size() != 3) return ?#InvalidTerms({ reason = "three attestors" });
+        if (Principal.equal(x.attestors[0], x.attestors[1]) or Principal.equal(x.attestors[0], x.attestors[2]) or Principal.equal(x.attestors[1], x.attestors[2])) return ?#InvalidTerms({ reason = "three different attestors" });
+        null
+      };
+      case (#attestPrice(x)) {
+        let ?p = attestorOf(s, x.attestor) else return ?#InvalidTerms({ reason = "an attestor numbered one to three" });
+        if (not Principal.equal(p, caller)) return ?#InvalidTerms({ reason = "the attestor's own price" });
+        if (not isDerivative(s, x.instrument)) return ?#InvalidTerms({ reason = "a derivative" });
+        // a price is for the day it is given: one for another day would mark the positions at a stale price
+        if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day's price" });
+        if (attestationOf(s, x.instrument, x.day, x.attestor) != null) return ?#InvalidTerms({ reason = "an attestor's price once a day" });
+        if (x.price == 0) return ?#InvalidTerms({ reason = "a price above zero" });
+        null
+      };
+      case (#settleDerivatives(x)) {
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        let ?d = derivOf(s, x.instrument) else return ?#InvalidTerms({ reason = "a derivative" });
+        if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day's settlement" });
+        if (d.expired or x.day <= d.settled) return ?#InvalidTerms({ reason = "a day not settled" });
+        if (d.runDay != 0 and d.runDay != x.day) return ?#InvalidTerms({ reason = "the run in progress finished first" });
+        if (x.day > expiryOf(s, x.instrument)) return ?#InvalidTerms({ reason = "a contract before its expiry" });
+        if (i.phase != #closed) return ?#InvalidTerms({ reason = "a derivative closed for the day" });
+        if (x.limit == 0 or x.limit > 500) return ?#InvalidTerms({ reason = "1 to 500 positions a message" });
+        if (x.day == expiryOf(s, x.instrument)) {
+          if (indexLevel(s, indexOfDeriv(s, x.instrument)) == 0) return ?#InvalidTerms({ reason = "the index's level at expiry" });
+        } else if (d.runDay == 0 and attestedPrice(s, x.instrument, x.day) == null) return ?#InvalidTerms({ reason = "three attestations for the day" });
+        null
+      };
       case (#valueDate(x)) {
         let ?b = bondOf(s, x.instrument) else return ?#InvalidTerms({ reason = "a bond" });
         let day = settlementDay(xs, X.marketTime(xs, now).0, b.settleDays);
@@ -2273,6 +2469,12 @@ module {
     let ?(_, r) = clearingMember(s, m) else return ?#NotClearing({ member = m }); // kept: a designation names an admitted member
     if (r.status != 1) return ?#NotClearing({ member = m });
     if (not Principal.equal(i.cashLedger, t.cashLedger)) return ?#InvalidTerms({ reason = "an instrument settled in the clearing currency" });
+    // a derivative's order holds its initial margin on either side; nothing is paid or delivered at the fill (§34, §35)
+    if (isDerivative(s, inst)) {
+      let im = derivIm(s, inst, side == #buy, qty, price);
+      if (im > heldBefore) { switch (marginRefusal(s, r, im, heldBefore, 0)) { case (?e) return ?e; case null {} } };
+      return null;
+    };
     switch (side) {
       case (#buy) {
         let ?bps = marginOf(s, inst) else return ?#InvalidTerms({ reason = "an instrument with a margin rate" });
@@ -2463,7 +2665,10 @@ module {
         // a pre-funded order holds what it needs; a clearing buy its initial margin, a clearing sale its pledged shares
         let held = if (incomingCancelled) 0 else switch (clearingOf(s, x.account)) {
           case null { hold(s, x.account, holdingLedger(i, x.side), need); need };
-          case (?m) { switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, valueOf(s, x.instrument, price, x.qty)); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } } };
+          case (?m) {
+            if (isDerivative(s, x.instrument)) derivIm(s, x.instrument, x.side == #buy, x.qty, price)
+            else switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, valueOf(s, x.instrument, price, x.qty)); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } }
+          };
         };
         putOrder(s, id, { account = x.account; instrument = x.instrument; side = x.side; kind = x.kind; qty = x.qty; remaining = x.qty; price; stopPrice = x.stopPrice;
           peak = x.peak; validity = x.validity; gtdDay = x.gtdDay; selfTrade = x.selfTrade; capacity = x.capacity; shortSale = x.shortSale; clientRef = x.clientRef;
@@ -2490,7 +2695,10 @@ module {
         let need = holdNeed(s, i, o.instrument, o.side, x.price, x.qty);
         let held = switch (clearingOf(s, o.account)) {
           case null { if (need > o.held) hold(s, o.account, ledger, need - o.held) else release(s, o.account, ledger, o.held - need); need };
-          case (?m) { switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, valueOf(s, o.instrument, x.price, x.qty)); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } } };
+          case (?m) {
+            if (isDerivative(s, o.instrument)) derivIm(s, o.instrument, o.side == #buy, x.qty, x.price)
+            else switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, valueOf(s, o.instrument, x.price, x.qty)); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } }
+          };
         };
         let qty = o.filled + x.qty;
         putOrder(s, x.order, { o with remaining = x.qty; qty; price = x.price; held; prio = if (keeps) o.prio else now;
@@ -2766,7 +2974,11 @@ module {
       // SPEC §28 to §32
       case (#setTerms(x)) {
         RS.put(s.termsStore, termsRows, x.instrument, x.terms);
-        [52, x.instrument, switch (x.terms) { case (#bond(_)) 1; case (#receipt(_)) 2; case (#certificate(_)) 3; case (#right(_)) 4 }]
+        switch (x.terms, instrument(s, x.instrument)) {
+          case (#future(_) or #option(_), ?i) RS.put(s.derivStore, derivRows, x.instrument, { mark = i.referencePrice; settled = 0; runDay = 0; runPrice = 0; cursor = 0; runTo = 0; runBy = 0; expired = false });
+          case (_) {};
+        };
+        [52, x.instrument, switch (x.terms) { case (#bond(_)) 1; case (#receipt(_)) 2; case (#certificate(_)) 3; case (#right(_)) 4; case (#future(_)) 5; case (#option(_)) 6 }]
       };
       case (#defineNav(x)) {
         for (b in x.basket.vals()) { let id = s.nextBasket; s.nextBasket += 1; RS.put(s.basketStore, basketRows, id, { fund = x.instrument; instrument = b.instrument; shares = b.shares }) };
@@ -2816,6 +3028,16 @@ module {
         RS.put(s.valueDateStore, valueDateRows, x.instrument, { day = x.day });
         [58, x.instrument, x.day]
       };
+      case (#setAttestors(x)) {
+        for (k in Nat.range(0, 3)) RS.put(s.attestorStore, attestorRows, k + 1, { attestor = x.attestors[k] });
+        [59]
+      };
+      case (#attestPrice(x)) {
+        let id = s.nextAttestation; s.nextAttestation += 1;
+        RS.put(s.attestationStore, attestationRows, id, { instrument = x.instrument; day = x.day; attestor = x.attestor; price = x.price });
+        [60, x.instrument, x.day, x.attestor, switch (attestedPrice(s, x.instrument, x.day)) { case (?m) m; case null 0 }]
+      };
+      case (#settleDerivatives(x)) settleDerivatives(s, x.instrument, x.day, x.limit);
       case (#tripBreaker(x)) {
         let ?row = indexRowOf(s, x.index) else Runtime.trap("apply: an index vanished");
         let move = if (row.level > row.reference) row.level - row.reference else row.reference - row.level;
@@ -2835,6 +3057,60 @@ module {
     }
   };
 
+  /// SPEC §34, §35: a slice of a derivative's daily settlement, `limit` open positions from the run's cursor. The price is
+  /// the run's: the attested median before the expiry, the index's level on the expiry day. A future's position is
+  /// owed or owes (price − mark) × the contracts × the multiplier in the open cycle and is marked at the price; an
+  /// option's is marked (its writer's margin follows). On the expiry day every position closes: a future after its last
+  /// variation, an option paying its intrinsic value from its writers to its holders. The run ends when no open position
+  /// is left after the cursor. Effects: [61, instrument, day, price, done, n, (account, member, owed to it, owed by it)...].
+  func settleDerivatives(s : State, inst : Nat, day : Nat, limit : Nat) : T.Effects {
+    let ?d = derivOf(s, inst) else Runtime.trap("apply: a derivative vanished");
+    let final = day == expiryOf(s, inst);
+    let price = if (d.runDay != 0) d.runPrice else if (final) indexLevel(s, indexOfDeriv(s, inst)) else switch (attestedPrice(s, inst, day)) { case (?m) m; case null Runtime.trap("apply: the attestations were checked") };
+    let mult = multiplierOf(s, inst);
+    let start = if (d.runDay != 0) d.cursor + 1 else 0;
+    let out = List.empty<Nat>();
+    var n = 0; var last = d.cursor; var done = false; var sumTo = 0; var sumBy = 0;
+    // the slice: up to `limit` + 1 open positions after the cursor, the pages followed to the range's end (a page may stop
+    // at its scan budget short of its rows); the run is done when no more than `limit` were left
+    let found = List.empty<(Nat, Position)>();
+    var cursor : ?Page.Cursor = null;
+    label pages loop {
+      switch (RS.page(s.positionStore, positionRows, "open", R.key2(inst, 8, start, 8), R.key2(inst, 8, MAXP, 8), cursor, limit + 1 - List.size(found))) {
+        case (#ok(pg)) {
+          for (row in pg.rows.vals()) { if (List.size(found) <= limit) List.add(found, row) };
+          switch (pg.next) { case (?c) { if (List.size(found) > limit) break pages; cursor := ?c }; case null break pages };
+        };
+        case (#err(e)) Runtime.trap("settleDerivatives: " # debug_show(e));
+      };
+    };
+    done := List.size(found) <= limit;
+    for ((id, p) in List.toArray(found).vals()) {
+      if (n < limit) {
+          var to = 0; var by = 0;
+          switch (termsOf(s, inst)) {
+            case (?#future(_)) {
+              let amt = (if (price > p.mark) price - p.mark else p.mark - price) * p.qty * mult;
+              if ((price > p.mark) == p.long) to := amt else by := amt;
+              if (price == p.mark) { to := 0; by := 0 };
+            };
+            case (?#option(o)) { if (final) { let pay = intrinsic(o, price) * p.qty * mult; if (p.long) to := pay else by := pay } };
+            case (_) {};
+          };
+          if (to > 0 or by > 0) owe(s, p.member, s.cycleNo, to, by);
+          sumTo += to; sumBy += by;
+          let (qty, im) = if (final) (0, 0) else (p.qty, derivIm(s, inst, p.long, p.qty, price));
+          RS.put(s.positionStore, positionRows, id, { p with qty; im; mark = price });
+          putMemberIm(s, p.member, im, p.im);
+          for (v in [p.account, p.member, to, by].vals()) List.add(out, v);
+          n += 1; last := p.account;
+      };
+    };
+    RS.put(s.derivStore, derivRows, inst,
+      if (done) ({ mark = price; settled = day; runDay = 0; runPrice = 0; cursor = 0; runTo = 0; runBy = 0; expired = final } : Deriv)
+      else ({ d with runDay = day; runPrice = price; cursor = last; runTo = d.runTo + sumTo; runBy = d.runBy + sumBy } : Deriv));
+    Array.concat<Nat>([61, inst, day, price, if (done) 1 else 0, n], List.toArray(out))
+  };
   /// SPEC §25: the makers' period closed for a market day. Every registration's presence accrued to now; the
   /// obligation met when it was present for at least its required share of the continuous session (and there was one);
   /// a maker that met it paid its rebate — its fees on the instrument in the period × its rebate rate, half-even — from
@@ -3130,7 +3406,7 @@ module {
       settlePair(s, inst, i0, b, bo, a, ao, p, q);
       for ((oid, o0) in [(b, bo), (a, ao)].vals()) {
         // a clearing buy's margin falls with what remains; every other order's hold by what the fill took
-        let held = switch (o0.side, clearingOf(s, o0.account) != null) {
+        let held = if (isDerivative(s, inst)) o0.held * (o0.remaining - q) / o0.remaining else switch (o0.side, clearingOf(s, o0.account) != null) {
           case (#buy, true) o0.held * (o0.remaining - q) / o0.remaining;
           case (#buy, false) buyHold(s, i0, inst, o0.price, o0.remaining - q);
           case (#sell, _) o0.held - q;
@@ -3165,6 +3441,7 @@ module {
   /// shares it buys or sells are the CCP's custody. Where one side is pre-funded and the other clearing, the CCP pays or is
   /// paid, delivers or receives. Every movement of a pre-funded party is a leg of the settlement range.
   func settlePair(s : State, inst : Nat, i0 : T.Instrument, b : Nat, bo : T.Order, a : Nat, ao : T.Order, p : Nat, q : Nat) {
+    if (isDerivative(s, inst)) return settleDerivativePair(s, inst, b, bo, a, ao, p, q);
     let v = p * q;
     // a bond's interest accrued to its value date, paid by the buyer to the seller beside the clean value (SPEC §28)
     let ai = switch (bondOf(s, inst)) { case (?bd) accruedOn(bd, q, valueDateOf(s, inst)); case null 0 };
@@ -3220,6 +3497,31 @@ module {
         case null {};
       };
     };
+  };
+  /// A derivative's fill (§34, §35), novated: both parties are clearing members' accounts and trade against the CCP. A
+  /// future's trade is marked at once to the contract's mark, the buyer owed (or owing) (mark − price) × the contracts ×
+  /// the multiplier and the seller the opposite, in the open cycle; an option's buyer owes the premium and its writer is
+  /// owed it. Fees on the notional or premium as any clearing party's; both positions netted.
+  func settleDerivativePair(s : State, inst : Nat, b : Nat, bo : T.Order, a : Nat, ao : T.Order, p : Nat, q : Nat) {
+    let ?bm = clearingOf(s, bo.account) else Runtime.trap("settle: a derivative's buyer clears");
+    let ?am = clearingOf(s, ao.account) else Runtime.trap("settle: a derivative's seller clears");
+    let mult = multiplierOf(s, inst);
+    let v = p * q * mult;
+    switch (termsOf(s, inst)) {
+      case (?#future(_)) {
+        let mark = switch (derivOf(s, inst)) { case (?d) d.mark; case null p };
+        let d = (if (mark > p) mark - p else p - mark) * q * mult;
+        if (mark >= p) { owe(s, bm, s.cycleNo, d, 0); owe(s, am, s.cycleNo, 0, d) } else { owe(s, bm, s.cycleNo, 0, d); owe(s, am, s.cycleNo, d, 0) };
+      };
+      case (_) { owe(s, bm, s.cycleNo, 0, v); owe(s, am, s.cycleNo, v, 0) };
+    };
+    let feeB = feeOn(s, inst, v); let feeS = feeOn(s, inst, v);
+    owe(s, bm, s.cycleNo, 0, feeB); owePayable(s, inst, feeB);
+    owe(s, am, s.cycleNo, 0, feeS); owePayable(s, inst, feeS);
+    addFeeTotal(s, bo.member, inst, feeB); addFeeTotal(s, ao.member, inst, feeS);
+    movePosition(s, bo.account, bm, inst, true, q);
+    movePosition(s, ao.account, am, inst, false, q);
+    appendStatement(s, bo.member, b, #buy, q, p, feeB); appendStatement(s, ao.member, a, #sell, q, p, feeS);
   };
   /// A bond fill's accrued interest as its own leg (kind 6), when there is any.
   func accruedLeg(s : State, i0 : T.Instrument, from : Nat, to : Nat, ai : Nat) { if (ai > 0) appendLeg(s, 6, i0.cashLedger, from, to, ai) };
@@ -3496,6 +3798,7 @@ module {
           case (#cancelReceipt(c)) own(c.member);
           case (#retire(c)) own(c.member);
           case (#exercise(c)) { own(c.member); switch (termsOf(s, c.instrument)) { case (?#right(r)) mentioned(r.issuerMember); case (_) {} } };
+          case (#settleDerivatives(_)) { for (j in Nat.range(0, e[5])) mentioned(e[7 + 4 * j]) };
           case (#registerMaker(c)) own(c.member);
           case (#quote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
           case (#massQuote(c)) { own(c.member); var p = 2; for (_ in Nat.range(0, e[1])) { let nc = e[p + 1]; for (j in Nat.range(0, nc)) touched(e[p + 2 + j]); p += 2 + nc + 8 } };
@@ -3712,6 +4015,10 @@ module {
     table<Retirement>("retirements", s.retireStore, retireRows, s.nextRetire);
     table<Entitlement>("entitlements", s.entitlementStore, entitlementRows, s.nextEntitlement);
     table<Supply>("supply", s.supplyStore, supplyRows, s.nextSupply);
+    table<Attestor>("attestors", s.attestorStore, attestorRows, 4);
+    table<Attestation>("attestations", s.attestationStore, attestationRows, s.nextAttestation);
+    table<Position>("positions", s.positionStore, positionRows, s.nextPosition);
+    Fold.section(f, "positionmargin", func(w : C.Writer) { positionMargins(s, w) });
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
@@ -3730,7 +4037,12 @@ module {
       switch (termsOf(s, i)) { case (?t) { w.nat(i); w.byte(1); w.blob(termsRows.encode(t)) }; case null {} };
       switch (navOf(s, i)) { case (?n) { w.nat(i); w.byte(2); w.blob(navRows.encode(n)) }; case null {} };
       switch (RS.get(s.valueDateStore, valueDateRows, i)) { case (?v) { w.nat(i); w.byte(3); w.nat(v.day) }; case null {} };
+      switch (derivOf(s, i)) { case (?d) { w.nat(i); w.byte(4); w.blob(derivRows.encode(d)) }; case null {} };
     };
+  };
+  /// Every clearing member's positions' margin, in member order (SPEC §34).
+  func positionMargins(s : State, w : C.Writer) {
+    for (r in clearingMembers(s).vals()) { switch (RS.get(s.memberImStore, memberImRows, r.member)) { case (?x) { w.nat(r.member); w.nat(x.im) }; case null {} } };
   };
   func margins(s : State, w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.marginStore, marginRows, i)) { case (?r) { w.nat(i); w.nat(r) }; case null {} } } };
   /// One step of a table in the sliced fingerprint: its next row, or on to `after` past its end.
@@ -3751,7 +4063,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 83) {
+    while (left > 0 and run.part < 90) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -3836,12 +4148,19 @@ module {
         case 79 tableStep<Entitlement>(w, run, s.entitlementStore, entitlementRows, s.nextEntitlement, 80);
         case 80 tableHead(w, run, "supply", s.nextSupply, 81);
         case 81 tableStep<Supply>(w, run, s.supplyStore, supplyRows, s.nextSupply, 82);
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 83 };
+        case 82 { tableHead(w, run, "attestors", 4, 83) };
+        case 83 tableStep<Attestor>(w, run, s.attestorStore, attestorRows, 4, 84);
+        case 84 tableHead(w, run, "attestations", s.nextAttestation, 85);
+        case 85 tableStep<Attestation>(w, run, s.attestationStore, attestationRows, s.nextAttestation, 86);
+        case 86 tableHead(w, run, "positions", s.nextPosition, 87);
+        case 87 tableStep<Position>(w, run, s.positionStore, positionRows, s.nextPosition, 88);
+        case 88 { w.text("positionmargin"); positionMargins(s, w); run.part := 89 };
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 90 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 83) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 90) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };
@@ -3850,7 +4169,7 @@ module {
      s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode,
      s.nextPayable, s.nextFeeTotal, s.nextStatement, s.nextStatementSeal, s.lastStatementDay, s.nextRecon, s.nextMaker, s.nextMakerDay, s.lastMakerDay,
      s.nextConstituent, s.nextPath, s.breakerDue, Nat64.toNat(s.suspendedAt),
-     s.nextBasket, s.nextNavPath, s.nextReceipt, s.nextRetire, s.nextEntitlement, s.nextSupply]
+     s.nextBasket, s.nextNavPath, s.nextReceipt, s.nextRetire, s.nextEntitlement, s.nextSupply, s.nextAttestation, s.nextPosition]
   };
   /// The order indexes whose entries leave as orders change (the reference index's keys never move).
   public let churnIndexes : [Text] = ["book", "stops", "own", "day", "gtd", "immediate", "trailing", "member", "trader"];

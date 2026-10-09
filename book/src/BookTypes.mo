@@ -201,6 +201,13 @@ module {
     /// A bond's value date for the market day (§28): the day its trades settle and accrue to, the calendar's T+n, recorded
     /// by the scheduler before the day's first order (the fold reads no calendar).
     #valueDate : { instrument : InstrumentId; day : Day };
+    /// The three price attestors (SPEC §33; four eyes): the principals whose attestations make a derivative's daily price.
+    #setAttestors : { attestors : [Principal] };
+    /// An attestor's price for a derivative on the market day (§33): its number among the three, the price.
+    #attestPrice : { attestor : Nat; instrument : InstrumentId; day : Day; price : Nat };
+    /// The scheduler's daily settlement of a derivative's positions (§34, §35), `limit` positions a message from the run's
+    /// cursor: before the expiry at the attested price, on the expiry day at the index's level, the positions then closed.
+    #settleDerivatives : { instrument : InstrumentId; day : Day; limit : Nat };
   };
 
   /// A levy of a fee schedule (SPEC §22): its recipient account and its rate in parts per million of a fill's value.
@@ -222,6 +229,12 @@ module {
     #receipt : { warehouses : [Nat] };
     #certificate : { registry : Blob };
     #right : { underlying : InstrumentId; price : Nat; num : Nat; den : Nat; deadline : Day; issuer : AccountId; issuerMember : Nat };
+    /// A future on an index (§34): the index, the multiplier, the expiry day, the initial margin in basis points of
+    /// notional. Quoted in hundredths of an index point, as the index's level.
+    #future : { index : Nat; multiplier : Nat; expiry : Day; imBps : Nat };
+    /// A European option on an index settled in cash (§35): the strike in hundredths of a point, a call or a put, the
+    /// multiplier, the expiry, the writer's margin rates (a × the index less what it is out of the money, at least b ×).
+    #option : { index : Nat; strike : Nat; call : Bool; multiplier : Nat; expiry : Day; aBps : Nat; bBps : Nat };
   };
   /// A bond's day count (ISO 20022 InterestComputationMethod4Code): A004 ACT/365 fixed, A006 30/360 bond basis, A001
   /// ACT/ACT ICMA.
