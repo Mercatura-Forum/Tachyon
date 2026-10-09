@@ -12,6 +12,7 @@
 import Array "mo:core/Array";
 import Blob "mo:core/Blob";
 import Int "mo:core/Int";
+import Iter "mo:core/Iter";
 import List "mo:core/List";
 import Map "mo:core/Map";
 import Nat "mo:core/Nat";
@@ -38,6 +39,7 @@ import X "../../exchange/src/ExchangeCore";
 import XText "../../exchange/src/ExchangeText";
 
 import T "BookTypes";
+import F "BookFeed";
 import K "BookCanonical";
 import L "BookLogic";
 
@@ -77,6 +79,7 @@ module {
     Perm.p("book.kill.sweep", "kill", #update, #command("killSweep"), false, false, false),
     Perm.p("book.kill.revive", "kill", #close, #command("revive"), false, false, true),
     Perm.p("book.risk.limits", "limits", #update, #command("setLimits"), false, false, true),
+    Perm.p("book.day.seal", "day", #create, #command("sealDay"), false, false, false),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -97,6 +100,7 @@ module {
     ("book.auction.uncross", "the scheduler, or the venue at the drawn end, uncrosses a call auction at the price the rule of section 9 fixes"),
     ("book.kill.set", "the operator, or a trader of the member, blocks a member or a trader at once; lifting it takes four eyes"),
     ("book.kill.sweep", "the operator's system cancels a killed member's or trader's open orders in slices; what they held returns"),
+    ("book.day.seal", "the scheduler seals the market day at its end: the day's statistics recorded and their file's hash written; it moves no order and no funds"),
   ] };
   public let commandNames : [Text] = K.families;
   public let methodNames : [Text] = ["approve", "reject"];
@@ -200,9 +204,60 @@ module {
     // a partial index: the instruments in a call phase, which the venue's random end reads (SPEC §8)
     indexes = [{ name = "calling"; keyBytes = 8; keyOf = func(id : Nat, x : T.Instrument) : ?Blob { if (x.phase == #auction or x.phase == #closingAuction) ?R.key(id, 8) else null } }];
   };
+  /// The feed hash of every block (SPEC §13), by the block's index.
+  public let feedHashes : RS.Decl<Blob> = {
+    table = "feedhashes"; idBytes = 8; rowBytes = 32;
+    encode = func(x : Blob) : Blob { x };
+    decode = func(a : [Nat8]) : Blob { Blob.fromArray(a) };
+    indexes = [];
+  };
+  /// An instrument's statistics (SPEC §15): for the session since the last seal, or for a sealed day.
+  public type Stats = { first : Nat; high : Nat; low : Nat; last : Nat; closing : Nat; volume : Nat; value : Nat; trades : Nat };
+  public let NO_STATS : Stats = { first = 0; high = 0; low = 0; last = 0; closing = 0; volume = 0; value = 0; trades = 0 };
+  public let STATS_ROW_BYTES = 64;   // eight figures of 8 bytes
+  func putStats(b : R.Buf, x : Stats) { for (v in [x.first, x.high, x.low, x.last, x.closing, x.volume, x.value, x.trades].vals()) R.putNat(b, v, 8) };
+  func getStats(a : [Nat8], p : Nat) : Stats {
+    { first = R.getNat(a, p, 8); high = R.getNat(a, p + 8, 8); low = R.getNat(a, p + 16, 8); last = R.getNat(a, p + 24, 8); closing = R.getNat(a, p + 32, 8);
+      volume = R.getNat(a, p + 40, 8); value = R.getNat(a, p + 48, 8); trades = R.getNat(a, p + 56, 8) }
+  };
+  /// The session's statistics, by instrument id.
+  public let statRows : RS.Decl<Stats> = {
+    table = "sessionstats"; idBytes = 8; rowBytes = STATS_ROW_BYTES;
+    encode = func(x : Stats) : Blob { let b = R.buf(); putStats(b, x); padded(b, STATS_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Stats { getStats(a, 0) };
+    indexes = [];
+  };
+  /// A sealed day's row for an instrument: its statistics and the reference price at the seal, found by day.
+  public type DayRow = { day : Nat; instrument : Nat; stats : Stats; reference : Nat };
+  public let DAY_ROW_BYTES = 88;   // day 8, instrument 8, statistics 64, reference 8
+  public let dayRows : RS.Decl<DayRow> = {
+    table = "days"; idBytes = 8; rowBytes = DAY_ROW_BYTES;
+    encode = func(x : DayRow) : Blob { let b = R.buf(); R.putNat(b, x.day, 8); R.putNat(b, x.instrument, 8); putStats(b, x.stats); R.putNat(b, x.reference, 8); padded(b, DAY_ROW_BYTES) };
+    decode = func(a : [Nat8]) : DayRow { { day = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); stats = getStats(a, 16); reference = R.getNat(a, 80, 8) } };
+    indexes = [{ name = "byDay"; keyBytes = 16; keyOf = func(_ : Nat, x : DayRow) : ?Blob { ?R.key2(x.day, 8, x.instrument, 8) } }];
+  };
+  /// A seal (SPEC §15): the day, the file's rows and its hash; found by day.
+  public type SealRow = { day : Nat; rows : Nat; hash : Blob };
+  public let SEAL_ROW_BYTES = 48;   // day 8, rows 8, hash 32
+  public let sealRows : RS.Decl<SealRow> = {
+    table = "seals"; idBytes = 8; rowBytes = SEAL_ROW_BYTES;
+    encode = func(x : SealRow) : Blob { let b = R.buf(); R.putNat(b, x.day, 8); R.putNat(b, x.rows, 8); R.putBlob(b, x.hash, 32); padded(b, SEAL_ROW_BYTES) };
+    decode = func(a : [Nat8]) : SealRow { { day = R.getNat(a, 0, 8); rows = R.getNat(a, 8, 8); hash = R.getBlob(a, 16, 32) } };
+    indexes = [{ name = "byDay"; keyBytes = 8; keyOf = func(_ : Nat, x : SealRow) : ?Blob { ?R.key(x.day, 8) } }];
+  };
+  /// A drop-copy row (SPEC §14): a block that concerns a member, and whether it is the member's own act.
+  public type DropRow = { member : Nat; block : Nat; own : Bool };
+  public let DROP_ROW_BYTES = 17;   // member 8, block 8, own 1
+  public let dropRows : RS.Decl<DropRow> = {
+    table = "drops"; idBytes = 8; rowBytes = DROP_ROW_BYTES;
+    encode = func(x : DropRow) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.block, 8); R.putBool(b, x.own); padded(b, DROP_ROW_BYTES) };
+    decode = func(a : [Nat8]) : DropRow { { member = R.getNat(a, 0, 8); block = R.getNat(a, 8, 8); own = R.getBool(a, 16) } };
+    indexes = [{ name = "byMember"; keyBytes = 16; keyOf = func(_ : Nat, x : DropRow) : ?Blob { ?R.key2(x.member, 8, x.block, 8) } }];
+  };
   /// A kill switch (SPEC §11), by its sequence number; its index finds the active one of a member or a trader.
   public let KILL_ROW_BYTES = 24;   // member 8, trader 8, active 1, pad 7
-  func killKey(x : T.Kill) : Blob { if (x.member != 0) R.key2(1, 1, x.member, 8) else R.key2(2, 1, x.trader, 8) };
+  /// A trader's kill is keyed by its trader, a member's by its member.
+  func killKey(x : T.Kill) : Blob { if (x.trader != 0) R.key2(2, 1, x.trader, 8) else R.key2(1, 1, x.member, 8) };
   public let kills : RS.Decl<T.Kill> = {
     table = "kills"; idBytes = 8; rowBytes = KILL_ROW_BYTES;
     encode = func(x : T.Kill) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.trader, 8); R.putBool(b, x.active); padded(b, KILL_ROW_BYTES) };
@@ -253,6 +308,15 @@ module {
     log : DL.State;
     var orderRows : RS.Store; balanceRows : RS.Store; refRows : RS.Store; var instrumentRows : RS.Store; dueRows : RS.Store; proposalRows : RS.Store;
     killRows : RS.Store; limitStore : RS.Store;
+    /// The public feed's chain (SPEC §13): every block's feed hash by its index, the head, and the next block to project.
+    feedRows : RS.Store; var feedHead : Blob; var feedNext : Nat;
+    /// The drop copy's index (SPEC §14): a row for every (member, block) the block concerns, written with the feed.
+    dropStore : RS.Store; var nextDrop : Nat;
+    /// The day's statistics (SPEC §15): the session's by instrument, every sealed day's rows, and the last day sealed.
+    statStore : RS.Store; dayStore : RS.Store; var nextDayRow : Nat; var lastSealed : Nat; sealStore : RS.Store; var nextSeal : Nat;
+    /// The instruments the book holds, in id order (written when one opens; the fold rebuilds it): what the fingerprint,
+    /// the seal and the readers walk, in place of every possible id.
+    var instrumentList : [Nat];
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -272,6 +336,8 @@ module {
   public func newStateOver(log : DL.State) : State {
     { log; var orderRows = RS.newStore(orders); balanceRows = RS.newStore(balances); refRows = RS.newStore(refs); var instrumentRows = RS.newStore(instruments); dueRows = RS.newStore(dues);
       proposalRows = RS.newStore(proposals); killRows = RS.newStore(kills); limitStore = RS.newStore(limitRows);
+      feedRows = RS.newStore(feedHashes); var feedHead = F.genesis(); var feedNext = 0; dropStore = RS.newStore(dropRows); var nextDrop = 1;
+      statStore = RS.newStore(statRows); dayStore = RS.newStore(dayRows); var nextDayRow = 1; var lastSealed = 0; sealStore = RS.newStore(sealRows); var nextSeal = 1; var instrumentList = [];
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -431,14 +497,18 @@ module {
   //  VALIDATION
   // ═══════════════════════════════════════════════════════
 
-  /// The account and the caller: an open account of a member the caller is an active trader of.
+  /// The account and the caller: an open account of a member the caller is an active trader of. Membership is judged
+  /// before the account's status, so another member's account answers only NotYourAccount, never whether it is closed
+  /// (no read or refusal tells one member about another's accounts).
   func ownAccount(xs : X.State, caller : Principal, account : Nat) : ?T.Error {
     let ?a = X.account(xs, account) else return ?#UnknownAccount({ account });
-    if (a.status != #open) return ?#AccountClosed({ account });
     let ?(_, t) = X.traderByPrincipal(xs, caller) else return ?#NotYourAccount({ account });
     if (t.status != #active or t.member != a.member) return ?#NotYourAccount({ account });
+    if (a.status != #open) return ?#AccountClosed({ account });
     null
   };
+  /// The member an account belongs to in the exchange's rows (0 for no such account).
+  func memberOf(xs : X.State, account : Nat) : Nat { switch (X.account(xs, account)) { case (?a) a.member; case null 0 } };
   func ownOrder(s : State, xs : X.State, caller : Principal, id : Nat) : Result.Result<T.Order, T.Error> {
     let ?o = order(s, id) else return #err(#UnknownOrder({ order = id }));
     switch (ownAccount(xs, caller, o.account)) { case (?_) return #err(#NotYourOrder({ order = id })); case null {} };
@@ -500,7 +570,8 @@ module {
         null
       };
       case (#deposit(x)) {
-        if (X.account(xs, x.account) == null) return ?#UnknownAccount({ account = x.account });
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
         if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
         if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
         if (one(s.refRows, refs, "byRef", x.reference) != null) return ?#DuplicateReference;
@@ -508,6 +579,7 @@ module {
       };
       case (#withdraw(x)) {
         switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
+        if (memberOf(xs, x.account) != x.member) return ?#InvalidTerms({ reason = "the account's member" });
         if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
         let b = balance(s, x.account, x.ledger);
         if (b.available < x.amount) return ?#InsufficientFunds({ ledger = x.ledger; available = b.available; wanted = x.amount });
@@ -596,7 +668,11 @@ module {
         if (crossing.size() > 0) return ?#SelfTradePrevented({ resting = crossing[0].0 });
         null
       };
-      case (#massCancel(x)) { ownAccount(xs, caller, x.account) };
+      case (#massCancel(x)) {
+        switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
+        if (memberOf(xs, x.account) != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        null
+      };
       case (#flush) { if (s.batchTime == 0 and s.dueCount == 0) ?#NothingToClear else null };
       case (#endOfDay(_)) null;
       case (#expireGtd(x)) { let (today, _) = X.marketTime(xs, now); if (x.day != today) ?#NotTheChainsDay({ day = today }) else null };
@@ -631,16 +707,17 @@ module {
         null
       };
       case (#kill(x)) {
-        if ((x.member == 0) == (x.trader == 0)) return ?#InvalidTerms({ reason = "a member or a trader" });
+        if (x.member == 0) return ?#InvalidTerms({ reason = "a member" });
         switch (reasonRefusal(x.reason)) { case (?e) return ?e; case null {} };
-        let targetMember = if (x.member != 0) { switch (X.member(xs, x.member)) { case (?_) x.member; case null return ?#InvalidTerms({ reason = "no such member" }) } }
-          else { switch (X.trader(xs, x.trader)) { case (?t) t.member; case null return ?#InvalidTerms({ reason = "no such trader" }) } };
+        if (X.member(xs, x.member) == null) return ?#InvalidTerms({ reason = "no such member" });
+        if (x.trader != 0) { switch (X.trader(xs, x.trader)) { case (?t) { if (t.member != x.member) return ?#InvalidTerms({ reason = "a trader of the member" }) }; case null return ?#InvalidTerms({ reason = "no such trader" }) } };
+        let targetMember = x.member;
         // a trader kills within its own member; the operator, anywhere
         switch (X.traderByPrincipal(xs, caller)) {
           case (?(_, t)) { if (t.status != #active or t.member != targetMember) return ?#InvalidTerms({ reason = "a trader kills within its own member" }) };
           case null {};
         };
-        if (activeKill(s, if (x.member != 0) 1 else 2, if (x.member != 0) x.member else x.trader) != null) return ?#InvalidTerms({ reason = "already killed" });
+        if (activeKill(s, if (x.trader != 0) 2 else 1, if (x.trader != 0) x.trader else x.member) != null) return ?#InvalidTerms({ reason = "already killed" });
         null
       };
       case (#killSweep(x)) {
@@ -656,6 +733,12 @@ module {
       };
       case (#setLimits(x)) {
         if (X.member(xs, x.member) == null) return ?#InvalidTerms({ reason = "no such member" });
+        null
+      };
+      // SPEC §15: the market day of the act, later than every day sealed
+      case (#sealDay(x)) {
+        if (x.day != X.marketTime(xs, now).0) return ?#InvalidTerms({ reason = "the market day of the act" });
+        if (x.day <= s.lastSealed) return ?#InvalidTerms({ reason = "a day later than the last sealed" });
         null
       };
     }
@@ -677,7 +760,7 @@ module {
   };
   /// The first open order of a kill's target, if any.
   func firstOpenOf(s : State, k : T.Kill) : ?(Nat, T.Order) {
-    let (ix, who) = if (k.member != 0) ("member", k.member) else ("trader", k.trader);
+    let (ix, who) = if (k.trader != 0) ("trader", k.trader) else ("member", k.member);
     let (lo, hi) = R.prefixRange(who, 8, 8);
     first(s.orderRows, orders, ix, lo, hi)
   };
@@ -744,17 +827,20 @@ module {
 
   /// Effects by family: [tag] then
   ///   openInstrument, setTrading, setReference: [instrument]; deposit: [account, amount]; withdraw: [account, amount];
-  ///   placeOrder: [order, status, cancelled own orders...]; cancelOrder: [order]; amendOrder: [order, priority kept 1/0];
+  ///   placeOrder: [order, status, price, shown, cancelled own orders...]; cancelOrder: [order]; amendOrder: [order,
+  ///   priority kept 1/0, shown];
   ///   massCancel / endOfDay / expireGtd: [count, orders...]; flush: []; clear: per instrument cleared, [instrument, price,
-  ///   volume, pairs, (buy, sell, quantity)..., cancelled, orders..., triggered, orders..., interrupted 1/0]; setPhase:
+  ///   volume, pairs, (buy, sell, quantity)..., cancelled, orders..., triggered, (order, side 1 buy 2 sell, price, shown)...,
+  ///   icebergs traded, (order, shown)..., interrupted 1/0]; setPhase:
   ///   [instrument, phase]; uncross: [instrument, price, volume, pairs, (buy, sell, quantity)..., cancelled, orders...,
-  ///   phase after]; halt, resume: [instrument]; kill: [kill]; killSweep: [kill, count, orders...]; revive: [kill];
+  ///   icebergs traded, (order, shown)..., phase after]; halt, resume: [instrument]; kill: [kill]; killSweep: [kill, count, orders...]; revive: [kill];
   ///   setLimits: [member].
   public func apply(s : State, now : Nat64, c : T.Command) : T.Effects {
     switch (c) {
       case (#openInstrument(x)) {
         RS.put<T.Instrument>(s.instrumentRows, instruments, x.instrument, { assetLedger = x.assetLedger; cashLedger = x.cashLedger; lot = x.lot; referencePrice = x.referencePrice; bands = x.bands;
           collarBps = x.collarBps; phase = (#closed : T.Phase); lastPrice = 0; staticBps = x.staticBps; dynamicBps = x.dynamicBps; interruptSecs = x.interruptSecs; endFrom = 0; endTo = 0; interruptUntil = 0; closePrice = 0 });
+        s.instrumentList := Array.sort<Nat>(Array.concat<Nat>(s.instrumentList, [x.instrument]), Nat.compare);
         [1, x.instrument]
       };
       case (#setTrading(x)) {
@@ -805,7 +891,9 @@ module {
         if (status == #live) { markDue(s, x.instrument, true); if (s.batchTime == 0) s.batchTime := now };
         // a stop may already be triggered by the last clear's price: the instrument is due at the next clear
         if (status == #waiting) markDue(s, x.instrument, true);
-        Array.concat<Nat>([6, id, Nat8.toNat(K.statusCode(status))], List.toArray(cancelled))
+        // what the order rests at and shows (0 unless live): the feed's add (SPEC §13)
+        let shows = if (status == #live) (if (x.peak == 0) x.qty else Nat.min(x.peak, x.qty)) else 0;
+        Array.concat<Nat>([6, id, Nat8.toNat(K.statusCode(status)), price, shows], List.toArray(cancelled))
       };
       case (#cancelOrder(x)) {
         let ?o = order(s, x.order) else Runtime.trap("apply: order vanished");
@@ -824,7 +912,8 @@ module {
           key = if (keeps) o.key else K.orderKey(o.account, o.side, x.price, x.qty, o.clientRef) });
         markDue(s, o.instrument, true);
         if (s.batchTime == 0) s.batchTime := now;
-        [8, x.order, if (keeps) 1 else 0]
+        // what it shows: nothing while it waits hidden (a stop), so an amendment does not reveal it (SPEC §13)
+        [8, x.order, if (keeps) 1 else 0, if (o.status != #live) 0 else if (o.peak == 0) x.qty else Nat.min(o.peak, x.qty)]
       };
       case (#massCancel(x)) {
         let (lo, hi) = span(accountPrefix(x.account), 25);
@@ -864,7 +953,7 @@ module {
       };
       case (#killSweep(x)) {
         let ?k = kill(s, x.kill) else Runtime.trap("apply: kill vanished");
-        let (ix, who) = if (k.member != 0) (MEMBER, k.member) else (TRADER, k.trader);
+        let (ix, who) = if (k.trader != 0) (TRADER, k.trader) else (MEMBER, k.member);
         let (lo, hi) = R.prefixRange(who, 8, 8);
         let done = List.empty<Nat>();
         let limit = Nat.min(x.limit, T.MAX_SWEEP);
@@ -884,6 +973,10 @@ module {
         putLimits(s, x.member, func(l : T.Limits) : T.Limits { { l with maxOrderQty = x.maxOrderQty; maxOrderValue = x.maxOrderValue; creditLimit = x.creditLimit } });
         [21, x.member]
       };
+      case (#sealDay(x)) {
+        let (rows, hash) = seal(s, x.day);
+        Array.concat<Nat>([22, x.day, rows], Array.map<Nat8, Nat>(Blob.toArray(hash), func(b) { Nat8.toNat(b) }))
+      };
     }
   };
 
@@ -898,10 +991,10 @@ module {
       case (?(bids, asks)) {
         let r = L.uncross(bids, asks, i0.lot, if (i0.lastPrice != 0) i0.lastPrice else i0.referencePrice);
         switch (r.price) {
-          case (?p) { if (not L.within(p, i0.referencePrice, i0.staticBps)) return [15, inst, 0, 0, 0, 0, Nat8.toNat(K.phaseCode(i0.phase))] };
+          case (?p) { if (not L.within(p, i0.referencePrice, i0.staticBps)) return [15, inst, 0, 0, 0, 0, 0, Nat8.toNat(K.phaseCode(i0.phase))] };
           case null {};
         };
-        let (p, v) = execute(s, i0, r, now, cancelled, pairs); price := p; volume := v;
+        let (p, v) = execute(s, inst, i0, r, now, cancelled, pairs); price := p; volume := v;
       };
       case null {};
     };
@@ -909,6 +1002,8 @@ module {
     let ?i1 = instrument(s, inst) else Runtime.trap("apply: instrument vanished");
     let last = if (price > 0) price else i1.lastPrice;
     let close = if (i0.phase == #closingAuction) (if (last > 0) last else i1.referencePrice) else i1.closePrice;
+    // the session's closing price: the closing auction's (SPEC §15)
+    if (i0.phase == #closingAuction) RS.put(s.statStore, statRows, inst, { statsOf(s, inst) with closing = close });
     RS.put<T.Instrument>(s.instrumentRows, instruments, inst, { i1 with phase = next; endFrom = 0; endTo = 0; interruptUntil = 0; closePrice = close });
     if (price > 0) afterTrade(s, inst, price);
     markDue(s, inst, true);
@@ -916,6 +1011,8 @@ module {
     for (x in [15, inst, price, volume, List.size(pairs)].vals()) List.add(fx, x);
     for ((b, a, q) in List.values(pairs)) { List.add(fx, b); List.add(fx, a); List.add(fx, q) };
     List.add(fx, List.size(cancelled)); for (x in List.values(cancelled)) List.add(fx, x);
+    let shown = shownAfter(s, pairs);
+    List.add(fx, shown.size()); for ((t, sh) in shown.vals()) { List.add(fx, t); List.add(fx, sh) };
     List.add(fx, Nat8.toNat(K.phaseCode(next)));
     List.toArray(fx)
   };
@@ -944,7 +1041,7 @@ module {
     List.toArray(out)
   };
 
-  func triggerStops(s : State, inst : Nat, i : T.Instrument, time : Nat64, out : List.List<Nat>, cancelled : List.List<Nat>) {
+  func triggerStops(s : State, inst : Nat, i : T.Instrument, time : Nat64, out : List.List<(Nat, Nat, Nat, Nat)>, cancelled : List.List<Nat>) {
     if (i.lastPrice == 0) return;
     for (side in [#buy, #sell].vals()) {
       let (lo, hi) = span(sidePrefix(inst, side), 16);
@@ -960,7 +1057,8 @@ module {
           case (?o) {
             if (o.status == #waiting) {
               putOrder(s, id, { o with status = #live; prio = time });
-              List.add(out, id);
+              // revealed: what the order shows from now on (SPEC §13)
+              List.add(out, (id, if (o.side == #buy) 1 else 2, o.price, shownOf(o)));
               // a triggered stop is judged against the account's own live orders now (§3.5): it was not at entry
               let crossing = crossingOwn(s, o.account, inst, o.side, o.price, T.MAX_SWEEP);
               if (crossing.size() > 0) {
@@ -991,7 +1089,7 @@ module {
   /// An auction's result carried out (§3.2, §3.3, §4): fill-or-kill orders removed are cancelled; each pair paid and
   /// delivered at the price; icebergs whose peak filled take `time` as their priority; a filled linked order cancels its
   /// pair; a filled order releases what it still holds. Returns the price and the volume (0, 0 when nothing traded).
-  func execute(s : State, i0 : T.Instrument, r : L.Result, time : Nat64, cancelled : List.List<Nat>, pairs : List.List<(Nat, Nat, Nat)>) : (Nat, Nat) {
+  func execute(s : State, inst : Nat, i0 : T.Instrument, r : L.Result, time : Nat64, cancelled : List.List<Nat>, pairs : List.List<(Nat, Nat, Nat)>) : (Nat, Nat) {
     for (k in r.killed.vals()) { switch (order(s, k)) { case (?o) { close(s, k, o, #cancelled); List.add(cancelled, k) }; case null {} } };
     let ?p = r.price else return (0, 0);
     for ((b, a, q) in r.pairs.vals()) {
@@ -1009,6 +1107,7 @@ module {
         putOrder(s, oid, { o0 with remaining; filled = o0.filled + q; held; status = if (remaining == 0) #filled else #live });
       };
       List.add(pairs, (b, a, q));
+      addTrade(s, inst, p, q);
     };
     // an iceberg whose fill reached its displayed peak (the peak shown when the clear began) takes this priority (§2)
     for ((oid, f) in r.fills.vals()) {
@@ -1028,6 +1127,76 @@ module {
     };
     (p, r.volume)
   };
+  /// The quantity an order shows (SPEC §2, §13): an iceberg its peak, or what remains when less; any other order what
+  /// remains.
+  public func shownOf(o : T.Order) : Nat { if (o.peak == 0) o.remaining else Nat.min(o.peak, o.remaining) };
+  /// The icebergs a clear traded that stay live, each with the quantity it shows after the clear, in the order they first
+  /// appear in the pairs (SPEC §13: the feed cannot compute it, the hidden part never being published).
+  func shownAfter(s : State, pairs : List.List<(Nat, Nat, Nat)>) : [(Nat, Nat)] {
+    let seen = Map.empty<Nat, Bool>();
+    let out = List.empty<(Nat, Nat)>();
+    for ((b, a, _) in List.values(pairs)) {
+      for (oid in [b, a].vals()) {
+        if (Map.get(seen, Nat.compare, oid) == null) {
+          Map.add(seen, Nat.compare, oid, true);
+          switch (order(s, oid)) { case (?o) { if (o.peak != 0 and o.status == #live) List.add(out, (oid, shownOf(o))) }; case null {} };
+        };
+      };
+    };
+    List.toArray(out)
+  };
+  public let DAY_FILE_DOMAIN = "thebes.book.day.v1";
+  /// The instruments the book holds, in id order.
+  func instrumentIds(s : State) : [Nat] {
+    let out = List.empty<Nat>();
+    for (i in s.instrumentList.vals()) List.add(out, i);
+    List.toArray(out)
+  };
+  /// The day's file from its rows (SPEC §15).
+  func dayFileOf(day : Nat, rows : [DayRow]) : Blob {
+    let w = C.Writer(); w.text(DAY_FILE_DOMAIN); w.nat(day); w.len16(rows.size());
+    for (r in rows.vals()) {
+      w.nat(r.instrument);
+      for (v in [r.stats.first, r.stats.high, r.stats.low, r.stats.last, r.stats.closing, r.stats.volume, r.stats.value, r.stats.trades, r.reference].vals()) w.nat(v);
+    };
+    w.toBlob()
+  };
+  /// The seal: every instrument's session recorded as the day's, a new session begun; the file's rows and hash.
+  func seal(s : State, day : Nat) : (Nat, Blob) {
+    let rows = Array.map<Nat, DayRow>(instrumentIds(s), func(i) {
+      let reference = switch (instrument(s, i)) { case (?x) x.referencePrice; case null 0 };
+      { day; instrument = i; stats = statsOf(s, i); reference }
+    });
+    for (r in rows.vals()) { RS.put(s.dayStore, dayRows, s.nextDayRow, r); s.nextDayRow += 1; RS.put(s.statStore, statRows, r.instrument, NO_STATS) };
+    s.lastSealed := day;
+    let hash = Sha256.fromBlob(#sha256, dayFileOf(day, rows));
+    RS.put(s.sealStore, sealRows, s.nextSeal, { day; rows = rows.size(); hash }); s.nextSeal += 1;
+    (rows.size(), hash)
+  };
+  /// A day's seal, if it was sealed.
+  public func sealOf(s : State, day : Nat) : ?SealRow { switch (one(s.sealStore, sealRows, "byDay", R.key(day, 8))) { case (?(_, r)) ?r; case null null } };
+  /// A sealed day's file, rebuilt from its rows; null for a day not sealed.
+  public func dayFile(s : State, day : Nat) : ?Blob {
+    let ?sealed = sealOf(s, day) else return null;
+    let rows = List.empty<DayRow>();
+    var cursor : ?Page.Cursor = null;
+    label reading loop {
+      switch (RS.page(s.dayStore, dayRows, "byDay", R.key2(day, 8, 0, 8), R.key2(day, 8, 2 ** 64 - 1, 8), cursor, 500)) {
+        case (#ok(p)) { for ((_, r) in p.rows.vals()) List.add(rows, r); switch (p.next) { case (?n) cursor := ?n; case null break reading } };
+        case (#err(_)) break reading;
+      };
+    };
+    if (List.size(rows) != sealed.rows) Runtime.trap("day file: the day's rows are not the seal's");
+    ?dayFileOf(day, List.toArray(rows))
+  };
+  /// A trade of `q` at `p` in the instrument's session statistics (SPEC §15).
+  func addTrade(s : State, inst : Nat, p : Nat, q : Nat) {
+    let x = statsOf(s, inst);
+    RS.put(s.statStore, statRows, inst, { x with first = if (x.trades == 0) p else x.first; high = Nat.max(x.high, p); low = if (x.trades == 0) p else Nat.min(x.low, p);
+      last = p; volume = x.volume + q; value = x.value + p * q; trades = x.trades + 1 });
+  };
+  /// An instrument's statistics for the session since the last seal.
+  public func statsOf(s : State, inst : Nat) : Stats { switch (RS.get(s.statStore, statRows, inst)) { case (?x) x; case null NO_STATS } };
   /// The live immediate orders of an instrument cancelled (they cannot wait).
   func endImmediates(s : State, inst : Nat, cancelled : List.List<Nat>) {
     let (ilo, ihi) = R.prefixRange(inst, 8, 8);
@@ -1055,7 +1224,7 @@ module {
       let ?i0 = instrument(s, inst) else Runtime.trap("clear: instrument vanished");
       markDue(s, inst, false);
       let cancelled = List.empty<Nat>();
-      let triggered = List.empty<Nat>();
+      let triggered = List.empty<(Nat, Nat, Nat, Nat)>();
       var price = 0; var volume = 0;
       var interrupted = false;
       let pairs = List.empty<(Nat, Nat, Nat)>();
@@ -1070,7 +1239,7 @@ module {
                 case (?p) { not L.within(p, i0.referencePrice, i0.staticBps) or (i0.dynamicBps != 0 and not L.within(p, if (i0.lastPrice != 0) i0.lastPrice else i0.referencePrice, i0.dynamicBps)) };
                 case null false;
               };
-              if (outside) interrupted := true else { let (p, v) = execute(s, i0, r, time, cancelled, pairs); price := p; volume := v };
+              if (outside) interrupted := true else { let (p, v) = execute(s, inst, i0, r, time, cancelled, pairs); price := p; volume := v };
             };
             case null {};
           };
@@ -1079,7 +1248,7 @@ module {
           // trade at the closing price only (SPEC §8)
           let bids = Array.map<(T.OrderId, T.Order), L.Bid>(crossingSide(s, inst, #buy, i0.closePrice), toBid);
           let asks = Array.map<(T.OrderId, T.Order), L.Bid>(crossingSide(s, inst, #sell, i0.closePrice), toBid);
-          if (bids.size() > 0 and asks.size() > 0) { let (p, v) = execute(s, i0, L.auctionAt(bids, asks, i0.lot, i0.closePrice), time, cancelled, pairs); price := p; volume := v };
+          if (bids.size() > 0 and asks.size() > 0) { let (p, v) = execute(s, inst, i0, L.auctionAt(bids, asks, i0.lot, i0.closePrice), time, cancelled, pairs); price := p; volume := v };
         };
         case (_) {};
       };
@@ -1093,7 +1262,9 @@ module {
       List.add(fx, inst); List.add(fx, price); List.add(fx, volume); List.add(fx, List.size(pairs));
       for ((b, a, q) in List.values(pairs)) { List.add(fx, b); List.add(fx, a); List.add(fx, q) };
       List.add(fx, List.size(cancelled)); for (x in List.values(cancelled)) List.add(fx, x);
-      List.add(fx, List.size(triggered)); for (x in List.values(triggered)) List.add(fx, x);
+      List.add(fx, List.size(triggered)); for ((t, sd, tp, sh) in List.values(triggered)) { List.add(fx, t); List.add(fx, sd); List.add(fx, tp); List.add(fx, sh) };
+      let shown = shownAfter(s, pairs);
+      List.add(fx, shown.size()); for ((t, sh) in shown.vals()) { List.add(fx, t); List.add(fx, sh) };
       List.add(fx, if (interrupted) 1 else 0);
     };
     s.batchTime := 0;
@@ -1163,7 +1334,101 @@ module {
   /// The clear due at the chain's time `now` (§1): when a batch is waiting from an earlier time, or an instrument is due
   /// and the time has moved on, the clear is recorded as a block of its own, before anything else is judged. Returns
   /// the clear's block, if one was recorded.
-  public func flushDue(s : State, now : Nat64, caller : Principal) : ?Nat {
+  /// The feed carried to the log's end: every block not yet projected gets its message's hash, chained (SPEC §13). Run at
+  /// the end of every entry that appends and after a replay, so the chain is the same however the log was made.
+  func feedTo(s : State) {
+    let n = DL.length(s.log);
+    while (s.feedNext < n) {
+      let ?b = DL.get(s.log, K.codec, s.feedNext) else Runtime.trap("feed: a block of the log does not read");
+      let h = F.chain(s.feedHead, F.message(b));
+      RS.put(s.feedRows, feedHashes, s.feedNext, h);
+      s.feedHead := h;
+      for ((member, own) in concerned(s, b).vals()) { RS.put(s.dropStore, dropRows, s.nextDrop, { member; block = s.feedNext; own }); s.nextDrop += 1 };
+      s.feedNext += 1;
+    };
+  };
+  /// Block `i`'s feed message, its feed hash, and the hash before it (the genesis value before block 0); null past the
+  /// log's end.
+  public func feedEntry(s : State, i : Nat) : ?{ message : Blob; hash : Blob; previous : Blob } {
+    if (i >= s.feedNext) return null;
+    let ?b = DL.get(s.log, K.codec, i) else return null;
+    let ?hash = RS.get(s.feedRows, feedHashes, i) else return null;
+    let previous = if (i == 0) F.genesis() else switch (RS.get(s.feedRows, feedHashes, i - 1)) { case (?h) h; case null return null };
+    ?{ message = F.message(b); hash; previous }
+  };
+  public func feedHeadOf(s : State) : (Nat, Blob) { (s.feedNext, s.feedHead) };
+  /// The members a block concerns, each with whether the block is its own act, in member order (SPEC §14).
+  func concerned(s : State, b : DL.Block<K.Event>) : [(Nat, Bool)] {
+    let out = Map.empty<Nat, Bool>();
+    func own(m : Nat) { if (m != 0) Map.add(out, Nat.compare, m, true) };
+    func touched(oid : Nat) { switch (order(s, oid)) { case (?o) { if (Map.get(out, Nat.compare, o.member) == null) Map.add(out, Nat.compare, o.member, false) }; case null {} } };
+    func killMember(id : Nat) : Nat { switch (kill(s, id)) { case (?k) k.member; case null 0 } };
+    switch (b.event) {
+      case (#executed(x)) {
+        let e = x.effects;
+        switch (x.command) {
+          case (#placeOrder(c)) own(c.member);
+          case (#cancelOrder(c)) { switch (order(s, c.order)) { case (?o) own(o.member); case null {} } };
+          case (#amendOrder(c)) { switch (order(s, c.order)) { case (?o) own(o.member); case null {} } };
+          case (#deposit(c)) own(c.member);
+          case (#withdraw(c)) own(c.member);
+          case (#massCancel(c)) own(c.member);
+          case (#kill(c)) own(c.member);
+          case (#revive(c)) own(killMember(c.kill));
+          case (#killSweep(c)) own(killMember(c.kill));
+          case (#setLimits(c)) own(c.member);
+          case (#endOfDay(_) or #expireGtd(_)) { for (oid in Array.sliceToArray<Nat>(e, 2, 2 + e[1]).vals()) touched(oid) };
+          case (#clear(_)) {
+            var k = 1;
+            while (k < e.size()) {
+              let np = e[k + 3]; var p = k + 4;
+              for (_ in Nat.range(0, np)) { touched(e[p]); touched(e[p + 1]); p += 3 };
+              let nc = e[p]; for (j in Nat.range(0, nc)) touched(e[p + 1 + j]); p += 1 + nc;
+              let nt = e[p]; for (j in Nat.range(0, nt)) touched(e[p + 1 + 4 * j]); p += 1 + 4 * nt;
+              let ns = e[p]; for (j in Nat.range(0, ns)) touched(e[p + 1 + 2 * j]); p += 1 + 2 * ns;
+              k := p + 1;
+            };
+          };
+          case (#uncross(_)) {
+            let np = e[4]; var p = 5;
+            for (_ in Nat.range(0, np)) { touched(e[p]); touched(e[p + 1]); p += 3 };
+            let nc = e[p]; for (j in Nat.range(0, nc)) touched(e[p + 1 + j]); p += 1 + nc;
+            let ns = e[p]; for (j in Nat.range(0, ns)) touched(e[p + 1 + 2 * j]);
+          };
+          case (_) {};
+        };
+      };
+      case (_) {};
+    };
+    Iter.toArray(Map.entries(out))
+  };
+  /// The most entries one page of a drop copy holds.
+  public let MAX_DROP_PAGE = 100;
+  /// A member's drop copy from block `from` (SPEC §14): up to `limit` entries (at most `MAX_DROP_PAGE`), each the block's
+  /// index, whether it is the member's own, and the stored block (its own) or the block's public message (not its own);
+  /// and the block to read from next, when more remain.
+  public func dropCopy(s : State, member : Nat, from : Nat, limit : Nat) : { entries : [(Nat, Bool, Blob)]; next : ?Nat } {
+    let want = Nat.max(1, Nat.min(limit, MAX_DROP_PAGE));
+    // one row more than the page, to know where the next page starts; the row store may answer in several pages
+    let rows = List.empty<DropRow>();
+    var cursor : ?Page.Cursor = null;
+    label reading loop {
+      switch (RS.page(s.dropStore, dropRows, "byMember", R.key2(member, 8, from, 8), R.key2(member, 8, 2 ** 64 - 1, 8), cursor, want + 1 - List.size(rows))) {
+        case (#ok(p)) { for ((_, row) in p.rows.vals()) List.add(rows, row); if (List.size(rows) > want) break reading; switch (p.next) { case (?n) cursor := ?n; case null break reading } };
+        case (#err(_)) break reading;
+      };
+    };
+    let all = List.toArray(rows);
+    let page = Array.sliceToArray<DropRow>(all, 0, Nat.min(want, all.size()));
+    let entries = Array.map<DropRow, (Nat, Bool, Blob)>(page, func(row) {
+      let bytes = if (row.own) { switch (DL.rawBlock(s.log, row.block)) { case (?raw) raw; case null Runtime.trap("drop copy: a block does not read") } }
+        else { switch (DL.get(s.log, K.codec, row.block)) { case (?bk) F.message(bk); case null Runtime.trap("drop copy: a block does not read") } };
+      (row.block, row.own, bytes)
+    });
+    { entries; next = if (all.size() > want) ?all[want].block else null }
+  };
+  public func flushDue(s : State, now : Nat64, caller : Principal) : ?Nat { let r = flushDueAt(s, now, caller); feedTo(s); r };
+  func flushDueAt(s : State, now : Nat64, caller : Principal) : ?Nat {
     let pending : Nat64 = if (s.batchTime != 0) s.batchTime else if (s.dueCount > 0) s.lastTime else 0;
     if (pending == 0 or now <= pending) return null;
     let (block, _) = appendExecuted(s, now, caller, null, K.registry.current, #clear({ time = pending }));
@@ -1172,7 +1437,10 @@ module {
 
 
   public func submit(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {
-    ignore flushDue(s, now, caller);
+    let r = submitAt(s, xs, auth, now, caller, c, partition, justification); feedTo(s); r
+  };
+  func submitAt(s : State, xs : X.State, auth : Authority, now : Nat64, caller : Principal, c : T.Command, partition : ?Text, justification : Text) : Result<Outcome> {
+    ignore flushDueAt(s, now, caller);
     let perm = permissionOf(c);
     if (not auth.hasGrant(caller, perm.id)) return #err(#auth(#NoGrant({ permission = perm.id })));
     switch (validate(s, xs, now, caller, c)) { case (?e) return #err(#book(e)); case null {} };
@@ -1209,7 +1477,10 @@ module {
     ?{ index = id; commandHash = p.commandHash; commandEncoding = p.commandEncoding; permission = p.permission; partition = p.partition; maker = p.maker; required = p.required; eligibleRole = p.eligibleRole; expiresAt = p.expiresAt; justification = p.justification; approvals; status }
   };
   public func approve(s : State, xs : X.State, auth : Authority, now : Nat64, checker : Principal, id : Cmd.ProposalId) : Result<Outcome> {
-    ignore flushDue(s, now, checker);
+    let r = approveAt(s, xs, auth, now, checker, id); feedTo(s); r
+  };
+  func approveAt(s : State, xs : X.State, auth : Authority, now : Nat64, checker : Principal, id : Cmd.ProposalId) : Result<Outcome> {
+    ignore flushDueAt(s, now, checker);
     if (not auth.hasGrant(checker, "command.approve")) return #err(#auth(#NoGrant({ permission = "command.approve" })));
     let ?e = proposal(s, id) else return #err(#auth(#ProposalNotAwaiting({ index = id })));
     switch (MC.checkApprover(e, checker, auth.holdsRole(checker, e.eligibleRole), now)) { case (?err) return #err(#auth(err)); case null {} };
@@ -1255,7 +1526,11 @@ module {
       };
     }
   };
-  public func replay(fresh : State) : Fold.Report { Fold.replay<K.Event, State>(fresh.log, K.codec, func(_ : Nat) : ?Blob { null }, fresh, applyBlock) };
+  public func replay(fresh : State) : Fold.Report {
+    let r = Fold.replay<K.Event, State>(fresh.log, K.codec, func(_ : Nat) : ?Blob { null }, fresh, applyBlock);
+    feedTo(fresh);
+    r
+  };
   public func fingerprint(s : State) : Blob {
     let f = Fold.newFingerprint();
     func table<Rw>(name : Text, store : RS.Store, decl : RS.Decl<Rw>, next : Nat) {
@@ -1265,12 +1540,17 @@ module {
     table<T.Balance>("balances", s.balanceRows, balances, s.nextBalance);
     table<RefRow>("depositrefs", s.refRows, refs, s.nextRef);
     // instruments and dues are keyed by the exchange's instrument id
-    Fold.section(f, "instruments", func(w : C.Writer) { var i = 1; while (i <= 4_096) { switch (RS.get(s.instrumentRows, instruments, i)) { case (?r) { w.nat(i); w.blob(instruments.encode(r)) }; case null {} }; i += 1 } });
-    Fold.section(f, "due", func(w : C.Writer) { var i = 1; while (i <= 4_096) { switch (RS.get(s.dueRows, dues, i)) { case (?r) { if (r.due) w.nat(i) }; case null {} }; i += 1 } });
+    Fold.section(f, "instruments", func(w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.instrumentRows, instruments, i)) { case (?r) { w.nat(i); w.blob(instruments.encode(r)) }; case null {} } } });
+    Fold.section(f, "due", func(w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.dueRows, dues, i)) { case (?r) { if (r.due) w.nat(i) }; case null {} } } });
     Fold.section(f, "batch", func(w : C.Writer) { w.nat64(s.batchTime) });
     Fold.section(f, "proposals", func(w : C.Writer) { var i = 0; let n = DL.length(s.log); while (i < n) { switch (RS.get(s.proposalRows, proposals, i)) { case (?r) { w.nat(i); w.blob(MC.encodeProposalRow(r)) }; case null {} }; i += 1 } });
     table<T.Kill>("kills", s.killRows, kills, s.nextKill);
     table<LimitRow>("limits", s.limitStore, limitRows, s.nextLimit);
+    Fold.section(f, "feed", func(w : C.Writer) { w.nat(s.feedNext); w.blobRaw(s.feedHead) });
+    table<DropRow>("drops", s.dropStore, dropRows, s.nextDrop);
+    Fold.section(f, "stats", func(w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.statStore, statRows, i)) { case (?r) { w.nat(i); w.blob(statRows.encode(r)) }; case null {} } } });
+    table<DayRow>("days", s.dayStore, dayRows, s.nextDayRow);
+    table<SealRow>("seals", s.sealStore, sealRows, s.nextSeal);
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
@@ -1287,7 +1567,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 16) {
+    while (left > 0 and run.part < 24) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -1296,8 +1576,8 @@ module {
         case 3 { if (run.cursor < s.nextBalance) { switch (RS.get(s.balanceRows, balances, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(balances.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 4 };
         case 4 { w.text("depositrefs"); w.nat(s.nextRef); run.part := 5; run.cursor := 1 };
         case 5 { if (run.cursor < s.nextRef) { switch (RS.get(s.refRows, refs, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(refs.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 6 };
-        case 6 { w.text("instruments"); var i = 1; while (i <= 4_096) { switch (RS.get(s.instrumentRows, instruments, i)) { case (?r) { w.nat(i); w.blob(instruments.encode(r)) }; case null {} }; i += 1 }; run.part := 7 };
-        case 7 { w.text("due"); var i = 1; while (i <= 4_096) { switch (RS.get(s.dueRows, dues, i)) { case (?r) { if (r.due) w.nat(i) }; case null {} }; i += 1 }; run.part := 8 };
+        case 6 { w.text("instruments"); for (i in s.instrumentList.vals()) { switch (RS.get(s.instrumentRows, instruments, i)) { case (?r) { w.nat(i); w.blob(instruments.encode(r)) }; case null {} } }; run.part := 7 };
+        case 7 { w.text("due"); for (i in s.instrumentList.vals()) { switch (RS.get(s.dueRows, dues, i)) { case (?r) { if (r.due) w.nat(i) }; case null {} } }; run.part := 8 };
         case 8 { w.text("batch"); w.nat64(s.batchTime); run.part := 9 };
         case 9 { w.text("proposals"); run.part := 10; run.cursor := 0 };
         case 10 { if (run.cursor < run.logLength) { switch (RS.get(s.proposalRows, proposals, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(MC.encodeProposalRow(r)) }; case null {} }; run.cursor += 1 } else run.part := 11 };
@@ -1305,12 +1585,20 @@ module {
         case 12 { if (run.cursor < s.nextKill) { switch (RS.get(s.killRows, kills, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(kills.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 13 };
         case 13 { w.text("limits"); w.nat(s.nextLimit); run.part := 14; run.cursor := 1 };
         case 14 { if (run.cursor < s.nextLimit) { switch (RS.get(s.limitStore, limitRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(limitRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 15 };
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 16 };
+        case 15 { w.text("feed"); w.nat(s.feedNext); w.blobRaw(s.feedHead); run.part := 16 };
+        case 16 { w.text("drops"); w.nat(s.nextDrop); run.part := 17; run.cursor := 1 };
+        case 17 { if (run.cursor < s.nextDrop) { switch (RS.get(s.dropStore, dropRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(dropRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 18 };
+        case 18 { w.text("stats"); for (i in s.instrumentList.vals()) { switch (RS.get(s.statStore, statRows, i)) { case (?r) { w.nat(i); w.blob(statRows.encode(r)) }; case null {} } }; run.part := 19 };
+        case 19 { w.text("days"); w.nat(s.nextDayRow); run.part := 20; run.cursor := 1 };
+        case 20 { if (run.cursor < s.nextDayRow) { switch (RS.get(s.dayStore, dayRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(dayRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 21 };
+        case 21 { w.text("seals"); w.nat(s.nextSeal); run.part := 22; run.cursor := 1 };
+        case 22 { if (run.cursor < s.nextSeal) { switch (RS.get(s.sealStore, sealRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(sealRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 23 };
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 24 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 16) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 24) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };

@@ -51,15 +51,15 @@ module {
       };
       case (#setTrading(x)) { w.byte(2); w.nat(x.instrument); w.bool(x.open) };
       case (#setReference(x)) { w.byte(3); w.nat(x.instrument); w.nat(x.price) };
-      case (#deposit(x)) { w.byte(4); w.nat(x.account); w.principal(x.ledger); w.nat(x.amount); w.blob(x.reference) };
-      case (#withdraw(x)) { w.byte(5); w.nat(x.account); w.principal(x.ledger); w.nat(x.amount) };
+      case (#deposit(x)) { w.byte(4); w.nat(x.account); w.nat(x.member); w.principal(x.ledger); w.nat(x.amount); w.blob(x.reference) };
+      case (#withdraw(x)) { w.byte(5); w.nat(x.account); w.nat(x.member); w.principal(x.ledger); w.nat(x.amount) };
       case (#placeOrder(x)) {
         w.byte(6); w.nat(x.account); w.nat(x.instrument); w.byte(sideCode(x.side)); w.byte(kindCode(x.kind)); w.nat(x.qty); w.nat(x.price); w.nat(x.stopPrice); w.nat(x.peak);
         w.byte(validityCode(x.validity)); w.nat(x.gtdDay); w.byte(selfTradeCode(x.selfTrade)); w.byte(capacityCode(x.capacity)); w.bool(x.shortSale); w.text(x.clientRef); w.nat(x.oco); w.nat(x.trail); w.nat(x.member); w.nat(x.trader)
       };
       case (#cancelOrder(x)) { w.byte(7); w.nat(x.order) };
       case (#amendOrder(x)) { w.byte(8); w.nat(x.order); w.nat(x.qty); w.nat(x.price) };
-      case (#massCancel(x)) { w.byte(9); w.nat(x.account); w.nat(x.limit) };
+      case (#massCancel(x)) { w.byte(9); w.nat(x.account); w.nat(x.member); w.nat(x.limit) };
       case (#flush) { w.byte(10) };
       case (#endOfDay(x)) { w.byte(11); w.nat(x.limit) };
       case (#expireGtd(x)) { w.byte(12); w.nat(x.day); w.nat(x.limit) };
@@ -72,6 +72,7 @@ module {
       case (#killSweep(x)) { w.byte(19); w.nat(x.kill); w.nat(x.limit) };
       case (#revive(x)) { w.byte(20); w.nat(x.kill) };
       case (#setLimits(x)) { w.byte(21); w.nat(x.member); w.nat(x.maxOrderQty); w.nat(x.maxOrderValue); w.nat(x.creditLimit) };
+      case (#sealDay(x)) { w.byte(22); w.nat(x.day) };
     };
     true
   };
@@ -86,8 +87,8 @@ module {
       };
       case 2 { let ?instrument = r.nat() else return null; let ?open = r.bool() else return null; ?#setTrading({ instrument; open }) };
       case 3 { let ?instrument = r.nat() else return null; let ?price = r.nat() else return null; ?#setReference({ instrument; price }) };
-      case 4 { let ?account = r.nat() else return null; let ?ledger = r.principal() else return null; let ?amount = r.nat() else return null; let ?reference = r.blob() else return null; ?#deposit({ account; ledger; amount; reference }) };
-      case 5 { let ?account = r.nat() else return null; let ?ledger = r.principal() else return null; let ?amount = r.nat() else return null; ?#withdraw({ account; ledger; amount }) };
+      case 4 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?ledger = r.principal() else return null; let ?amount = r.nat() else return null; let ?reference = r.blob() else return null; ?#deposit({ account; member; ledger; amount; reference }) };
+      case 5 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?ledger = r.principal() else return null; let ?amount = r.nat() else return null; ?#withdraw({ account; member; ledger; amount }) };
       case 6 {
         let ?account = r.nat() else return null; let ?instrument = r.nat() else return null; let ?sc = r.byte() else return null; let ?side = sideOf(sc) else return null;
         let ?kc = r.byte() else return null; let ?kind = kindOf(kc) else return null; let ?qty = r.nat() else return null; let ?price = r.nat() else return null;
@@ -100,7 +101,7 @@ module {
       };
       case 7 { let ?order = r.nat() else return null; ?#cancelOrder({ order }) };
       case 8 { let ?order = r.nat() else return null; let ?qty = r.nat() else return null; let ?price = r.nat() else return null; ?#amendOrder({ order; qty; price }) };
-      case 9 { let ?account = r.nat() else return null; let ?limit = r.nat() else return null; ?#massCancel({ account; limit }) };
+      case 9 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?limit = r.nat() else return null; ?#massCancel({ account; member; limit }) };
       case 10 ?#flush;
       case 11 { let ?limit = r.nat() else return null; ?#endOfDay({ limit }) };
       case 12 { let ?day = r.nat() else return null; let ?limit = r.nat() else return null; ?#expireGtd({ day; limit }) };
@@ -113,6 +114,7 @@ module {
       case 19 { let ?kill = r.nat() else return null; let ?limit = r.nat() else return null; ?#killSweep({ kill; limit }) };
       case 20 { let ?kill = r.nat() else return null; ?#revive({ kill }) };
       case 21 { let ?member = r.nat() else return null; let ?maxOrderQty = r.nat() else return null; let ?maxOrderValue = r.nat() else return null; let ?creditLimit = r.nat() else return null; ?#setLimits({ member; maxOrderQty; maxOrderValue; creditLimit }) };
+      case 22 { let ?day = r.nat() else return null; ?#sealDay({ day }) };
       case _ null;
     }
   };
@@ -120,14 +122,14 @@ module {
   public let registry : E.Registry<T.Command> = { domainPrefix = "tachyon-book-command"; current = 1; encoders = [{ version = 1; write = writeV1; read = readV1 }] };
 
   public let families : [Text] = ["openInstrument", "setTrading", "setReference", "deposit", "withdraw", "placeOrder", "cancelOrder", "amendOrder", "massCancel", "flush", "endOfDay", "expireGtd", "clear",
-    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits"];
+    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
       case (#withdraw(_)) "withdraw"; case (#placeOrder(_)) "placeOrder"; case (#cancelOrder(_)) "cancelOrder"; case (#amendOrder(_)) "amendOrder";
       case (#massCancel(_)) "massCancel"; case (#flush) "flush"; case (#endOfDay(_)) "endOfDay"; case (#expireGtd(_)) "expireGtd"; case (#clear(_)) "clear";
       case (#setPhase(_)) "setPhase"; case (#uncross(_)) "uncross"; case (#halt(_)) "halt"; case (#resume(_)) "resume"; case (#kill(_)) "kill"; case (#killSweep(_)) "killSweep";
-      case (#revive(_)) "revive"; case (#setLimits(_)) "setLimits";
+      case (#revive(_)) "revive"; case (#setLimits(_)) "setLimits"; case (#sealDay(_)) "sealDay";
     }
   };
 

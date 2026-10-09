@@ -103,8 +103,10 @@ module {
     #setReference : { instrument : InstrumentId; price : Nat };
     /// The depository's attestation that `amount` reached the venue's account on `ledger` for `account`, by the
     /// reference of that transfer (32 bytes), recorded once.
-    #deposit : { account : AccountId; ledger : Principal; amount : Nat; reference : Blob };
-    #withdraw : { account : AccountId; ledger : Principal; amount : Nat };
+    /// Funds and the mass cancel name the account's member (checked against the exchange's rows), so the log alone says
+    /// which member every block concerns (the drop copy, SPEC §14).
+    #deposit : { account : AccountId; member : Nat; ledger : Principal; amount : Nat; reference : Blob };
+    #withdraw : { account : AccountId; member : Nat; ledger : Principal; amount : Nat };
     #placeOrder : {
       account : AccountId; instrument : InstrumentId; side : Side; kind : Kind; qty : Nat; price : Nat; stopPrice : Nat; peak : Nat;
       validity : Validity; gtdDay : Day; selfTrade : SelfTrade; capacity : Capacity; shortSale : Bool; clientRef : Text; oco : OrderId; trail : Nat;
@@ -112,7 +114,7 @@ module {
     };
     #cancelOrder : { order : OrderId };
     #amendOrder : { order : OrderId; qty : Nat; price : Nat };
-    #massCancel : { account : AccountId; limit : Nat };
+    #massCancel : { account : AccountId; member : Nat; limit : Nat };
     /// The scheduler records a due clear when no other command arrives to do so.
     #flush;
     #endOfDay : { limit : Nat };
@@ -124,10 +126,13 @@ module {
     #uncross : { instrument : InstrumentId; next : Phase };
     #halt : { instrument : InstrumentId; reason : Text };
     #resume : { instrument : InstrumentId };
+    /// A kill names its member; with a trader (not 0) it kills that trader of the member only.
     #kill : { member : Nat; trader : Nat; reason : Text };
     #killSweep : { kill : Nat; limit : Nat };
     #revive : { kill : Nat };
     #setLimits : { member : Nat; maxOrderQty : Nat; maxOrderValue : Nat; creditLimit : Nat };
+    /// The scheduler seals the market day (SPEC §15): the day's file written, its hash recorded, a new session begun.
+    #sealDay : { day : Nat };
   };
 
   /// Effects: a flat list of numbers, the family tag first (`BookCore.apply` gives each family's layout).

@@ -195,8 +195,8 @@ An instrument carries a **static band** (`staticBps`) around its reference price
 
 - **Halt and resume** (four eyes, with a reason): a halt takes the instrument to halted from any phase; a resumption
   takes it to an auction (no window), uncrossed by the scheduler.
-- **Kill switch:** the operator, or a trader of the member, kills a member or one trader of it: from that act no order
-  of the target is accepted or amended. `killSweep` cancels its open orders, up to 500 an act, in order number order,
+- **Kill switch:** the operator, or a trader of the member, kills a member or one trader of it (the act always names the
+  member; with a trader, that trader only): from that act no order of the target is accepted or amended. `killSweep` cancels its open orders, up to 500 an act, in order number order,
   until none is left. The block holds until a `revive` under four eyes, refused while any order of the target is open.
   Every order records its member and the trader that entered it (both checked against the exchange's rows at entry).
 - **Risk limits per member** (four eyes): a maximum order quantity, a maximum order value and a credit limit (0 for
@@ -208,3 +208,77 @@ An instrument carries a **static band** (`staticBps`) around its reference price
 
 An instrument opens in the book with the exchange's reference price for it (the offering's hand-off): an opening that
 names another is refused, so its first auction's reference and bands are the hand-off's.
+
+## 13. The public feed
+
+The feed is the book's log, projected: one message for every block, in the log's order, its sequence the block's index.
+It names no account, member, trader, client reference or caller. A consumer that applies the messages in order holds
+every order the book shows, at the price and quantity it shows, and every instrument's phase, after every block.
+
+**What an order shows.** A live order shows its remaining quantity; an iceberg its peak, or what remains when less. A
+waiting stop shows nothing until a clear triggers it. The log records what becomes visible, so the feed needs nothing
+but the log: a placed order's effects carry the price it rests at (a market order's collar) and the quantity it shows
+(0 unless live); an amendment's carry what the order shows after it (0 for a waiting stop); a clear's carry, for each
+stop it triggers, the order, its side, its price and what it shows, and, after the trades, each iceberg that traded and
+stays live with what it shows; an uncross's carry the same for its icebergs.
+
+**The message** (the kernel's canonical writer): a version byte (1), the sequence (nat), the block's time (nat64), a kind
+byte, then:
+
+| Kind | From | Body |
+|---|---|---|
+| 0 | a proposal, an approval, a rejection, an expiry; a deposit, a withdrawal, a kill, a revival, risk limits, a flush; a placed stop (it waits hidden) | nothing |
+| 1 instrument | openInstrument | instrument, lot, reference price, bands (count, then from-price and tick each), collar, static and dynamic bands, interruption seconds |
+| 2 trading | setTrading | instrument, open (bool) |
+| 3 reference | setReference | instrument, price |
+| 4 add | a placed live order | order, instrument, side (1 buy, 2 sell), price, shown, then the account's own orders it cancelled (count, orders) |
+| 5 remove | a cancel; a mass cancel, the day's sweep, the dated sweep, a kill's sweep (their effects' orders); an order cancelled with the resting (its cancelled resting orders) | count, orders |
+| 6 amend | an amendment of a live order | order, price, shown, priority kept (bool) |
+| 7 clear | a clear | count of instruments, then each: instrument, price, volume, pairs (count, then buy, sell, quantity), removed (count, orders), revealed (count, then order, side, price, shown), shown (count, then order, shown), interrupted (bool) |
+| 8 phase | setPhase, halt, resume | instrument, phase byte (§8 codes), window from and to (nat64; 0 for none), reason (a halt's; empty otherwise) |
+| 9 uncross | an uncross | instrument, price, volume, pairs, removed, shown (as in a clear), phase after |
+| 10 day | the day's seal (§15) | day, rows, the file's hash |
+
+An amendment of a waiting stop is kind 0. A removal may name an order the feed never showed (a waiting stop cancelled):
+a consumer ignores an order it does not hold. Within a clear's instrument, a consumer applies the revealed orders, then
+the pairs (each reduces both orders' shown quantity; an order whose shown quantity reaches 0 and which the shown list
+does not name is gone), then the removed, then the shown list, then the interruption (the instrument enters an
+auction). An uncross's phase after sets the phase; an interruption, a halt (halted) and a resumption (auction) set it.
+
+**The chain.** The feed hash of block n is SHA-256 of the text `thebes.book.feed.v1` written canonically, the feed hash
+of block n − 1 (32 zero bytes before block 0), and the message. The book keeps the hash of every block and the head
+(the last), in its fingerprint; a consumer that recomputes the chain over what it received detects a gap, a reordering
+or an altered message at the first message it fails on.
+
+## 14. The drop copy
+
+A member's drop copy is every block of the log that concerns it, in the log's order, and nothing else. A block concerns a
+member when its command names the member (a placement, a deposit, a withdrawal, a mass cancel, a kill and risk limits
+carry the member; the exchange's rows are checked to agree), names an order of the member (a cancel, an amendment), names
+a kill of the member (its sweep, its revival), or when its effects name an order of the member (a clear's or an
+uncross's pairs, removed, revealed and shown orders; a sweep's orders). A proposal, an approval, a rejection or an expiry
+concerns no member: the execution it leads to does.
+
+An entry is the block's index, whether the block is the member's own (its command names the member, its account, its
+order or its kill), and the block: the stored block itself when it is the member's own, the block's public message
+(§13) otherwise, so that no entry carries another member's account, client reference or trader, or the caller of a
+block that is not the member's. The book keeps, for every member, the index of its blocks, written with the feed; the
+drop copy is read in pages from a block index, scoped to the caller's member.
+
+
+## 15. The day's statistics and its sealed file
+
+**The session's statistics.** For every instrument the book keeps, since the last seal: the first, highest, lowest and
+last price traded, the closing auction's price (the closing price an uncross out of the closing auction fixes; 0 when
+none ran), the volume, the value (price × quantity, summed) and the number of trades (pairs), every one updated by every
+pair of a clear or an uncross.
+
+**The seal.** `sealDay(day)`, the scheduler's: `day` must be the market day of the act's time (the exchange's clock) and
+later than every day sealed before. It writes the day's file, records each instrument's statistics as the day's, and
+starts a new session (every instrument's statistics back to nothing). Its effects are the day, the number of rows and
+the file's SHA-256, one effect per byte; its feed message (kind 10) carries the same.
+
+**The file** (the kernel's canonical writer): the text `thebes.book.day.v1`, the day, the number of rows (two bytes),
+then for every instrument the book holds, in instrument order: the instrument, the first, high, low and last prices,
+the closing price, the volume, the value, the trades and the reference price at the seal. Anyone holding the log
+rebuilds it byte for byte and its hash with it.
