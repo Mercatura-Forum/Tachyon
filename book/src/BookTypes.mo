@@ -140,6 +140,28 @@ module {
     /// The depository attests a securities loan: the shares credited and recorded owed; a trader returns them (§17).
     #borrow : { account : AccountId; member : Nat; instrument : InstrumentId; qty : Nat; reference : Blob };
     #returnBorrow : { account : AccountId; member : Nat; instrument : InstrumentId; qty : Nat };
+    /// The central counterparty (SPEC §18 to §21): the market's clearing terms and an instrument's margin (four eyes). The
+    /// CCP's account, its member and the clearing currency are fixed by the first; the parameters may change after.
+    #setClearing : { ccpAccount : AccountId; ccpMember : Nat; cashLedger : Principal; cycleSecs : Nat; cycleDays : Nat; penaltyBps : Nat; deadlineCycles : Nat; fundBps : Nat; fundFloor : Nat };
+    #setMargin : { instrument : InstrumentId; imBps : Nat };
+    /// A clearing member admitted (its settlement account and credit line) and an account designated (four eyes).
+    #admitClearing : { member : Nat; settlementAccount : AccountId; creditLine : Nat };
+    #designateClearing : { account : AccountId; member : Nat };
+    /// A member's collateral, posted from or withdrawn to its settlement account (a trader of the member).
+    #postCollateral : { member : Nat; amount : Nat };
+    #withdrawCollateral : { member : Nat; amount : Nat };
+    /// The scheduler's cut of the open cycle, with the market day it settles on (0 when it settles at once, §19), the
+    /// settlement of the oldest cut cycle, and the close-out of a failing member's shares in an instrument (§20).
+    #cutCycle : { cycle : Nat; settleDay : Nat };
+    #settleCycle : { cycle : Nat };
+    #closeOut : { member : Nat; instrument : InstrumentId };
+    /// The guarantee fund: the scheduler's call, a member's contribution, the venue's skin-in-the-game (§21).
+    #callFund;
+    #contributeFund : { member : Nat; amount : Nat };
+    #fundSkin : { account : AccountId; amount : Nat };
+    /// Default (four eyes): declared, then closed through the waterfall (§21).
+    #declareDefault : { member : Nat; reason : Text };
+    #closeDefault : { member : Nat };
   };
 
   /// Effects: a flat list of numbers, the family tag first (`BookCore.apply` gives each family's layout).
@@ -181,5 +203,10 @@ module {
     #UnknownBlackout : { blackout : Nat };
     #ShortSaleNotFlagged : { free : Nat; wanted : Nat };
     #ShortSalePrice : { price : Nat; floor : Nat };
+    #MarginShort : { required : Nat; available : Nat };
+    #LiquidityShort : { needed : Nat; free : Nat };
+    #NotClearing : { member : Nat };
+    #CycleNotDue : { due : Nat };
+    #FundShort : { required : Nat; paid : Nat };
   };
 };

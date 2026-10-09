@@ -305,3 +305,103 @@ reduces what is owed. What an account owns free of other sales is its available 
   instrument's last trade price (its reference price before any trade); otherwise it is refused (ShortSalePrice). An
   amendment of it is judged on its new price.
 - A return may not exceed what is owed nor what is available.
+
+## 18. The central counterparty and clearing accounts
+
+Two kinds of account trade on one book. A **pre-funded** account is as §4 describes: funds held at entry, its fill final
+at the fill (BIS DvP Model 1). A **clearing** account belongs to a clearing member and is designated under four eyes;
+its fills are **novated** to the venue's central counterparty (the CCP), which faces every clearing member, and settle
+in a cycle (§19). An account is designated only while it has no open order, and a designation is permanent, so an
+order's kind is its account's at entry for its whole life.
+
+**The market's clearing terms** (four eyes): the CCP's account (an exchange account of the CCP's member, empty and with
+no order when first named), its member and the clearing currency (fixed by the first act), the cycle (seconds, or a
+number of business days, §19), the fail penalty in basis points, the deadline in failed cycles before a close-out, the
+guarantee fund's rate in basis points of a member's largest cycle purchase and its floor. Per instrument, the initial
+margin in basis points of value (four eyes). The CCP's account moves only by clearing: no deposit, withdrawal, loan or
+trader's order on it.
+
+**A clearing member** (four eyes; at most 64) has a settlement account (one of its accounts, where its cash and
+shares settle), a credit line, and the CCP holds for it: its collateral (cash posted from its settlement account and
+withdrawn within its requirement and the CCP's free cash), its guarantee fund contribution, its **custody** (the shares
+it bought and not yet delivered, and the shares pledged for its sales), and its cash obligations in the cycles not yet
+settled (owed to it, owed by it).
+
+**At entry**, a clearing account's order:
+- a **buy** holds no funds; it holds its initial margin (the instrument's rate × price × quantity, rounded up; a market
+  order at its collar) in its member's requirement, and is refused (FundShort) while the member's fund contribution is
+  below its requirement; refused (MarginShort) unless the requirement — the open buys' margin, this one's, and the
+  variation margin (what the member owes in unsettled cycles and rolled debt beyond what it is owed and its custody's
+  value at the last price, at least 0) — stays within its collateral plus its credit line; and refused
+  (LiquidityShort) unless the CCP's free cash (its account's cash less the open clearing buys' value it is committed
+  to) covers the order's value;
+- a **sale** is covered (§17) by the member's shares: what the CCP holds for it free of its sales, then its settlement
+  account's (free of loans unless flagged short). Its shares are **pledged**: taken from the custody's free shares
+  first, the rest moved from the settlement account into the CCP's account.
+An amendment is judged the same way on what it adds.
+
+**At the fill**, each pair settles as its parties' kinds say:
+- a pre-funded buyer pays out of what it holds at its own price (the difference returns) and receives the shares; a
+  pre-funded seller delivers what it holds and is paid;
+- a clearing buyer's member owes the value in the open cycle and the shares join its custody; a clearing seller's
+  member is owed the value and its pledged shares leave its custody;
+- where one side is pre-funded and the other clearing, the CCP pays or is paid, receives or delivers, at the fill: a
+  pre-funded party's fill is final at the fill whatever its counterparty.
+A clearing buy's margin falls with what remains of it.
+
+## 19. The netting cycle (Model 3 per cycle) and the settlement range
+
+The scheduler **cuts** the open cycle: in a market of seconds, no sooner than the cycle's length after the last cut,
+and only once the last cut cycle is settled (the cycle settles at once); in a market of business days (T+n, the
+EGX's T+2), once a market day, naming the settlement day the exchange's calendar gives — n business days after the
+market day, holidays and rest days skipped — so up to n + 1 cycles are pending at once.
+
+`settleCycle` settles the oldest cut cycle when due (its settlement day reached), every clearing member not closed,
+all or nothing. Each member's side is fixed before any leg moves, from the cycle as cut: what it owes (its purchases
+in the cycle and its rolled debt) against what it is owed (its sales in the cycle). Payers first, so receivers are paid
+out of what the payers brought in:
+- a payer pays its net from its settlement account if the account holds it; otherwise it **fails**: the net rolls as
+  its debt with the penalty added (the penalty accrues to the venue's skin-in-the-game), its failed cycles counted;
+- a receiver is paid its net within the CCP's free cash; what the CCP cannot pay rolls to it in the next cycle.
+A member that owes nothing after the cycle, and is not in default, receives the shares the CCP holds for it free of its
+sales and of its purchases in later cycles (delivery against payment: shares bought in a cycle are delivered only when
+that cycle is paid). A member's net equals the sum of its gross obligations in the cycle, signed.
+
+**The settlement range.** Every movement between two of the venue's accounts is a **leg**, appended to a Merkle
+mountain range under the kernel's proof hashing (`MmrProof`: leaf SHA-256(0x00 ‖ leg), node SHA-256(0x01 ‖ left ‖
+right), the root bagging the peaks from the highest): kind 1, a pre-funded party's gross fill (its cash and its
+shares); kind 2, a cycle's net payment, receipt or delivery; kind 3, a transfer to or from the CCP outside a fill or a
+cycle (a sale's pledge, collateral, a fund contribution, the venue's skin). A leg records its kind, the ledger, the two
+accounts, the units and the block that settled it; each account's holding in a ledger is therefore its deposits and
+loans less its withdrawals and returns, plus its legs in, less its legs out. The root at any earlier leg count stays
+computable, and a leg's inclusion proof is given against the root at any count that holds it.
+
+**Custody composed with the book.** The custody register admits a leg as a receipt (`admitLeg`) only with its
+inclusion proof against the book's own root at the count the command names, the host composing the register with the
+book supplying that root; the holders are the holders the custodian linked to the leg's accounts under four eyes, the
+units and the ledger the leg's, and each leg is admitted once.
+
+## 20. Fails and close-out
+
+A member that has failed the deadline's number of cycles in a row, or is in default, is **closed out** by the
+scheduler, one instrument at a time: the CCP's account sells, as a market order at the collar, the whole lots of the
+member's custody free of its sales; the order holds those custody shares. As it fills, the proceeds pay the member's
+debt, and what exceeds the debt is owed to the member in the open cycle. This is a cash fail's resolution (CSDR's
+sell-out); sales being covered and pledged at entry, a trade cannot fail on its delivery side, so a securities buy-in
+cannot arise.
+
+## 21. The guarantee fund, default and the waterfall
+
+The scheduler **calls** the fund: each active clearing member's requirement is the larger of the floor's share (the
+floor over the active members, rounded up) and the fund's rate × its largest cycle purchase, both from the fold. A
+member pays its contribution from its settlement account, up to its requirement. The venue funds its skin-in-the-game
+from an account of the CCP's member (four eyes).
+
+A member is **declared in default** under four eyes: its member is killed (§11), and its kill is not revived before
+its waterfall. Once its orders are cancelled, its shares sold and its cycles settled, `closeDefault` (four eyes) meets
+what it still owes in this order: its collateral, its fund contribution, the venue's skin-in-the-game, then the other
+active members' contributions pro rata to them (whole units; the units left go to the largest remainders, ties in
+member order). What it had beyond its loss stays as its collateral, to withdraw; what no layer covers stays its debt;
+the member is closed. Every step is a recorded act, and the waterfall moves claims on the CCP's cash, not cash: the
+CCP's cash is always its members' collateral and contributions plus its skin plus what it is owed, less what it owes
+(checked after every act).

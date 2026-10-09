@@ -77,6 +77,20 @@ module {
       case (#liftBlackout(x)) { w.byte(24); w.nat(x.blackout) };
       case (#borrow(x)) { w.byte(25); w.nat(x.account); w.nat(x.member); w.nat(x.instrument); w.nat(x.qty); w.blob(x.reference) };
       case (#returnBorrow(x)) { w.byte(26); w.nat(x.account); w.nat(x.member); w.nat(x.instrument); w.nat(x.qty) };
+      case (#setClearing(x)) { w.byte(27); w.nat(x.ccpAccount); w.nat(x.ccpMember); w.principal(x.cashLedger); w.nat(x.cycleSecs); w.nat(x.cycleDays); w.nat(x.penaltyBps); w.nat(x.deadlineCycles); w.nat(x.fundBps); w.nat(x.fundFloor) };
+      case (#setMargin(x)) { w.byte(28); w.nat(x.instrument); w.nat(x.imBps) };
+      case (#admitClearing(x)) { w.byte(29); w.nat(x.member); w.nat(x.settlementAccount); w.nat(x.creditLine) };
+      case (#designateClearing(x)) { w.byte(30); w.nat(x.account); w.nat(x.member) };
+      case (#postCollateral(x)) { w.byte(31); w.nat(x.member); w.nat(x.amount) };
+      case (#withdrawCollateral(x)) { w.byte(32); w.nat(x.member); w.nat(x.amount) };
+      case (#cutCycle(x)) { w.byte(33); w.nat(x.cycle); w.nat(x.settleDay) };
+      case (#settleCycle(x)) { w.byte(34); w.nat(x.cycle) };
+      case (#closeOut(x)) { w.byte(35); w.nat(x.member); w.nat(x.instrument) };
+      case (#callFund) { w.byte(36) };
+      case (#contributeFund(x)) { w.byte(37); w.nat(x.member); w.nat(x.amount) };
+      case (#fundSkin(x)) { w.byte(38); w.nat(x.account); w.nat(x.amount) };
+      case (#declareDefault(x)) { w.byte(39); w.nat(x.member); w.text(x.reason) };
+      case (#closeDefault(x)) { w.byte(40); w.nat(x.member) };
     };
     true
   };
@@ -123,6 +137,25 @@ module {
       case 24 { let ?blackout = r.nat() else return null; ?#liftBlackout({ blackout }) };
       case 25 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?instrument = r.nat() else return null; let ?qty = r.nat() else return null; let ?reference = r.blob() else return null; ?#borrow({ account; member; instrument; qty; reference }) };
       case 26 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; let ?instrument = r.nat() else return null; let ?qty = r.nat() else return null; ?#returnBorrow({ account; member; instrument; qty }) };
+      case 27 {
+        let ?ccpAccount = r.nat() else return null; let ?ccpMember = r.nat() else return null; let ?cashLedger = r.principal() else return null; let ?cycleSecs = r.nat() else return null;
+        let ?cycleDays = r.nat() else return null; let ?penaltyBps = r.nat() else return null; let ?deadlineCycles = r.nat() else return null; let ?fundBps = r.nat() else return null;
+        let ?fundFloor = r.nat() else return null;
+        ?#setClearing({ ccpAccount; ccpMember; cashLedger; cycleSecs; cycleDays; penaltyBps; deadlineCycles; fundBps; fundFloor })
+      };
+      case 28 { let ?instrument = r.nat() else return null; let ?imBps = r.nat() else return null; ?#setMargin({ instrument; imBps }) };
+      case 29 { let ?member = r.nat() else return null; let ?settlementAccount = r.nat() else return null; let ?creditLine = r.nat() else return null; ?#admitClearing({ member; settlementAccount; creditLine }) };
+      case 30 { let ?account = r.nat() else return null; let ?member = r.nat() else return null; ?#designateClearing({ account; member }) };
+      case 31 { let ?member = r.nat() else return null; let ?amount = r.nat() else return null; ?#postCollateral({ member; amount }) };
+      case 32 { let ?member = r.nat() else return null; let ?amount = r.nat() else return null; ?#withdrawCollateral({ member; amount }) };
+      case 33 { let ?cycle = r.nat() else return null; let ?settleDay = r.nat() else return null; ?#cutCycle({ cycle; settleDay }) };
+      case 34 { let ?cycle = r.nat() else return null; ?#settleCycle({ cycle }) };
+      case 35 { let ?member = r.nat() else return null; let ?instrument = r.nat() else return null; ?#closeOut({ member; instrument }) };
+      case 36 ?#callFund;
+      case 37 { let ?member = r.nat() else return null; let ?amount = r.nat() else return null; ?#contributeFund({ member; amount }) };
+      case 38 { let ?account = r.nat() else return null; let ?amount = r.nat() else return null; ?#fundSkin({ account; amount }) };
+      case 39 { let ?member = r.nat() else return null; let ?reason = r.text() else return null; ?#declareDefault({ member; reason }) };
+      case 40 { let ?member = r.nat() else return null; ?#closeDefault({ member }) };
       case _ null;
     }
   };
@@ -130,7 +163,9 @@ module {
   public let registry : E.Registry<T.Command> = { domainPrefix = "tachyon-book-command"; current = 1; encoders = [{ version = 1; write = writeV1; read = readV1 }] };
 
   public let families : [Text] = ["openInstrument", "setTrading", "setReference", "deposit", "withdraw", "placeOrder", "cancelOrder", "amendOrder", "massCancel", "flush", "endOfDay", "expireGtd", "clear",
-    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay", "setBlackout", "liftBlackout", "borrow", "returnBorrow"];
+    "setPhase", "uncross", "halt", "resume", "kill", "killSweep", "revive", "setLimits", "sealDay", "setBlackout", "liftBlackout", "borrow", "returnBorrow",
+    "setClearing", "setMargin", "admitClearing", "designateClearing", "postCollateral", "withdrawCollateral", "cutCycle", "settleCycle", "closeOut", "callFund",
+    "contributeFund", "fundSkin", "declareDefault", "closeDefault"];
   public func familyOf(c : T.Command) : Text {
     switch (c) {
       case (#openInstrument(_)) "openInstrument"; case (#setTrading(_)) "setTrading"; case (#setReference(_)) "setReference"; case (#deposit(_)) "deposit";
@@ -139,6 +174,9 @@ module {
       case (#setPhase(_)) "setPhase"; case (#uncross(_)) "uncross"; case (#halt(_)) "halt"; case (#resume(_)) "resume"; case (#kill(_)) "kill"; case (#killSweep(_)) "killSweep";
       case (#revive(_)) "revive"; case (#setLimits(_)) "setLimits"; case (#sealDay(_)) "sealDay";
       case (#setBlackout(_)) "setBlackout"; case (#liftBlackout(_)) "liftBlackout"; case (#borrow(_)) "borrow"; case (#returnBorrow(_)) "returnBorrow";
+      case (#setClearing(_)) "setClearing"; case (#setMargin(_)) "setMargin"; case (#admitClearing(_)) "admitClearing"; case (#designateClearing(_)) "designateClearing";
+      case (#postCollateral(_)) "postCollateral"; case (#withdrawCollateral(_)) "withdrawCollateral"; case (#cutCycle(_)) "cutCycle"; case (#settleCycle(_)) "settleCycle"; case (#closeOut(_)) "closeOut";
+      case (#callFund) "callFund"; case (#contributeFund(_)) "contributeFund"; case (#fundSkin(_)) "fundSkin"; case (#declareDefault(_)) "declareDefault"; case (#closeDefault(_)) "closeDefault";
     }
   };
 

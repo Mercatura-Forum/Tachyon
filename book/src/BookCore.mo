@@ -10,6 +10,7 @@
 /// Attribution: Thebes Core Team.
 
 import Array "mo:core/Array";
+import VarArray "mo:core/VarArray";
 import Blob "mo:core/Blob";
 import Int "mo:core/Int";
 import Iter "mo:core/Iter";
@@ -34,6 +35,8 @@ import MC "mo:kernel/auth/MakerChecker";
 import RS "mo:kernel/rows/RowStore";
 import Page "mo:kernel/rows/Page";
 import R "mo:kernel/rows/StableRows";
+import MP "mo:kernel/proof/MmrProof";
+import Cal "mo:kernel/time/Calendar";
 
 import X "../../exchange/src/ExchangeCore";
 import XText "../../exchange/src/ExchangeText";
@@ -84,6 +87,20 @@ module {
     Perm.p("book.insider.lift", "insider", #close, #command("liftBlackout"), false, false, true),
     Perm.p("book.borrow.record", "borrow", #create, #command("borrow"), false, false, false),
     Perm.p("book.borrow.return", "borrow", #update, #command("returnBorrow"), false, false, false),
+    Perm.p("book.clearing.terms", "clearing", #update, #command("setClearing"), false, false, true),
+    Perm.p("book.clearing.margin", "clearing", #update, #command("setMargin"), false, false, true),
+    Perm.p("book.clearing.admit", "clearing", #create, #command("admitClearing"), false, false, true),
+    Perm.p("book.clearing.designate", "clearing", #create, #command("designateClearing"), false, false, true),
+    Perm.p("book.collateral.post", "collateral", #create, #command("postCollateral"), false, false, false),
+    Perm.p("book.collateral.withdraw", "collateral", #update, #command("withdrawCollateral"), false, false, false),
+    Perm.p("book.cycle.cut", "cycle", #create, #command("cutCycle"), false, false, false),
+    Perm.p("book.cycle.settle", "cycle", #update, #command("settleCycle"), false, false, false),
+    Perm.p("book.cycle.closeout", "cycle", #create, #command("closeOut"), false, false, false),
+    Perm.p("book.fund.call", "fund", #update, #command("callFund"), false, false, false),
+    Perm.p("book.fund.contribute", "fund", #create, #command("contributeFund"), false, false, false),
+    Perm.p("book.fund.skin", "fund", #create, #command("fundSkin"), false, false, true),
+    Perm.p("book.default.declare", "default", #create, #command("declareDefault"), false, false, true),
+    Perm.p("book.default.close", "default", #close, #command("closeDefault"), false, false, true),
     Perm.p("command.approve", "command", #approve, #method("approve"), false, false, false),
     Perm.p("command.reject", "command", #reject, #method("reject"), false, false, false),
   ] };
@@ -107,6 +124,13 @@ module {
     ("book.day.seal", "the scheduler seals the market day at its end: the day's statistics recorded and their file's hash written; it moves no order and no funds"),
     ("book.borrow.record", "the depository attests a securities loan settled at the custodian, as it attests a deposit: the shares credited and recorded owed"),
     ("book.borrow.return", "a trader of the member returns borrowed shares from its account; it moves what the account holds and what it owes, nothing else"),
+    ("book.collateral.post", "a trader of the clearing member moves cash from its settlement account to the CCP as its collateral; nothing else moves"),
+    ("book.collateral.withdraw", "a trader of the clearing member takes collateral back to its settlement account within its margin requirement and the CCP's free cash"),
+    ("book.cycle.cut", "the scheduler closes the open cycle when its length has passed, or at the day's end with the settlement day the calendar gives"),
+    ("book.cycle.settle", "the scheduler settles the oldest cut cycle when it is due; every amount is the fold's, none is typed"),
+    ("book.cycle.closeout", "the scheduler sells, at the collar, the shares the CCP holds for a member past its deadline or in default; the rule fixes the order"),
+    ("book.fund.call", "the scheduler sets each clearing member's fund requirement from its largest cycle purchase in the fold"),
+    ("book.fund.contribute", "a trader of the clearing member pays its fund contribution from its settlement account, up to the requirement"),
   ] };
   public let commandNames : [Text] = K.families;
   public let methodNames : [Text] = ["approve", "reject"];
@@ -271,6 +295,115 @@ module {
     decode = func(a : [Nat8]) : BorrowRow { { account = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); owed = R.getNat(a, 16, 8) } };
     indexes = [{ name = "byAccount"; keyBytes = 16; keyOf = func(_ : Nat, x : BorrowRow) : ?Blob { ?R.key2(x.account, 8, x.instrument, 8) } }];
   };
+  // ── the central counterparty (SPEC §18 to §21) ──
+  /// The market's clearing terms: the CCP's account and its member, the clearing currency, the cycle (seconds, or business
+  /// days when not 0), the fail penalty a cycle, the close-out deadline in cycles, the fund's rate and floor.
+  public type ClearingTerms = { ccpAccount : Nat; ccpMember : Nat; cashLedger : Principal; cycleSecs : Nat; cycleDays : Nat; penaltyBps : Nat; deadlineCycles : Nat; fundBps : Nat; fundFloor : Nat };
+  public let TERMS_BYTES = 94;   // account 8, member 8, ledger 30, six figures of 8
+  func encodeTerms(x : ClearingTerms) : Blob {
+    let b = R.buf(); R.putNat(b, x.ccpAccount, 8); R.putNat(b, x.ccpMember, 8); putPrincipal(b, x.cashLedger);
+    for (v in [x.cycleSecs, x.cycleDays, x.penaltyBps, x.deadlineCycles, x.fundBps, x.fundFloor].vals()) R.putNat(b, v, 8);
+    padded(b, TERMS_BYTES)
+  };
+  /// A clearing member's row: its settlement account and credit line; what the CCP holds for it (collateral, its fund
+  /// contribution) and the contribution required; its open buys' initial margin; its cash obligations in the cycles not
+  /// yet settled (owed to it, owed by it); a rolled fail's debt and the cycles it has failed in a row; its largest cycle
+  /// purchase; its status (1 active, 2 in default, 3 closed after default).
+  public type ClearingMember = {
+    member : Nat; settlementAccount : Nat; creditLine : Nat; collateral : Nat; fund : Nat; fundRequired : Nat; imOrders : Nat;
+    owedTo : Nat; owedBy : Nat; debt : Nat; fails : Nat; peak : Nat; status : Nat;
+  };
+  public let CLEARING_ROW_BYTES = 97;   // twelve figures of 8, status 1
+  public let clearingRows : RS.Decl<ClearingMember> = {
+    table = "clearingmembers"; idBytes = 8; rowBytes = CLEARING_ROW_BYTES;
+    encode = func(x : ClearingMember) : Blob {
+      let b = R.buf();
+      for (v in [x.member, x.settlementAccount, x.creditLine, x.collateral, x.fund, x.fundRequired, x.imOrders, x.owedTo, x.owedBy, x.debt, x.fails, x.peak].vals()) R.putNat(b, v, 8);
+      R.putNat(b, x.status, 1); padded(b, CLEARING_ROW_BYTES)
+    };
+    decode = func(a : [Nat8]) : ClearingMember {
+      { member = R.getNat(a, 0, 8); settlementAccount = R.getNat(a, 8, 8); creditLine = R.getNat(a, 16, 8); collateral = R.getNat(a, 24, 8); fund = R.getNat(a, 32, 8);
+        fundRequired = R.getNat(a, 40, 8); imOrders = R.getNat(a, 48, 8); owedTo = R.getNat(a, 56, 8); owedBy = R.getNat(a, 64, 8); debt = R.getNat(a, 72, 8);
+        fails = R.getNat(a, 80, 8); peak = R.getNat(a, 88, 8); status = R.getNat(a, 96, 1) }
+    };
+    indexes = [{ name = "byMember"; keyBytes = 8; keyOf = func(_ : Nat, x : ClearingMember) : ?Blob { ?R.key(x.member, 8) } }];
+  };
+  /// An account designated for clearing, with its member.
+  public type Designation = { account : Nat; member : Nat };
+  public let designationRows : RS.Decl<Designation> = {
+    table = "designations"; idBytes = 8; rowBytes = 16;
+    encode = func(x : Designation) : Blob { let b = R.buf(); R.putNat(b, x.account, 8); R.putNat(b, x.member, 8); padded(b, 16) };
+    decode = func(a : [Nat8]) : Designation { { account = R.getNat(a, 0, 8); member = R.getNat(a, 8, 8) } };
+    indexes = [{ name = "byAccount"; keyBytes = 8; keyOf = func(_ : Nat, x : Designation) : ?Blob { ?R.key(x.account, 8) } }];
+  };
+  /// The shares the CCP holds for a member in an instrument (bought and not yet delivered, or pledged for its sales), and
+  /// how many of them its open sales and close-outs hold.
+  public type CustodyRow = { member : Nat; instrument : Nat; qty : Nat; held : Nat };
+  public let custodyRows : RS.Decl<CustodyRow> = {
+    table = "ccpcustody"; idBytes = 8; rowBytes = 32;
+    encode = func(x : CustodyRow) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.instrument, 8); R.putNat(b, x.qty, 8); R.putNat(b, x.held, 8); padded(b, 32) };
+    decode = func(a : [Nat8]) : CustodyRow { { member = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); qty = R.getNat(a, 16, 8); held = R.getNat(a, 24, 8) } };
+    indexes = [{ name = "byMember"; keyBytes = 16; keyOf = func(_ : Nat, x : CustodyRow) : ?Blob { ?R.key2(x.member, 8, x.instrument, 8) } }];
+  };
+  /// An instrument's initial margin in basis points, by the instrument's id.
+  public let marginRows : RS.Decl<Nat> = {
+    table = "margins"; idBytes = 8; rowBytes = 8;
+    encode = func(x : Nat) : Blob { let b = R.buf(); R.putNat(b, x, 8); padded(b, 8) };
+    decode = func(a : [Nat8]) : Nat { R.getNat(a, 0, 8) };
+    indexes = [];
+  };
+  /// A close-out order of the CCP and the member whose debt its proceeds pay.
+  public type Closeout = { order : Nat; member : Nat };
+  public let closeoutRows : RS.Decl<Closeout> = {
+    table = "closeouts"; idBytes = 8; rowBytes = 16;
+    encode = func(x : Closeout) : Blob { let b = R.buf(); R.putNat(b, x.order, 8); R.putNat(b, x.member, 8); padded(b, 16) };
+    decode = func(a : [Nat8]) : Closeout { { order = R.getNat(a, 0, 8); member = R.getNat(a, 8, 8) } };
+    indexes = [{ name = "byOrder"; keyBytes = 8; keyOf = func(_ : Nat, x : Closeout) : ?Blob { ?R.key(x.order, 8) } }];
+  };
+  /// A member's cash obligations in one cycle: owed to it (its sales) and owed by it (its purchases), gross.
+  public type Obligation = { member : Nat; cycle : Nat; owedTo : Nat; owedBy : Nat };
+  public let obligationRows : RS.Decl<Obligation> = {
+    table = "obligations"; idBytes = 8; rowBytes = 32;
+    encode = func(x : Obligation) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.cycle, 8); R.putNat(b, x.owedTo, 8); R.putNat(b, x.owedBy, 8); padded(b, 32) };
+    decode = func(a : [Nat8]) : Obligation { { member = R.getNat(a, 0, 8); cycle = R.getNat(a, 8, 8); owedTo = R.getNat(a, 16, 8); owedBy = R.getNat(a, 24, 8) } };
+    indexes = [{ name = "byMemberCycle"; keyBytes = 16; keyOf = func(_ : Nat, x : Obligation) : ?Blob { ?R.key2(x.member, 8, x.cycle, 8) } }];
+  };
+  /// The shares a member bought in an instrument in one cycle: not delivered before that cycle is paid (DvP).
+  public type Bought = { member : Nat; instrument : Nat; cycle : Nat; qty : Nat };
+  public let boughtRows : RS.Decl<Bought> = {
+    table = "bought"; idBytes = 8; rowBytes = 32;
+    encode = func(x : Bought) : Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.instrument, 8); R.putNat(b, x.cycle, 8); R.putNat(b, x.qty, 8); padded(b, 32) };
+    decode = func(a : [Nat8]) : Bought { { member = R.getNat(a, 0, 8); instrument = R.getNat(a, 8, 8); cycle = R.getNat(a, 16, 8); qty = R.getNat(a, 24, 8) } };
+    indexes = [{ name = "byKey"; keyBytes = 24; keyOf = func(_ : Nat, x : Bought) : ?Blob { let b = R.buf(); R.putNat(b, x.member, 8); R.putNat(b, x.instrument, 8); R.putNat(b, x.cycle, 8); ?R.done(b, 24) } }];
+  };
+  /// A cut cycle, by its number: when it was cut, the market day it settles on (0: at once), whether it is settled.
+  public type CycleRow = { cutAt : Nat64; settleDay : Nat; settled : Bool };
+  public let cycleRows : RS.Decl<CycleRow> = {
+    table = "cycles"; idBytes = 8; rowBytes = 17;
+    encode = func(x : CycleRow) : Blob { let b = R.buf(); R.putNat(b, Nat64.toNat(x.cutAt), 8); R.putNat(b, x.settleDay, 8); R.putBool(b, x.settled); padded(b, 17) };
+    decode = func(a : [Nat8]) : CycleRow { { cutAt = Nat64.fromNat(R.getNat(a, 0, 8)); settleDay = R.getNat(a, 8, 8); settled = R.getBool(a, 16) } };
+    indexes = [];
+  };
+  /// A leg of the settlement range (SPEC §19): its kind (1 a pre-funded party's gross fill, 2 a cycle's net, 3 a transfer
+  /// to or from the CCP outside a fill or a cycle: a sale's pledge, collateral, a fund contribution, the venue's skin), the
+  /// ledger, the accounts it moves from and to, the units, the block that settled it. Leaf `i` is row `i + 1`. Every
+  /// movement between two of the venue's accounts is a leg.
+  public type Leg = { kind : Nat; ledger : Principal; from : Nat; to : Nat; units : Nat; block : Nat };
+  public let LEG_ROW_BYTES = 63;   // kind 1, ledger 30, four figures of 8
+  public let legRows : RS.Decl<Leg> = {
+    table = "settlementlegs"; idBytes = 8; rowBytes = LEG_ROW_BYTES;
+    encode = func(x : Leg) : Blob { let b = R.buf(); R.putNat(b, x.kind, 1); putPrincipal(b, x.ledger); R.putNat(b, x.from, 8); R.putNat(b, x.to, 8); R.putNat(b, x.units, 8); R.putNat(b, x.block, 8); padded(b, LEG_ROW_BYTES) };
+    decode = func(a : [Nat8]) : Leg { { kind = R.getNat(a, 0, 1); ledger = getPrincipal(a, 1); from = R.getNat(a, 31, 8); to = R.getNat(a, 39, 8); units = R.getNat(a, 47, 8); block = R.getNat(a, 55, 8) } };
+    indexes = [];
+  };
+  /// The settlement range's nodes in post-order (a leaf, then the parents its arrival completes): position `p` is row
+  /// `p + 1`, each the node's hash under the kernel's proof hashing (`MmrProof`).
+  public let nodeRows : RS.Decl<Blob> = {
+    table = "settlementnodes"; idBytes = 8; rowBytes = 32;
+    encode = func(x : Blob) : Blob { let b = R.buf(); R.putBlob(b, x, 32); R.done(b, 32) };
+    decode = func(a : [Nat8]) : Blob { R.getBlob(a, 0, 32) };
+    indexes = [];
+  };
   /// A drop-copy row (SPEC §14): a block that concerns a member, and whether it is the member's own act.
   public type DropRow = { member : Nat; block : Nat; own : Bool };
   public let DROP_ROW_BYTES = 17;   // member 8, block 8, own 1
@@ -324,6 +457,7 @@ module {
     and PRINCIPAL_BYTES * 2 + 8 + 8 + 1 + T.MAX_BANDS * 16 + 4 + 1 + 8 + 4 + 4 + 4 + 8 + 8 + 8 + 8 == 390 and 390 <= INSTRUMENT_ROW_BYTES
     and 8 + 8 + 1 <= KILL_ROW_BYTES and 8 * 5 == LIMIT_ROW_BYTES
     and 32 <= REF_ROW_BYTES and 1 <= DUE_ROW_BYTES
+    and 8 * 12 + 1 == CLEARING_ROW_BYTES and 1 + PRINCIPAL_BYTES + 8 * 4 == LEG_ROW_BYTES and 8 + 8 + PRINCIPAL_BYTES + 8 * 6 == TERMS_BYTES
   };
 
   // ═══════════════════════════════════════════════════════
@@ -345,6 +479,16 @@ module {
     var instrumentList : [Nat];
     /// Insider blackouts and securities loans (SPEC §16, §17).
     blackoutStore : RS.Store; var nextBlackout : Nat; borrowStore : RS.Store; var nextBorrow : Nat;
+    /// The central counterparty (SPEC §18 to §21) and the settlement range (§19).
+    var clearing : ?ClearingTerms; clearingStore : RS.Store; var nextClearing : Nat; designationStore : RS.Store; var nextDesignation : Nat;
+    custodyStore : RS.Store; var nextCustody : Nat; marginStore : RS.Store; closeoutStore : RS.Store; var nextCloseout : Nat;
+    obligationStore : RS.Store; var nextObligation : Nat; boughtStore : RS.Store; var nextBought : Nat; cycleStore : RS.Store;
+    /// The open cycle, the last cycle settled, the last cut's time, the open clearing buys' value the CCP's cash is
+    /// committed to, the venue's skin-in-the-game (its own cash and the fail penalties).
+    var cycleNo : Nat; var settledThrough : Nat; var lastCut : Nat64; var ccpCommitted : Nat; var skin : Nat;
+    legStore : RS.Store; var nextLeg : Nat; nodeStore : RS.Store; var nextNode : Nat;
+    /// The index of the block being applied (a leg records it); set before every apply, by the append or by the replay.
+    var applying : Nat;
     var nextOrder : Nat; var nextBalance : Nat; var nextRef : Nat; var nextKill : Nat; var nextLimit : Nat;
     /// The batch waiting to clear: the time (a block's `now`) its orders were entered with; 0 when none.
     var batchTime : Nat64;
@@ -366,6 +510,11 @@ module {
       proposalRows = RS.newStore(proposals); killRows = RS.newStore(kills); limitStore = RS.newStore(limitRows);
       feedRows = RS.newStore(feedHashes); var feedHead = F.genesis(); var feedNext = 0; dropStore = RS.newStore(dropRows); var nextDrop = 1;
       statStore = RS.newStore(statRows); dayStore = RS.newStore(dayRows); var nextDayRow = 1; var lastSealed = 0; sealStore = RS.newStore(sealRows); var nextSeal = 1; var instrumentList = []; blackoutStore = RS.newStore(blackoutRows); var nextBlackout = 1; borrowStore = RS.newStore(borrowRows); var nextBorrow = 1;
+      var clearing = null; clearingStore = RS.newStore(clearingRows); var nextClearing = 1; designationStore = RS.newStore(designationRows); var nextDesignation = 1;
+      custodyStore = RS.newStore(custodyRows); var nextCustody = 1; marginStore = RS.newStore(marginRows); closeoutStore = RS.newStore(closeoutRows); var nextCloseout = 1;
+      obligationStore = RS.newStore(obligationRows); var nextObligation = 1; boughtStore = RS.newStore(boughtRows); var nextBought = 1; cycleStore = RS.newStore(cycleRows);
+      var cycleNo = 1; var settledThrough = 0; var lastCut = 0; var ccpCommitted = 0; var skin = 0;
+      legStore = RS.newStore(legRows); var nextLeg = 0; nodeStore = RS.newStore(nodeRows); var nextNode = 0; var applying = 0;
       var nextOrder = 1; var nextBalance = 1; var nextRef = 1; var nextKill = 1; var nextLimit = 1; var batchTime = 0; var dueCount = 0; var lastTime = 0; marks = Map.empty<Blob, Blob>(); var policies = [] }
   };
   public func setPolicies(s : State, ps : [Auth.DualPolicy]) { s.policies := ps };
@@ -520,6 +669,198 @@ module {
   };
   func holdingLedger(i : T.Instrument, side : T.Side) : Principal { switch (side) { case (#buy) i.cashLedger; case (#sell) i.assetLedger } };
   func holdingOf(side : T.Side, price : Nat, qty : Nat) : Nat { switch (side) { case (#buy) price * qty; case (#sell) qty } };
+  /// Available funds leaving an account (a transfer the checks covered).
+  func debit(s : State, account : Nat, ledger : Principal, amount : Nat) {
+    if (amount == 0) return;
+    let b = balance(s, account, ledger);
+    if (b.available < amount) Runtime.trap("debit: the funds were checked");
+    putBalance(s, { b with available = b.available - amount });
+  };
+  func move(s : State, from : Nat, to : Nat, ledger : Principal, amount : Nat) { debit(s, from, ledger, amount); credit(s, to, ledger, amount) };
+
+  // ─── the central counterparty (SPEC §18 to §21) ──────────────────────────────────────────
+  public let MAX_CLEARING_MEMBERS = 64;
+  func ceilDiv(a : Nat, b : Nat) : Nat { (a + b - 1) / b };
+  /// Initial margin on a value at a rate in basis points, rounded up.
+  func imFor(bps : Nat, value : Nat) : Nat { ceilDiv(bps * value, 10_000) };
+  public func clearingTerms(s : State) : ?ClearingTerms { s.clearing };
+  public func clearingMember(s : State, member : Nat) : ?(Nat, ClearingMember) { one(s.clearingStore, clearingRows, "byMember", R.key(member, 8)) };
+  func updateMember(s : State, member : Nat, f : ClearingMember -> ClearingMember) {
+    let ?(id, r) = clearingMember(s, member) else Runtime.trap("clearing: a member vanished");
+    RS.put(s.clearingStore, clearingRows, id, f(r))
+  };
+  /// The clearing member an account is designated to, if it is a clearing account.
+  public func clearingOf(s : State, account : Nat) : ?Nat { switch (one(s.designationStore, designationRows, "byAccount", R.key(account, 8))) { case (?(_, d)) ?d.member; case null null } };
+  public func custodyOf(s : State, member : Nat, inst : Nat) : CustodyRow {
+    switch (one(s.custodyStore, custodyRows, "byMember", R.key2(member, 8, inst, 8))) { case (?(_, r)) r; case null ({ member; instrument = inst; qty = 0; held = 0 } : CustodyRow) }
+  };
+  func putCustody(s : State, c : CustodyRow) {
+    switch (one(s.custodyStore, custodyRows, "byMember", R.key2(c.member, 8, c.instrument, 8))) {
+      case (?(id, _)) RS.put(s.custodyStore, custodyRows, id, c);
+      case null { let id = s.nextCustody; s.nextCustody += 1; RS.put(s.custodyStore, custodyRows, id, c) };
+    }
+  };
+  /// Every custody row of a member, in instrument order (at most one an instrument).
+  public func custodyRowsOf(s : State, member : Nat) : [CustodyRow] {
+    let out = List.empty<CustodyRow>();
+    var cursor : ?Page.Cursor = null;
+    label reading loop {
+      switch (RS.page(s.custodyStore, custodyRows, "byMember", R.key2(member, 8, 0, 8), R.key2(member, 8, MAXP, 8), cursor, 100)) {
+        case (#ok(p)) { for ((_, r) in p.rows.vals()) List.add(out, r); switch (p.next) { case (?n) cursor := ?n; case null break reading } };
+        case (#err(_)) break reading;
+      };
+    };
+    List.toArray(out)
+  };
+  public func marginOf(s : State, inst : Nat) : ?Nat { RS.get(s.marginStore, marginRows, inst) };
+  public func obligationOf(s : State, member : Nat, cycle : Nat) : ?(Nat, Obligation) { one(s.obligationStore, obligationRows, "byMemberCycle", R.key2(member, 8, cycle, 8)) };
+  /// Adds to a member's obligations in a cycle, and to its row's totals over its unsettled cycles.
+  func owe(s : State, member : Nat, cycle : Nat, to : Nat, by : Nat) {
+    switch (obligationOf(s, member, cycle)) {
+      case (?(id, o)) RS.put(s.obligationStore, obligationRows, id, { o with owedTo = o.owedTo + to; owedBy = o.owedBy + by });
+      case null { let id = s.nextObligation; s.nextObligation += 1; RS.put(s.obligationStore, obligationRows, id, { member; cycle; owedTo = to; owedBy = by }) };
+    };
+    updateMember(s, member, func(r : ClearingMember) : ClearingMember { { r with owedTo = r.owedTo + to; owedBy = r.owedBy + by } });
+  };
+  func boughtKey(member : Nat, inst : Nat, cycle : Nat) : Blob { let b = R.buf(); R.putNat(b, member, 8); R.putNat(b, inst, 8); R.putNat(b, cycle, 8); R.done(b, 24) };
+  public func boughtOf(s : State, member : Nat, inst : Nat, cycle : Nat) : Nat { switch (one(s.boughtStore, boughtRows, "byKey", boughtKey(member, inst, cycle))) { case (?(_, r)) r.qty; case null 0 } };
+  func addBought(s : State, member : Nat, inst : Nat, cycle : Nat, qty : Nat) {
+    switch (one(s.boughtStore, boughtRows, "byKey", boughtKey(member, inst, cycle))) {
+      case (?(id, r)) RS.put(s.boughtStore, boughtRows, id, { r with qty = r.qty + qty });
+      case null { let id = s.nextBought; s.nextBought += 1; RS.put(s.boughtStore, boughtRows, id, { member; instrument = inst; cycle; qty }) };
+    }
+  };
+  public func cycleOf(s : State, cycle : Nat) : ?CycleRow { RS.get(s.cycleStore, cycleRows, cycle) };
+  /// The price a position is valued at: the last trade, or the reference before any.
+  func markPrice(i : T.Instrument) : Nat { if (i.lastPrice != 0) i.lastPrice else i.referencePrice };
+  /// The value of the shares the CCP holds for a member, each instrument at its mark.
+  func custodyValue(s : State, member : Nat) : Nat {
+    var v = 0;
+    for (c in custodyRowsOf(s, member).vals()) { if (c.qty > 0) { switch (instrument(s, c.instrument)) { case (?i) v += c.qty * markPrice(i); case null {} } } };
+    v
+  };
+  /// Variation margin (SPEC §18): what a member owes in its unsettled cycles and rolled debt beyond what it is owed and the
+  /// value of the shares the CCP holds for it; at least 0.
+  public func variationOf(s : State, r : ClearingMember) : Nat {
+    let owes = r.owedBy + r.debt; let has = r.owedTo + custodyValue(s, r.member);
+    if (owes > has) owes - has else 0
+  };
+  /// The CCP's cash on its account, and what is free of the open clearing buys it is committed to.
+  public func ccpCash(s : State) : Nat { switch (s.clearing) { case (?t) balance(s, t.ccpAccount, t.cashLedger).available; case null 0 } };
+  public func ccpFree(s : State) : Nat { let c = ccpCash(s); if (c > s.ccpCommitted) c - s.ccpCommitted else 0 };
+  /// A member's requirement against its resources (SPEC §18): its fund contribution paid up to the call, and its open
+  /// buys' initial margin (`imOrders`, changed by `add` and `drop`) with variation margin within its collateral and credit
+  /// line (`release` of collateral taken out first).
+  func marginRefusal(s : State, r : ClearingMember, add : Nat, drop : Nat, release : Nat) : ?T.Error {
+    if (r.fund < r.fundRequired) return ?#FundShort({ required = r.fundRequired; paid = r.fund });
+    let required = r.imOrders + add - drop + variationOf(s, r);
+    let available = r.collateral + r.creditLine - release;
+    if (required > available) ?#MarginShort({ required; available }) else null
+  };
+  /// The shares a clearing member may sell (SPEC §18): what the CCP holds for it free of its sales, and what its settlement
+  /// account holds (free of what it owes on loans, unless the sale is flagged short).
+  func clearingSellable(s : State, r : ClearingMember, i : T.Instrument, inst : Nat, flagged : Bool) : Nat {
+    let c = custodyOf(s, r.member, inst);
+    (c.qty - c.held) + (if (flagged) balance(s, r.settlementAccount, i.assetLedger).available else ownedFree(s, r.settlementAccount, i, inst))
+  };
+  /// A clearing sale's shares pledged to the CCP: what the CCP holds for the member free of its sales first, the rest from
+  /// its settlement account into the CCP's account. The order's hold on them is recorded by `putOrder`.
+  func pledge(s : State, member : Nat, i : T.Instrument, inst : Nat, qty : Nat) {
+    let ?t = s.clearing else Runtime.trap("pledge: no clearing");
+    let ?(_, r) = clearingMember(s, member) else Runtime.trap("pledge: a member vanished");
+    let c = custodyOf(s, member, inst);
+    let free = c.qty - c.held;
+    if (free >= qty) return;
+    move(s, r.settlementAccount, t.ccpAccount, i.assetLedger, qty - free);
+    appendLeg(s, 3, i.assetLedger, r.settlementAccount, t.ccpAccount, qty - free);
+    putCustody(s, { c with qty = c.qty + qty - free });
+  };
+  /// An order's clearing records as it changes (SPEC §18): a clearing buy's initial margin (what it holds) in its member's
+  /// row and its open value in the CCP's commitment; a clearing sale's or a close-out's held shares in the custody row.
+  func clearingMove(s : State, id : Nat, o : T.Order, v0 : Nat, v1 : Nat, h0 : Nat) {
+    switch (clearingOf(s, o.account)) {
+      case (?m) {
+        switch (o.side) {
+          case (#buy) { updateMember(s, m, func(r : ClearingMember) : ClearingMember { { r with imOrders = r.imOrders + o.held - h0 } }); s.ccpCommitted := s.ccpCommitted + v1 - v0 };
+          case (#sell) { let c = custodyOf(s, m, o.instrument); putCustody(s, { c with held = c.held + o.held - h0 }) };
+        };
+      };
+      case null {
+        switch (s.clearing) {
+          case (?t) {
+            if (o.account == t.ccpAccount) {
+              switch (one(s.closeoutStore, closeoutRows, "byOrder", R.key(id, 8))) {
+                case (?(_, co)) { let c = custodyOf(s, co.member, o.instrument); putCustody(s, { c with held = c.held + o.held - h0 }) };
+                case null {};
+              };
+            };
+          };
+          case null {};
+        };
+      };
+    };
+  };
+
+  // ─── the settlement range (SPEC §19): a Merkle mountain range under the kernel's proof hashing ───────────────────
+  func popcount(n : Nat) : Nat { var c = 0; var x = n; while (x > 0) { c += x % 2; x /= 2 }; c };
+  /// The post-order position of leaf `i`, and of the node of height `h` whose leaves start at `j * 2^h`.
+  func leafPos(i : Nat) : Nat { 2 * i - popcount(i) };
+  func nodePos(h : Nat, j : Nat) : Nat { leafPos((j + 1) * 2 ** h - 1) + h };
+  func nodeAt(s : State, h : Nat, j : Nat) : Blob { let ?x = RS.get(s.nodeStore, nodeRows, nodePos(h, j) + 1) else Runtime.trap("settlement range: a node is missing"); x };
+  func putNode(s : State, h : Nat, j : Nat, x : Blob) {
+    if (nodePos(h, j) != s.nextNode) Runtime.trap("settlement range: a node out of order");
+    s.nextNode += 1; RS.put(s.nodeStore, nodeRows, s.nextNode, x)
+  };
+  public func legHash(l : Leg) : Blob { MP.hashLeaf(legRows.encode(l)) };
+  /// A leg appended: its leaf, then the parents it completes.
+  func appendLeg(s : State, kind : Nat, ledger : Principal, from : Nat, to : Nat, units : Nat) {
+    if (units == 0) return;
+    let l : Leg = { kind; ledger; from; to; units; block = s.applying };
+    let i = s.nextLeg; s.nextLeg += 1; RS.put(s.legStore, legRows, s.nextLeg, l);
+    var h = legHash(l); putNode(s, 0, i, h);
+    var height = 0; var j = i;
+    while (j % 2 == 1) { h := MP.hashNode(nodeAt(s, height, j - 1), h); height += 1; j /= 2; putNode(s, height, j, h) };
+  };
+  /// The range's peaks, highest first, for its first `n` leaves.
+  func peaksOf(s : State, n : Nat) : [Blob] {
+    let out = List.empty<Blob>();
+    var off = 0; var h = 64;
+    while (h > 0) { h -= 1; if ((n / 2 ** h) % 2 == 1) { List.add(out, nodeAt(s, h, off / 2 ** h)); off += 2 ** h } };
+    List.toArray(out)
+  };
+  /// The settlement range's leaf count and root (the root of no leaves is 32 zero bytes).
+  public func settlementRoot(s : State) : (Nat, Blob) {
+    switch (MP.bagPeaks(peaksOf(s, s.nextLeg))) { case (?r) (s.nextLeg, r); case null (0, F.genesis()) }
+  };
+  /// The root the range had when it held its first `n` legs (1 to the present count): the nodes of those legs are stored
+  /// before any later leg's, so every earlier root stays computable.
+  public func settlementRootAt(s : State, n : Nat) : ?Blob { if (n == 0 or n > s.nextLeg) null else MP.bagPeaks(peaksOf(s, n)) };
+  /// Leg `i` and its inclusion proof against the present root.
+  public func settlementProof(s : State, i : Nat) : ?{ leg : Leg; proof : MP.Proof } { settlementProofAt(s, i, s.nextLeg) };
+  /// Leg `i` and its inclusion proof against the root the range had at `n` legs.
+  public func settlementProofAt(s : State, i : Nat, n : Nat) : ?{ leg : Leg; proof : MP.Proof } {
+    if (i >= n or n > s.nextLeg) return null;
+    let ?leg = RS.get(s.legStore, legRows, i + 1) else return null;
+    var off = 0; var h = 64; var k = 0;
+    while (h > 0) {
+      h -= 1;
+      if ((n / 2 ** h) % 2 == 1) {
+        if (i < off + 2 ** h) {
+          let sib = List.empty<Blob>();
+          var j = i;
+          for (level in Nat.range(0, h)) { List.add(sib, nodeAt(s, level, if (j % 2 == 0) j + 1 else j - 1)); j /= 2 };
+          return ?{ leg; proof = { siblings = List.toArray(sib); peakIndex = k; peaks = peaksOf(s, n) } };
+        };
+        off += 2 ** h; k += 1;
+      };
+    };
+    null
+  };
+  public func legOf(s : State, i : Nat) : ?Leg { RS.get(s.legStore, legRows, i + 1) };
+  /// The member a close-out order of the CCP is for, if the order is one.
+  public func closeoutOf(s : State, order : Nat) : ?Nat { switch (one(s.closeoutStore, closeoutRows, "byOrder", R.key(order, 8))) { case (?(_, c)) ?c.member; case null null } };
+  /// The clearing's figures: the CCP's commitment, the skin-in-the-game, the open cycle, the last settled, the last cut.
+  public func clearingFigures(s : State) : (Nat, Nat, Nat, Nat, Nat64) { (s.ccpCommitted, s.skin, s.cycleNo, s.settledThrough, s.lastCut) };
 
   // ═══════════════════════════════════════════════════════
   //  VALIDATION
@@ -625,6 +966,7 @@ module {
       case (#deposit(x)) {
         let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
         if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
         if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
         if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
         if (one(s.refRows, refs, "byRef", x.reference) != null) return ?#DuplicateReference;
@@ -634,6 +976,7 @@ module {
         switch (ownAccount(xs, caller, x.account)) { case (?e) return ?e; case null {} };
         if (memberOf(xs, x.account) != x.member) return ?#InvalidTerms({ reason = "the account's member" });
         if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
+        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
         let b = balance(s, x.account, x.ledger);
         if (b.available < x.amount) return ?#InsufficientFunds({ ledger = x.ledger; available = b.available; wanted = x.amount });
         null
@@ -645,6 +988,7 @@ module {
           case (?a, ?(tid, _)) { if (a.member != x.member or tid != x.trader) return ?#NotYourAccount({ account = x.account }) };
           case (_) return ?#NotYourAccount({ account = x.account });
         };
+        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account trades only its close-outs" });
         switch (X.mayTrade(xs, caller, x.instrument)) { case (?e) return ?#MayNotTrade({ code = XText.code(e) }); case null {} };
         let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
         if (i.phase == #halted) return ?#InstrumentHalted({ instrument = x.instrument });
@@ -691,7 +1035,7 @@ module {
             let limited = x.kind == #limit or x.kind == #ioc or x.kind == #fok or x.kind == #stopLimit;
             if (not limited or x.price < shortFloor(i)) return ?#ShortSalePrice({ price = x.price; floor = shortFloor(i) });
           } else {
-            let free = ownedFree(s, x.account, i, x.instrument);
+            let free = sellableFree(s, x.account, i, x.instrument);
             if (x.qty > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty });
           };
         };
@@ -706,8 +1050,10 @@ module {
         if (crossing.size() > 0 and x.selfTrade == #cancelIncoming) return ?#SelfTradePrevented({ resting = crossing[0].0 });
         let incomingCancelled = crossing.size() > 0 and x.selfTrade == #cancelBoth;
         if (not incomingCancelled) {
-          let b = balance(s, x.account, ledger);
-          if (b.available < need) return ?#InsufficientFunds({ ledger; available = b.available; wanted = need });
+          switch (clearingOf(s, x.account)) {
+            case null { let b = balance(s, x.account, ledger); if (b.available < need) return ?#InsufficientFunds({ ledger; available = b.available; wanted = need }) };
+            case (?m) { switch (clearingRefusal(s, m, i, x.instrument, x.side, x.shortSale, price, x.qty, 0, 0)) { case (?e) return ?e; case null {} } };
+          };
         };
         null
       };
@@ -728,13 +1074,15 @@ module {
         // short sales (SPEC §17): a flagged one's new price at or above the floor; an unflagged one adds only what is owned free
         if (o.side == #sell) {
           if (o.shortSale) { if (x.price < shortFloor(i)) return ?#ShortSalePrice({ price = x.price; floor = shortFloor(i) }) }
-          else if (x.qty > o.remaining) { let free = ownedFree(s, o.account, i, o.instrument); if (x.qty - o.remaining > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty - o.remaining }) };
+          else if (x.qty > o.remaining) { let free = sellableFree(s, o.account, i, o.instrument); if (x.qty - o.remaining > free) return ?#ShortSaleNotFlagged({ free; wanted = x.qty - o.remaining }) };
         };
         switch (riskRefusal(s, o.member, x.qty, x.price * x.qty, openValue(o))) { case (?e) return ?e; case null {} };
         let need = holdingOf(o.side, x.price, x.qty);
         let ledger = holdingLedger(i, o.side);
-        let b = balance(s, o.account, ledger);
-        if (need > o.held and b.available < need - o.held) return ?#InsufficientFunds({ ledger; available = b.available; wanted = need - o.held });
+        switch (clearingOf(s, o.account)) {
+          case null { let b = balance(s, o.account, ledger); if (need > o.held and b.available < need - o.held) return ?#InsufficientFunds({ ledger; available = b.available; wanted = need - o.held }) };
+          case (?m) { switch (clearingRefusal(s, m, i, o.instrument, o.side, o.shortSale, x.price, x.qty, o.held, openValue(o))) { case (?e) return ?e; case null {} } };
+        };
         let crossing = crossingOwn(s, o.account, o.instrument, o.side, x.price, 1);
         if (crossing.size() > 0) return ?#SelfTradePrevented({ resting = crossing[0].0 });
         null
@@ -800,6 +1148,7 @@ module {
         let ?k = kill(s, x.kill) else return ?#UnknownKill({ kill = x.kill });
         if (not k.active) return ?#InvalidTerms({ reason = "the kill is revived" });
         if (firstOpenOf(s, k) != null) return ?#OrdersStillOpen({ kill = x.kill });
+        if (k.trader == 0) { switch (clearingMember(s, k.member)) { case (?(_, r)) { if (r.status == 2) return ?#InvalidTerms({ reason = "a member in default is closed through the waterfall first" }) }; case null {} } };
         null
       };
       case (#setLimits(x)) {
@@ -823,6 +1172,7 @@ module {
       case (#borrow(x)) {
         let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
         if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = "the central counterparty's account moves only by clearing" });
         if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
         if (x.qty == 0) return ?#InvalidTerms({ reason = "a quantity above zero" });
         if (x.reference.size() != 32) return ?#InvalidTerms({ reason = "a 32-byte reference" });
@@ -844,7 +1194,217 @@ module {
         if (x.day <= s.lastSealed) return ?#InvalidTerms({ reason = "a day later than the last sealed" });
         null
       };
+      // SPEC §18 to §21
+      case (#setClearing(x)) {
+        let ?a = X.account(xs, x.ccpAccount) else return ?#UnknownAccount({ account = x.ccpAccount });
+        if (a.member != x.ccpMember) return ?#InvalidTerms({ reason = "the account's member" });
+        if (a.status != #open) return ?#AccountClosed({ account = x.ccpAccount });
+        if (x.cycleDays == 0 and x.cycleSecs == 0) return ?#InvalidTerms({ reason = "a cycle of seconds or of business days" });
+        if (x.cycleDays > 10) return ?#InvalidTerms({ reason = "a cycle of at most ten business days" });
+        if (x.penaltyBps > 10_000 or x.fundBps > 10_000) return ?#InvalidTerms({ reason = "rates of at most 100 per cent" });
+        if (x.deadlineCycles == 0) return ?#InvalidTerms({ reason = "a deadline of at least one cycle" });
+        switch (s.clearing) {
+          case (?t) { if (t.ccpAccount != x.ccpAccount or t.ccpMember != x.ccpMember or not Principal.equal(t.cashLedger, x.cashLedger)) return ?#InvalidTerms({ reason = "the CCP's account, member and currency are fixed" }) };
+          case null {
+            // the CCP's account starts empty and idle, so everything on it is the clearing's
+            if (clearingOf(s, x.ccpAccount) != null) return ?#InvalidTerms({ reason = "an account not designated for clearing" });
+            if (hasLiveOrder(s, x.ccpAccount) or not accountEmpty(s, x.ccpAccount)) return ?#InvalidTerms({ reason = "an empty account with no orders" });
+          };
+        };
+        null
+      };
+      case (#setMargin(x)) {
+        if (instrument(s, x.instrument) == null) return ?#UnknownInstrument({ instrument = x.instrument });
+        if (x.imBps == 0 or x.imBps > 10_000) return ?#InvalidTerms({ reason = "a margin above 0 and at most 100 per cent" });
+        null
+      };
+      case (#admitClearing(x)) {
+        let ?t = s.clearing else return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        if (X.member(xs, x.member) == null) return ?#InvalidTerms({ reason = "no such member" });
+        if (x.member == t.ccpMember) return ?#InvalidTerms({ reason = "a member other than the central counterparty's" });
+        if (clearingMember(s, x.member) != null) return ?#InvalidTerms({ reason = "already a clearing member" });
+        if (RS.size(s.clearingStore) >= MAX_CLEARING_MEMBERS) return ?#InvalidTerms({ reason = "at most 64 clearing members" });
+        let ?a = X.account(xs, x.settlementAccount) else return ?#UnknownAccount({ account = x.settlementAccount });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (a.status != #open) return ?#AccountClosed({ account = x.settlementAccount });
+        null
+      };
+      case (#designateClearing(x)) {
+        let ?(_, r) = clearingMember(s, x.member) else return ?#NotClearing({ member = x.member });
+        if (r.status != 1) return ?#NotClearing({ member = x.member });
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != x.member) return ?#InvalidTerms({ reason = "the account's member" });
+        if (clearingOf(s, x.account) != null) return ?#InvalidTerms({ reason = "already designated" });
+        // an order's kind is its account's at entry: an account with orders open is designated once they close
+        if (hasLiveOrder(s, x.account)) return ?#InvalidTerms({ reason = "an account with no open orders" });
+        null
+      };
+      case (#postCollateral(x)) {
+        let r = switch (ownClearing(s, xs, caller, x.member)) { case (#err(e)) return ?e; case (#ok(r)) r };
+        if (r.status == 2) return ?#InvalidTerms({ reason = "a member in default" });
+        if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
+        let ?t = s.clearing else return ?#NotClearing({ member = x.member });   // kept: a clearing member implies the terms
+        let b = balance(s, r.settlementAccount, t.cashLedger);
+        if (b.available < x.amount) return ?#InsufficientFunds({ ledger = t.cashLedger; available = b.available; wanted = x.amount });
+        null
+      };
+      case (#withdrawCollateral(x)) {
+        let r = switch (ownClearing(s, xs, caller, x.member)) { case (#err(e)) return ?e; case (#ok(r)) r };
+        if (r.status == 2) return ?#InvalidTerms({ reason = "a member in default" });
+        if (x.amount == 0 or x.amount > r.collateral) return ?#InvalidTerms({ reason = "an amount above zero and within the collateral" });
+        switch (marginRefusal(s, { r with fundRequired = 0 }, 0, 0, x.amount)) { case (?e) return ?e; case null {} };
+        if (ccpFree(s) < x.amount) return ?#LiquidityShort({ needed = x.amount; free = ccpFree(s) });
+        null
+      };
+      case (#cutCycle(x)) {
+        let ?t = s.clearing else return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        if (x.cycle != s.cycleNo) return ?#InvalidTerms({ reason = "the open cycle" });
+        if (t.cycleDays == 0) {
+          if (x.settleDay != 0) return ?#InvalidTerms({ reason = "a cycle of seconds settles at once" });
+          if (s.settledThrough + 1 != s.cycleNo) return ?#InvalidTerms({ reason = "the last cycle settled first" });
+          let due = Nat64.toNat(s.lastCut) + t.cycleSecs * 1_000_000_000;
+          if (s.lastCut != 0 and Nat64.toNat(now) < due) return ?#CycleNotDue({ due });
+        } else {
+          let today = X.marketTime(xs, now).0;
+          let day = settlementDay(xs, today, t.cycleDays);
+          if (x.settleDay != day) return ?#InvalidTerms({ reason = "the settlement day the calendar gives" });
+          if (s.cycleNo > 1) { switch (cycleOf(s, s.cycleNo - 1)) { case (?c) { if (c.settleDay >= day) return ?#InvalidTerms({ reason = "one cut a market day" }) }; case null {} } };
+        };
+        null
+      };
+      case (#settleCycle(x)) {
+        if (s.clearing == null) return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        if (x.cycle != s.settledThrough + 1 or x.cycle >= s.cycleNo) return ?#InvalidTerms({ reason = "the oldest cut cycle" });
+        let ?c = cycleOf(s, x.cycle) else return ?#InvalidTerms({ reason = "the oldest cut cycle" });   // kept: a cut cycle has its row
+        if (c.settleDay != 0 and X.marketTime(xs, now).0 < c.settleDay) return ?#CycleNotDue({ due = c.settleDay });
+        null
+      };
+      case (#closeOut(x)) {
+        let ?t = s.clearing else return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        let ?(_, r) = clearingMember(s, x.member) else return ?#NotClearing({ member = x.member });
+        if (r.status != 2 and (r.debt == 0 or r.fails < t.deadlineCycles)) return ?#InvalidTerms({ reason = "a member past its deadline or in default" });
+        let ?i = instrument(s, x.instrument) else return ?#UnknownInstrument({ instrument = x.instrument });
+        if (i.phase != #continuous) return ?#InvalidTerms({ reason = "an instrument trading continuously" });
+        let c = custodyOf(s, x.member, x.instrument);
+        if ((c.qty - c.held) / i.lot == 0) return ?#InvalidTerms({ reason = "shares to close out" });
+        null
+      };
+      case (#callFund) {
+        if (s.clearing == null) return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        if (activeMembers(s).size() == 0) return ?#InvalidTerms({ reason = "a clearing member" });
+        null
+      };
+      case (#contributeFund(x)) {
+        let r = switch (ownClearing(s, xs, caller, x.member)) { case (#err(e)) return ?e; case (#ok(r)) r };
+        if (r.status != 1) return ?#NotClearing({ member = x.member });
+        if (x.amount == 0 or r.fund + x.amount > r.fundRequired) return ?#InvalidTerms({ reason = "an amount above zero and within the requirement" });
+        let ?t = s.clearing else return ?#NotClearing({ member = x.member });   // kept: a clearing member implies the terms
+        let b = balance(s, r.settlementAccount, t.cashLedger);
+        if (b.available < x.amount) return ?#InsufficientFunds({ ledger = t.cashLedger; available = b.available; wanted = x.amount });
+        null
+      };
+      case (#fundSkin(x)) {
+        let ?t = s.clearing else return ?#InvalidTerms({ reason = "the clearing terms set first" });
+        let ?a = X.account(xs, x.account) else return ?#UnknownAccount({ account = x.account });
+        if (a.member != t.ccpMember or x.account == t.ccpAccount) return ?#InvalidTerms({ reason = "an account of the central counterparty's member" });
+        if (x.amount == 0) return ?#InvalidTerms({ reason = "an amount above zero" });
+        let b = balance(s, x.account, t.cashLedger);
+        if (b.available < x.amount) return ?#InsufficientFunds({ ledger = t.cashLedger; available = b.available; wanted = x.amount });
+        null
+      };
+      case (#declareDefault(x)) {
+        let ?(_, r) = clearingMember(s, x.member) else return ?#NotClearing({ member = x.member });
+        if (r.status != 1) return ?#NotClearing({ member = x.member });
+        reasonRefusal(x.reason)
+      };
+      case (#closeDefault(x)) {
+        let ?(_, r) = clearingMember(s, x.member) else return ?#NotClearing({ member = x.member });
+        if (r.status != 2) return ?#InvalidTerms({ reason = "a member in default" });
+        let (lo, hi) = R.prefixRange(x.member, 8, 8);
+        if (first(s.orderRows, orders, "member", lo, hi) != null) return ?#InvalidTerms({ reason = "the member's orders cancelled first" });
+        for (c in custodyRowsOf(s, x.member).vals()) { if (c.qty > 0) return ?#InvalidTerms({ reason = "the member's shares closed out first" }) };
+        if (r.owedTo != 0 or r.owedBy != 0) return ?#InvalidTerms({ reason = "the member's cycles settled first" });
+        null
+      };
     }
+  };
+  /// Whether an account is the central counterparty's.
+  func isCcp(s : State, account : Nat) : Bool { switch (s.clearing) { case (?t) t.ccpAccount == account; case null false } };
+  /// Whether an account has a live or waiting order.
+  func hasLiveOrder(s : State, account : Nat) : Bool {
+    let prefix = accountPrefix(account);
+    let (lo, hi) = span(prefix, 25);
+    var found = false;
+    walk(s, OWN_ALL, prefix, lo, hi, 8, func(_ : Nat, o : T.Order) : Bool { if (isLiveish(o)) { found := true; false } else true });
+    found
+  };
+  /// Whether an account holds nothing in any ledger.
+  func accountEmpty(s : State, account : Nat) : Bool {
+    let (lo, hi) = R.prefixRange(account, 8, PRINCIPAL_BYTES);
+    var cursor : ?Page.Cursor = null;
+    loop {
+      switch (RS.page(s.balanceRows, balances, "byAccountLedger", lo, hi, cursor, 100)) {
+        case (#ok(p)) { for ((_, b) in p.rows.vals()) { if (b.available != 0 or b.held != 0) return false }; switch (p.next) { case (?n) cursor := ?n; case null return true } };
+        case (#err(_)) return false;
+      };
+    };
+  };
+  /// The caller as a trader of the clearing member it acts for.
+  func ownClearing(s : State, xs : X.State, caller : Principal, member : Nat) : Result.Result<ClearingMember, T.Error> {
+    let ?(_, r) = clearingMember(s, member) else return #err(#NotClearing({ member }));
+    let ?(_, t) = X.traderByPrincipal(xs, caller) else return #err(#NotYourAccount({ account = r.settlementAccount }));
+    if (t.status != #active or t.member != member) return #err(#NotYourAccount({ account = r.settlementAccount }));
+    #ok(r)
+  };
+  /// The market day `days` business days after `today`, by the exchange's calendar (SPEC §19).
+  func settlementDay(xs : X.State, today : Nat, days : Nat) : Nat {
+    var d = today; var k = 0;
+    while (k < days) { d += 1; while (not Cal.isBusinessDay(X.calendarFor(xs, d), d)) d += 1; k += 1 };
+    d
+  };
+  /// The shares an account may sell unflagged: a clearing account its member's (SPEC §18), any other what it owns free.
+  func sellableFree(s : State, account : Nat, i : T.Instrument, inst : Nat) : Nat {
+    switch (clearingOf(s, account)) {
+      case (?m) { switch (clearingMember(s, m)) { case (?(_, r)) clearingSellable(s, r, i, inst, false); case null 0 } };
+      case null ownedFree(s, account, i, inst);
+    }
+  };
+  /// A clearing order's entry checks (SPEC §18), for an order of `qty` at `price` replacing one that held `heldBefore`
+  /// with the open value `valueBefore`: a buy's initial margin and the CCP's free cash, a sale's shares.
+  func clearingRefusal(s : State, m : Nat, i : T.Instrument, inst : Nat, side : T.Side, flagged : Bool, price : Nat, qty : Nat, heldBefore : Nat, valueBefore : Nat) : ?T.Error {
+    let ?t = s.clearing else return ?#NotClearing({ member = m });             // kept: a designation implies the terms
+    let ?(_, r) = clearingMember(s, m) else return ?#NotClearing({ member = m }); // kept: a designation names an admitted member
+    if (r.status != 1) return ?#NotClearing({ member = m });
+    if (not Principal.equal(i.cashLedger, t.cashLedger)) return ?#InvalidTerms({ reason = "an instrument settled in the clearing currency" });
+    switch (side) {
+      case (#buy) {
+        let ?bps = marginOf(s, inst) else return ?#InvalidTerms({ reason = "an instrument with a margin rate" });
+        let value = price * qty;
+        let im = imFor(bps, value);
+        if (im > heldBefore) { switch (marginRefusal(s, r, im, heldBefore, 0)) { case (?e) return ?e; case null {} } };
+        let free = ccpFree(s);
+        if (value > valueBefore and free < value - valueBefore) return ?#LiquidityShort({ needed = value - valueBefore; free });
+        null
+      };
+      case (#sell) {
+        let avail = clearingSellable(s, r, i, inst, flagged);
+        if (qty > heldBefore and qty - heldBefore > avail) ?#InsufficientFunds({ ledger = i.assetLedger; available = avail; wanted = qty - heldBefore }) else null
+      };
+    }
+  };
+  /// The clearing members not closed, in member order.
+  func activeMembers(s : State) : [ClearingMember] { Array.filter<ClearingMember>(clearingMembers(s), func(r) { r.status == 1 }) };
+  public func clearingMembers(s : State) : [ClearingMember] {
+    let out = List.empty<ClearingMember>();
+    var cursor : ?Page.Cursor = null;
+    let (lo, hi) = R.fullRange(8);
+    label reading loop {
+      switch (RS.page(s.clearingStore, clearingRows, "byMember", lo, hi, cursor, 100)) {
+        case (#ok(p)) { for ((_, r) in p.rows.vals()) List.add(out, r); switch (p.next) { case (?n) cursor := ?n; case null break reading } };
+        case (#err(_)) break reading;
+      };
+    };
+    List.toArray(out)
   };
 
   func reasonRefusal(t : Text) : ?T.Error {
@@ -895,11 +1455,13 @@ module {
   public func kill(s : State, id : Nat) : ?T.Kill { RS.get(s.killRows, kills, id) };
 
   func putOrder(s : State, id : Nat, o : T.Order) {
-    let before = switch (RS.get(s.orderRows, orders, id)) { case (?p) openValue(p); case null 0 };
+    let (before, heldBefore) = switch (RS.get(s.orderRows, orders, id)) { case (?p) (openValue(p), p.held); case null (0, 0) };
     RS.put(s.orderRows, orders, id, o);
     // the member's use moves by the change in the order's open value
     let after = openValue(o);
     if (after != before) putLimits(s, o.member, func(l : T.Limits) : T.Limits { { l with used = l.used + after - before } });
+    // a clearing order's margin, the CCP's commitment, and pledged shares move with it (SPEC §18)
+    if (after != before or o.held != heldBefore) clearingMove(s, id, o, before, after, heldBefore);
     // every key the row now holds lowers its range's mark
     if (o.status == #live) {
       lower(s, BOOK, sidePrefix(o.instrument, o.side), bookKey(o));
@@ -920,7 +1482,10 @@ module {
   };
   /// An order leaves the book: what it still holds returns, its status becomes `status`.
   func close(s : State, id : Nat, o : T.Order, status : T.Status) {
-    switch (instrument(s, o.instrument)) { case (?i) release(s, o.account, holdingLedger(i, o.side), o.held); case null Runtime.trap("close: instrument vanished") };
+    // a clearing order holds nothing on its account: its margin or its pledge returns through `putOrder`
+    if (clearingOf(s, o.account) == null) {
+      switch (instrument(s, o.instrument)) { case (?i) release(s, o.account, holdingLedger(i, o.side), o.held); case null Runtime.trap("close: instrument vanished") };
+    };
     putOrder(s, id, { o with status; held = 0 });
   };
   func cancelOco(s : State, o : T.Order, out : List.List<Nat>) {
@@ -985,10 +1550,14 @@ module {
         let need = holdingOf(x.side, price, x.qty);
         let key = K.orderKey(x.account, x.side, price, x.qty, x.clientRef);
         let status : T.Status = if (incomingCancelled) #cancelled else if (stop) #waiting else #live;
-        if (not incomingCancelled) hold(s, x.account, holdingLedger(i, x.side), need);
+        // a pre-funded order holds what it needs; a clearing buy its initial margin, a clearing sale its pledged shares
+        let held = if (incomingCancelled) 0 else switch (clearingOf(s, x.account)) {
+          case null { hold(s, x.account, holdingLedger(i, x.side), need); need };
+          case (?m) { switch (x.side) { case (#buy) imFor(switch (marginOf(s, x.instrument)) { case (?b) b; case null 0 }, need); case (#sell) { pledge(s, m, i, x.instrument, x.qty); x.qty } } };
+        };
         putOrder(s, id, { account = x.account; instrument = x.instrument; side = x.side; kind = x.kind; qty = x.qty; remaining = x.qty; price; stopPrice = x.stopPrice;
           peak = x.peak; validity = x.validity; gtdDay = x.gtdDay; selfTrade = x.selfTrade; capacity = x.capacity; shortSale = x.shortSale; clientRef = x.clientRef;
-          oco = x.oco; trail = x.trail; member = x.member; trader = x.trader; prio = now; key; status; held = if (incomingCancelled) 0 else need; filled = 0 });
+          oco = x.oco; trail = x.trail; member = x.member; trader = x.trader; prio = now; key; status; held; filled = 0 });
         // a one-cancels-other pair is linked both ways
         if (x.oco != 0) { switch (order(s, x.oco)) { case (?p) putOrder(s, x.oco, { p with oco = id }); case null {} } };
         if (status == #live) { markDue(s, x.instrument, true); if (s.batchTime == 0) s.batchTime := now };
@@ -1009,9 +1578,12 @@ module {
         let keeps = x.price == o.price and x.qty <= o.remaining;
         let ledger = holdingLedger(i, o.side);
         let need = holdingOf(o.side, x.price, x.qty);
-        if (need > o.held) hold(s, o.account, ledger, need - o.held) else release(s, o.account, ledger, o.held - need);
+        let held = switch (clearingOf(s, o.account)) {
+          case null { if (need > o.held) hold(s, o.account, ledger, need - o.held) else release(s, o.account, ledger, o.held - need); need };
+          case (?m) { switch (o.side) { case (#buy) imFor(switch (marginOf(s, o.instrument)) { case (?b) b; case null 0 }, need); case (#sell) { if (x.qty > o.held) pledge(s, m, i, o.instrument, x.qty - o.held); x.qty } } };
+        };
         let qty = o.filled + x.qty;
-        putOrder(s, x.order, { o with remaining = x.qty; qty; price = x.price; held = need; prio = if (keeps) o.prio else now;
+        putOrder(s, x.order, { o with remaining = x.qty; qty; price = x.price; held; prio = if (keeps) o.prio else now;
           key = if (keeps) o.key else K.orderKey(o.account, o.side, x.price, x.qty, o.clientRef) });
         markDue(s, o.instrument, true);
         if (s.batchTime == 0) s.batchTime := now;
@@ -1105,7 +1677,218 @@ module {
         let (rows, hash) = seal(s, x.day);
         Array.concat<Nat>([22, x.day, rows], Array.map<Nat8, Nat>(Blob.toArray(hash), func(b) { Nat8.toNat(b) }))
       };
+      // SPEC §18 to §21
+      case (#setClearing(x)) {
+        s.clearing := ?{ ccpAccount = x.ccpAccount; ccpMember = x.ccpMember; cashLedger = x.cashLedger; cycleSecs = x.cycleSecs; cycleDays = x.cycleDays;
+          penaltyBps = x.penaltyBps; deadlineCycles = x.deadlineCycles; fundBps = x.fundBps; fundFloor = x.fundFloor };
+        [27, x.ccpAccount]
+      };
+      case (#setMargin(x)) { RS.put(s.marginStore, marginRows, x.instrument, x.imBps); [28, x.instrument, x.imBps] };
+      case (#admitClearing(x)) {
+        let id = s.nextClearing; s.nextClearing += 1;
+        RS.put(s.clearingStore, clearingRows, id, { member = x.member; settlementAccount = x.settlementAccount; creditLine = x.creditLine; collateral = 0; fund = 0;
+          fundRequired = 0; imOrders = 0; owedTo = 0; owedBy = 0; debt = 0; fails = 0; peak = 0; status = 1 });
+        [29, x.member]
+      };
+      case (#designateClearing(x)) {
+        let id = s.nextDesignation; s.nextDesignation += 1;
+        RS.put(s.designationStore, designationRows, id, { account = x.account; member = x.member });
+        [30, x.account, x.member]
+      };
+      case (#postCollateral(x)) {
+        let ?t = s.clearing else Runtime.trap("apply: no clearing");
+        let ?(_, r) = clearingMember(s, x.member) else Runtime.trap("apply: a member vanished");
+        move(s, r.settlementAccount, t.ccpAccount, t.cashLedger, x.amount);
+        appendLeg(s, 3, t.cashLedger, r.settlementAccount, t.ccpAccount, x.amount);
+        updateMember(s, x.member, func(m : ClearingMember) : ClearingMember { { m with collateral = m.collateral + x.amount } });
+        [31, x.member, x.amount]
+      };
+      case (#withdrawCollateral(x)) {
+        let ?t = s.clearing else Runtime.trap("apply: no clearing");
+        let ?(_, r) = clearingMember(s, x.member) else Runtime.trap("apply: a member vanished");
+        move(s, t.ccpAccount, r.settlementAccount, t.cashLedger, x.amount);
+        appendLeg(s, 3, t.cashLedger, t.ccpAccount, r.settlementAccount, x.amount);
+        updateMember(s, x.member, func(m : ClearingMember) : ClearingMember { { m with collateral = m.collateral - x.amount } });
+        [32, x.member, x.amount]
+      };
+      case (#cutCycle(x)) {
+        RS.put(s.cycleStore, cycleRows, x.cycle, { cutAt = now; settleDay = x.settleDay; settled = false });
+        s.cycleNo += 1; s.lastCut := now;
+        [33, x.cycle, x.settleDay]
+      };
+      case (#settleCycle(x)) settleCycle(s, x.cycle);
+      case (#closeOut(x)) {
+        let ?t = s.clearing else Runtime.trap("apply: no clearing");
+        let ?i = instrument(s, x.instrument) else Runtime.trap("apply: instrument vanished");
+        let c = custodyOf(s, x.member, x.instrument);
+        let q = (c.qty - c.held) / i.lot * i.lot;
+        let id = s.nextOrder; s.nextOrder += 1;
+        let price = effectivePrice(i, #sell, #market, 0);
+        let clientRef = "closeout " # Nat.toText(id);
+        // the close-out row first: the order's hold lands on the member's custody as it is written
+        RS.put(s.closeoutStore, closeoutRows, s.nextCloseout, { order = id; member = x.member }); s.nextCloseout += 1;
+        hold(s, t.ccpAccount, i.assetLedger, q);
+        putOrder(s, id, { account = t.ccpAccount; instrument = x.instrument; side = #sell; kind = #market; qty = q; remaining = q; price; stopPrice = 0; peak = 0;
+          validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #principal; shortSale = false; clientRef; oco = 0; trail = 0; member = t.ccpMember;
+          trader = 0; prio = now; key = K.orderKey(t.ccpAccount, #sell, price, q, clientRef); status = #live; held = q; filled = 0 });
+        markDue(s, x.instrument, true);
+        if (s.batchTime == 0) s.batchTime := now;
+        [35, id, Nat8.toNat(K.statusCode(#live)), price, q, x.member]
+      };
+      case (#callFund) {
+        let ?t = s.clearing else Runtime.trap("apply: no clearing");
+        let act = activeMembers(s);
+        let floorShare = ceilDiv(t.fundFloor, act.size());
+        let fx = List.empty<Nat>(); List.add(fx, 36); List.add(fx, act.size());
+        for (r in act.vals()) {
+          let required = Nat.max(floorShare, ceilDiv(t.fundBps * r.peak, 10_000));
+          updateMember(s, r.member, func(m : ClearingMember) : ClearingMember { { m with fundRequired = required } });
+          List.add(fx, r.member); List.add(fx, required);
+        };
+        List.toArray(fx)
+      };
+      case (#contributeFund(x)) {
+        let ?t = s.clearing else Runtime.trap("apply: no clearing");
+        let ?(_, r) = clearingMember(s, x.member) else Runtime.trap("apply: a member vanished");
+        move(s, r.settlementAccount, t.ccpAccount, t.cashLedger, x.amount);
+        appendLeg(s, 3, t.cashLedger, r.settlementAccount, t.ccpAccount, x.amount);
+        updateMember(s, x.member, func(m : ClearingMember) : ClearingMember { { m with fund = m.fund + x.amount } });
+        [37, x.member, x.amount]
+      };
+      case (#fundSkin(x)) {
+        let ?t = s.clearing else Runtime.trap("apply: no clearing");
+        move(s, x.account, t.ccpAccount, t.cashLedger, x.amount);
+        appendLeg(s, 3, t.cashLedger, x.account, t.ccpAccount, x.amount);
+        s.skin += x.amount;
+        [38, x.account, x.amount]
+      };
+      case (#declareDefault(x)) {
+        updateMember(s, x.member, func(m : ClearingMember) : ClearingMember { { m with status = 2 } });
+        // the member is killed (SPEC §11) unless it is already
+        let k = switch (activeKill(s, 1, x.member)) {
+          case (?_) 0;
+          case null { let id = s.nextKill; s.nextKill += 1; RS.put(s.killRows, kills, id, { member = x.member; trader = 0; active = true }); id };
+        };
+        [39, x.member, k]
+      };
+      case (#closeDefault(x)) closeDefault(s, x.member);
     }
+  };
+
+  /// SPEC §19: the oldest cut cycle settled, every clearing member all or nothing. Payers first, so the receivers are paid
+  /// out of what the payers brought in: a payer's net (its purchases in the cycle and its rolled debt less its sales) is
+  /// paid from its settlement account if it holds it, else it fails and the net rolls with the penalty. A receiver is paid
+  /// within the CCP's free cash, else the amount rolls to it in the next cycle. A member that owes nothing after the cycle
+  /// receives the shares the CCP holds for it free of its sales and of its purchases in later cycles.
+  /// Effects: [34, cycle, outcomes, (member, 1 paid / 2 failed / 3 received / 4 rolled to it, amount)..., deliveries,
+  /// (member, instrument, quantity)...].
+  func settleCycle(s : State, k : Nat) : T.Effects {
+    let ?t = s.clearing else Runtime.trap("apply: no clearing");
+    let outcomes = List.empty<(Nat, Nat, Nat)>();
+    let deliveries = List.empty<(Nat, Nat, Nat)>();
+    // every member's side is fixed before any leg moves: what it owes (its cycle's purchases and its rolled debt) and what
+    // it is owed, as the cycle was cut; settling one member never moves another between the two passes
+    let plan = Array.map<ClearingMember, (Nat, Nat, Nat, Nat)>(clearingMembers(s), func(r0) {
+      let (to, by) = switch (obligationOf(s, r0.member, k)) { case (?(_, o)) (o.owedTo, o.owedBy); case null (0, 0) };
+      (r0.member, to, by, by + r0.debt)
+    });
+    for (payers in [true, false].vals()) {
+      for ((member, to, by, pay) in plan.vals()) {
+        let ?(_, r) = clearingMember(s, member) else Runtime.trap("settle: a member vanished");
+        if (r.status != 3 and (pay > to) == payers) {
+          let cleared = func(m : ClearingMember) : ClearingMember { { m with owedTo = m.owedTo - to; owedBy = m.owedBy - by; debt = 0; fails = 0; peak = Nat.max(m.peak, by) } };
+          if (payers) {
+            let a = pay - to;
+            if (balance(s, r.settlementAccount, t.cashLedger).available >= a) {
+              move(s, r.settlementAccount, t.ccpAccount, t.cashLedger, a);
+              appendLeg(s, 2, t.cashLedger, r.settlementAccount, t.ccpAccount, a);
+              updateMember(s, r.member, cleared);
+              List.add(outcomes, (r.member, 1, a));
+            } else {
+              let penalty = ceilDiv(a * t.penaltyBps, 10_000);
+              s.skin += penalty;
+              updateMember(s, r.member, func(m : ClearingMember) : ClearingMember { { m with owedTo = m.owedTo - to; owedBy = m.owedBy - by; debt = a + penalty; fails = m.fails + 1; peak = Nat.max(m.peak, by) } });
+              List.add(outcomes, (r.member, 2, a + penalty));
+            };
+          } else {
+            let a = to - pay;
+            updateMember(s, r.member, cleared);
+            if (a > 0) {
+              if (ccpFree(s) >= a) {
+                move(s, t.ccpAccount, r.settlementAccount, t.cashLedger, a);
+                appendLeg(s, 2, t.cashLedger, t.ccpAccount, r.settlementAccount, a);
+                List.add(outcomes, (r.member, 3, a));
+              } else { owe(s, r.member, k + 1, a, 0); List.add(outcomes, (r.member, 4, a)) };
+            } else if (to != 0 or by != 0) List.add(outcomes, (r.member, 3, 0));
+          };
+          deliver(s, t, r.member, k, deliveries);
+        };
+      };
+    };
+    switch (cycleOf(s, k)) { case (?c) RS.put(s.cycleStore, cycleRows, k, { c with settled = true }); case null Runtime.trap("settle: the cycle vanished") };
+    s.settledThrough := k;
+    let fx = List.empty<Nat>();
+    List.add(fx, 34); List.add(fx, k); List.add(fx, List.size(outcomes));
+    for ((m, o, a) in List.values(outcomes)) { List.add(fx, m); List.add(fx, o); List.add(fx, a) };
+    List.add(fx, List.size(deliveries));
+    for ((m, i, q) in List.values(deliveries)) { List.add(fx, m); List.add(fx, i); List.add(fx, q) };
+    List.toArray(fx)
+  };
+  /// A member that owes nothing and is not in default receives, in each instrument, the shares the CCP holds for it free
+  /// of its sales, less what it bought in cycles after `k` (not yet paid): delivery against payment.
+  func deliver(s : State, t : ClearingTerms, member : Nat, k : Nat, out : List.List<(Nat, Nat, Nat)>) {
+    let ?(_, r) = clearingMember(s, member) else Runtime.trap("deliver: a member vanished");
+    if (r.debt != 0 or r.status != 1) return;
+    for (c in custodyRowsOf(s, member).vals()) {
+      var later = 0; var j = k + 1;
+      while (j <= s.cycleNo) { later += boughtOf(s, member, c.instrument, j); j += 1 };
+      let free = c.qty - c.held;
+      if (free > later) {
+        let d = free - later;
+        let ?i = instrument(s, c.instrument) else Runtime.trap("deliver: instrument vanished");
+        move(s, t.ccpAccount, r.settlementAccount, i.assetLedger, d);
+        putCustody(s, { c with qty = c.qty - d });
+        appendLeg(s, 2, i.assetLedger, t.ccpAccount, r.settlementAccount, d);
+        List.add(out, (member, c.instrument, d));
+      };
+    };
+  };
+  /// SPEC §21: a member in default, its orders cancelled, its shares sold and its cycles settled, has what it still owes
+  /// met in a fixed order: its collateral, its fund contribution, the venue's skin-in-the-game, then the other active
+  /// members' contributions pro rata to them (whole units; the units left go to the largest remainders, ties in member
+  /// order). What it had beyond its loss stays as its collateral, to withdraw; what no layer covers stays its debt.
+  /// Effects: [40, member, from collateral, from its fund, from skin, from others, uncovered, others, (member, amount)...].
+  func closeDefault(s : State, member : Nat) : T.Effects {
+    let ?(_, r) = clearingMember(s, member) else Runtime.trap("apply: a member vanished");
+    var rest = r.debt;
+    let fromCollateral = Nat.min(rest, r.collateral); rest -= fromCollateral;
+    let fromFund = Nat.min(rest, r.fund); rest -= fromFund;
+    let fromSkin = Nat.min(rest, s.skin); rest -= fromSkin; s.skin -= fromSkin;
+    let others = Array.filter<ClearingMember>(activeMembers(s), func(o) { o.member != member and o.fund > 0 });
+    var total = 0; for (o in others.vals()) total += o.fund;
+    let take = Nat.min(rest, total);
+    let shares = Array.tabulate<Nat>(others.size(), func(j) { if (total == 0) 0 else take * others[j].fund / total });
+    var given = 0; for (x in shares.vals()) given += x;
+    // the units left: to the largest remainders, ties in member order (the list is in member order and the sort is stable)
+    let order = Array.sort<Nat>(Array.tabulate<Nat>(others.size(), func(j) { j }), func(a, b) {
+      Nat.compare(take * others[b].fund % total, take * others[a].fund % total)
+    });
+    let extraVar = VarArray.repeat<Nat>(0, others.size());
+    var left = take - given; var j = 0;
+    while (left > 0) { extraVar[order[j]] += 1; left -= 1; j += 1 };
+    let fx = List.empty<Nat>();
+    for (x in [40, member, fromCollateral, fromFund, fromSkin, take].vals()) List.add(fx, x);
+    rest -= take;
+    List.add(fx, rest); List.add(fx, others.size());
+    for (n in Nat.range(0, others.size())) {
+      let share = shares[n] + extraVar[n];
+      updateMember(s, others[n].member, func(m : ClearingMember) : ClearingMember { { m with fund = m.fund - share } });
+      List.add(fx, others[n].member); List.add(fx, share);
+    };
+    updateMember(s, member, func(m : ClearingMember) : ClearingMember {
+      { m with collateral = m.collateral - fromCollateral + (m.fund - fromFund); fund = 0; fundRequired = 0; debt = rest; fails = 0; status = 3 }
+    });
+    List.toArray(fx)
   };
 
   /// SPEC §9: the uncross of a call auction at the price its rule fixes, then the phase it names. A price outside the
@@ -1223,14 +2006,14 @@ module {
     for ((b, a, q) in r.pairs.vals()) {
       let ?bo = order(s, b) else Runtime.trap("clear: buy vanished");
       let ?ao = order(s, a) else Runtime.trap("clear: sell vanished");
-      // the buyer pays p x q out of what it holds at its own price; the difference returns to it
-      spendHeld(s, bo.account, i0.cashLedger, bo.price * q);
-      credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);
-      credit(s, ao.account, i0.cashLedger, p * q);
-      spendHeld(s, ao.account, i0.assetLedger, q);
-      credit(s, bo.account, i0.assetLedger, q);
+      settlePair(s, inst, i0, b, bo, a, ao, p, q);
       for ((oid, o0) in [(b, bo), (a, ao)].vals()) {
-        let held = switch (o0.side) { case (#buy) o0.held - o0.price * q; case (#sell) o0.held - q };
+        // a clearing buy's margin falls with what remains; every other order's hold by what the fill took
+        let held = switch (o0.side, clearingOf(s, o0.account) != null) {
+          case (#buy, true) o0.held * (o0.remaining - q) / o0.remaining;
+          case (#buy, false) o0.held - o0.price * q;
+          case (#sell, _) o0.held - q;
+        };
         let remaining = o0.remaining - q;
         putOrder(s, oid, { o0 with remaining; filled = o0.filled + q; held; status = if (remaining == 0) #filled else #live });
       };
@@ -1254,6 +2037,55 @@ module {
       };
     };
     (p, r.volume)
+  };
+  /// One pair's settlement at the fill (SPEC §18): each side as its party's kind says. A pre-funded buyer pays out of what
+  /// it holds at its own price (the difference returns to it) and receives the shares; a pre-funded seller delivers what it
+  /// holds and is paid. A clearing party's fill is novated: its member owes or is owed the value in the open cycle, and the
+  /// shares it buys or sells are the CCP's custody. Where one side is pre-funded and the other clearing, the CCP pays or is
+  /// paid, delivers or receives. Every movement of a pre-funded party is a leg of the settlement range.
+  func settlePair(s : State, inst : Nat, i0 : T.Instrument, b : Nat, bo : T.Order, a : Nat, ao : T.Order, p : Nat, q : Nat) {
+    let v = p * q;
+    let bm = clearingOf(s, bo.account); let am = clearingOf(s, ao.account);
+    let ccp = switch (s.clearing) { case (?t) t.ccpAccount; case null 0 };
+    switch (bm) {
+      case null {
+        spendHeld(s, bo.account, i0.cashLedger, bo.price * q);
+        credit(s, bo.account, i0.cashLedger, (bo.price - p) * q);
+        credit(s, bo.account, i0.assetLedger, q);
+      };
+      case (?m) { owe(s, m, s.cycleNo, 0, v); addBought(s, m, inst, s.cycleNo, q); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty + q }) };
+    };
+    switch (am) {
+      case null { spendHeld(s, ao.account, i0.assetLedger, q); credit(s, ao.account, i0.cashLedger, v) };
+      case (?m) { owe(s, m, s.cycleNo, v, 0); let c = custodyOf(s, m, inst); putCustody(s, { c with qty = c.qty - q }) };
+    };
+    switch (bm, am) {
+      case (null, null) { appendLeg(s, 1, i0.cashLedger, bo.account, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, bo.account, q) };
+      case (null, ?_) {
+        // the CCP is paid by the buyer and delivers out of the shares it holds
+        credit(s, ccp, i0.cashLedger, v); debit(s, ccp, i0.assetLedger, q);
+        appendLeg(s, 1, i0.cashLedger, bo.account, ccp, v); appendLeg(s, 1, i0.assetLedger, ccp, bo.account, q);
+      };
+      case (?_, null) {
+        // the CCP pays the seller out of the cash committed at the buy's entry and receives the shares
+        debit(s, ccp, i0.cashLedger, v); credit(s, ccp, i0.assetLedger, q);
+        appendLeg(s, 1, i0.cashLedger, ccp, ao.account, v); appendLeg(s, 1, i0.assetLedger, ao.account, ccp, q);
+      };
+      case (?_, ?_) {};
+    };
+    // a close-out's proceeds pay its member's debt; what is left over is owed to the member in the open cycle (SPEC §20)
+    if (am == null and ao.account == ccp and ccp != 0) {
+      switch (one(s.closeoutStore, closeoutRows, "byOrder", R.key(a, 8))) {
+        case (?(_, co)) {
+          let c = custodyOf(s, co.member, inst); putCustody(s, { c with qty = c.qty - q });
+          let ?(_, r) = clearingMember(s, co.member) else Runtime.trap("close-out: a member vanished");
+          let paid = Nat.min(r.debt, v);
+          updateMember(s, co.member, func(x : ClearingMember) : ClearingMember { { x with debt = x.debt - paid } });
+          if (v > paid) owe(s, co.member, s.cycleNo, v - paid, 0);
+        };
+        case null {};
+      };
+    };
   };
   /// The quantity an order shows (SPEC §2, §13): an iceberg its peak, or what remains when less; any other order what
   /// remains.
@@ -1453,6 +2285,7 @@ module {
   public type Outcome = { #executed : { block : Nat; effects : T.Effects }; #proposed : { proposal : Cmd.ProposalId; required : Nat } };
 
   func appendExecuted(s : State, now : Nat64, caller : Principal, proposal : ?Cmd.ProposalId, version : Nat8, c : T.Command) : (Nat, T.Effects) {
+    s.applying := DL.length(s.log);
     let effects = apply(s, now, c);
     let b = DL.append(s.log, K.codec, now, caller, #executed({ proposal; version; command = c; effects }), null);
     s.lastTime := now;
@@ -1490,6 +2323,7 @@ module {
     let out = Map.empty<Nat, Bool>();
     func own(m : Nat) { if (m != 0) Map.add(out, Nat.compare, m, true) };
     func touched(oid : Nat) { switch (order(s, oid)) { case (?o) { if (Map.get(out, Nat.compare, o.member) == null) Map.add(out, Nat.compare, o.member, false) }; case null {} } };
+    func mentioned(m : Nat) { if (m != 0 and Map.get(out, Nat.compare, m) == null) Map.add(out, Nat.compare, m, false) };
     func killMember(id : Nat) : Nat { switch (kill(s, id)) { case (?k) k.member; case null 0 } };
     switch (b.event) {
       case (#executed(x)) {
@@ -1507,6 +2341,19 @@ module {
           case (#setLimits(c)) own(c.member);
           case (#borrow(c)) own(c.member);
           case (#returnBorrow(c)) own(c.member);
+          case (#admitClearing(c)) own(c.member);
+          case (#designateClearing(c)) own(c.member);
+          case (#postCollateral(c)) own(c.member);
+          case (#withdrawCollateral(c)) own(c.member);
+          case (#contributeFund(c)) own(c.member);
+          case (#declareDefault(c)) own(c.member);
+          case (#closeDefault(c)) { own(c.member); for (j in Nat.range(0, e[7])) mentioned(e[8 + 2 * j]) };
+          case (#closeOut(c)) own(c.member);
+          case (#callFund) { for (j in Nat.range(0, e[1])) mentioned(e[2 + 2 * j]) };
+          case (#settleCycle(_)) {
+            let n = e[2]; for (j in Nat.range(0, n)) mentioned(e[3 + 3 * j]);
+            let d = e[3 + 3 * n]; for (j in Nat.range(0, d)) mentioned(e[4 + 3 * n + 3 * j]);
+          };
           case (#endOfDay(_) or #expireGtd(_)) { for (oid in Array.sliceToArray<Nat>(e, 2, 2 + e[1]).vals()) touched(oid) };
           case (#clear(_)) {
             var k = 1;
@@ -1650,6 +2497,7 @@ module {
       case (#rejected(x)) { switch (RS.get(s.proposalRows, proposals, x.proposal)) { case (?row) RS.put(s.proposalRows, proposals, x.proposal, { row with status = #rejected(b.index) }); case null {} } };
       case (#expired(x)) { switch (RS.get(s.proposalRows, proposals, x.proposal)) { case (?row) RS.put(s.proposalRows, proposals, x.proposal, { row with status = #expired(b.index) }); case null {} } };
       case (#executed(x)) {
+        s.applying := b.index;
         let effects = apply(s, b.timestamp, x.command);
         switch (x.proposal) { case (?id) { switch (RS.get(s.proposalRows, proposals, id)) { case (?row) RS.put(s.proposalRows, proposals, id, { row with status = #executed(b.index) }); case null {} } }; case null {} };
         if (effects != x.effects) Runtime.trap("replay: block " # Nat.toText(b.index) # " recorded effects " # debug_show(x.effects) # " but the fold produced " # debug_show(effects));
@@ -1683,9 +2531,30 @@ module {
     table<SealRow>("seals", s.sealStore, sealRows, s.nextSeal);
     table<Blackout>("blackouts", s.blackoutStore, blackoutRows, s.nextBlackout);
     table<BorrowRow>("borrows", s.borrowStore, borrowRows, s.nextBorrow);
+    Fold.section(f, "clearing", func(w : C.Writer) { clearingScalars(s, w) });
+    table<ClearingMember>("clearingmembers", s.clearingStore, clearingRows, s.nextClearing);
+    table<Designation>("designations", s.designationStore, designationRows, s.nextDesignation);
+    table<CustodyRow>("ccpcustody", s.custodyStore, custodyRows, s.nextCustody);
+    Fold.section(f, "margins", func(w : C.Writer) { margins(s, w) });
+    table<Closeout>("closeouts", s.closeoutStore, closeoutRows, s.nextCloseout);
+    table<Obligation>("obligations", s.obligationStore, obligationRows, s.nextObligation);
+    table<Bought>("bought", s.boughtStore, boughtRows, s.nextBought);
+    table<CycleRow>("cycles", s.cycleStore, cycleRows, s.cycleNo);
+    table<Leg>("settlementlegs", s.legStore, legRows, s.nextLeg + 1);
+    table<Blob>("settlementnodes", s.nodeStore, nodeRows, s.nextNode + 1);
     Fold.section(f, "log", func(w : C.Writer) { w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)) });
     Fold.fingerprintHash(f)
   };
+  func clearingScalars(s : State, w : C.Writer) {
+    w.optBlob(switch (s.clearing) { case (?t) ?encodeTerms(t); case null null });
+    w.nat(s.cycleNo); w.nat(s.settledThrough); w.nat64(s.lastCut); w.nat(s.ccpCommitted); w.nat(s.skin)
+  };
+  func margins(s : State, w : C.Writer) { for (i in s.instrumentList.vals()) { switch (RS.get(s.marginStore, marginRows, i)) { case (?r) { w.nat(i); w.nat(r) }; case null {} } } };
+  /// One step of a table in the sliced fingerprint: its next row, or on to `after` past its end.
+  func tableStep<Rw>(w : C.Writer, run : FingerprintRun, store : RS.Store, decl : RS.Decl<Rw>, next : Nat, after : Nat) {
+    if (run.cursor < next) { switch (RS.get(store, decl, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(decl.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := after
+  };
+  func tableHead(w : C.Writer, run : FingerprintRun, name : Text, next : Nat, rows : Nat) { w.text(name); w.nat(next); run.part := rows; run.cursor := 1 };
   /// The fingerprint in slices, for a book too large to fingerprint in one message: the same bytes as `fingerprint`,
   /// fed to the same hash under the same domain, a bounded number of rows per step. A run belongs to the log's length
   /// when it started (every change to the rows comes with a block); if a block is appended meanwhile, it starts again.
@@ -1699,7 +2568,7 @@ module {
   public func stepFingerprint(s : State, run : FingerprintRun, rows : Nat) : FingerprintStep {
     if (DL.length(s.log) != run.logLength) return #restart;
     var left = Nat.max(1, rows);
-    while (left > 0 and run.part < 28) {
+    while (left > 0 and run.part < 48) {
       let w = C.Writer();
       switch (run.part) {
         case 0 { w.text("orders"); w.nat(s.nextOrder); run.part := 1; run.cursor := 1 };
@@ -1729,16 +2598,39 @@ module {
         case 24 { if (run.cursor < s.nextBlackout) { switch (RS.get(s.blackoutStore, blackoutRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(blackoutRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 25 };
         case 25 { w.text("borrows"); w.nat(s.nextBorrow); run.part := 26; run.cursor := 1 };
         case 26 { if (run.cursor < s.nextBorrow) { switch (RS.get(s.borrowStore, borrowRows, run.cursor)) { case (?r) { w.nat(run.cursor); w.blob(borrowRows.encode(r)) }; case null {} }; run.cursor += 1 } else run.part := 27 };
-        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 28 };
+        case 27 { w.text("clearing"); clearingScalars(s, w); run.part := 28 };
+        case 28 tableHead(w, run, "clearingmembers", s.nextClearing, 29);
+        case 29 tableStep<ClearingMember>(w, run, s.clearingStore, clearingRows, s.nextClearing, 30);
+        case 30 tableHead(w, run, "designations", s.nextDesignation, 31);
+        case 31 tableStep<Designation>(w, run, s.designationStore, designationRows, s.nextDesignation, 32);
+        case 32 tableHead(w, run, "ccpcustody", s.nextCustody, 33);
+        case 33 tableStep<CustodyRow>(w, run, s.custodyStore, custodyRows, s.nextCustody, 34);
+        case 34 { w.text("margins"); margins(s, w); run.part := 35 };
+        case 35 tableHead(w, run, "closeouts", s.nextCloseout, 36);
+        case 36 tableStep<Closeout>(w, run, s.closeoutStore, closeoutRows, s.nextCloseout, 37);
+        case 37 tableHead(w, run, "obligations", s.nextObligation, 38);
+        case 38 tableStep<Obligation>(w, run, s.obligationStore, obligationRows, s.nextObligation, 39);
+        case 39 tableHead(w, run, "bought", s.nextBought, 40);
+        case 40 tableStep<Bought>(w, run, s.boughtStore, boughtRows, s.nextBought, 41);
+        case 41 tableHead(w, run, "cycles", s.cycleNo, 42);
+        case 42 tableStep<CycleRow>(w, run, s.cycleStore, cycleRows, s.cycleNo, 43);
+        case 43 tableHead(w, run, "settlementlegs", s.nextLeg + 1, 44);
+        case 44 tableStep<Leg>(w, run, s.legStore, legRows, s.nextLeg + 1, 45);
+        case 45 tableHead(w, run, "settlementnodes", s.nextNode + 1, 46);
+        case 46 tableStep<Blob>(w, run, s.nodeStore, nodeRows, s.nextNode + 1, 47);
+        case _ { w.text("log"); w.nat(DL.length(s.log)); w.optBlob(DL.tipHash(s.log)); run.part := 48 };
       };
       run.digest.writeArray(w.toArray());
       left -= 1;
     };
-    if (run.part >= 28) #done(run.digest.sum()) else #more(run.part)
+    if (run.part >= 48) #done(run.digest.sum()) else #more(run.part)
   };
   public type Counts = { orders : Nat; balances : Nat; refs : Nat; blocks : Nat };
   public func counts(s : State) : Counts { { orders = RS.size(s.orderRows); balances = RS.size(s.balanceRows); refs = RS.size(s.refRows); blocks = DL.length(s.log) } };
-  public func counters(s : State) : [Nat] { [s.nextOrder, s.nextBalance, s.nextRef, Nat64.toNat(s.batchTime), s.dueCount, Nat64.toNat(s.lastTime), s.nextKill, s.nextLimit] };
+  public func counters(s : State) : [Nat] {
+    [s.nextOrder, s.nextBalance, s.nextRef, Nat64.toNat(s.batchTime), s.dueCount, Nat64.toNat(s.lastTime), s.nextKill, s.nextLimit,
+     s.nextClearing, s.nextDesignation, s.nextCustody, s.nextCloseout, s.nextObligation, s.nextBought, s.cycleNo, s.settledThrough, s.ccpCommitted, s.skin, s.nextLeg, s.nextNode]
+  };
   /// The order indexes whose entries leave as orders change (the reference index's keys never move).
   public let churnIndexes : [Text] = ["book", "stops", "own", "day", "gtd", "immediate", "trailing", "member", "trader"];
   /// Storage upkeep, not a command: one order index rebuilt without the entries of rows that left it, in slices of

@@ -76,8 +76,12 @@ module {
       };
       // effects: [22, day, rows, the file's hash, one byte an effect]
       case (#sealDay(_)) { w.byte(10); w.nat(e[1]); w.nat(e[2]); w.bytes(Array.tabulate<Nat8>(32, func(i) { Nat8.fromNat(e[3 + i]) })) };
-      // private: funds, kills, limits, insider lists, securities loans
-      case (#deposit(_) or #withdraw(_) or #flush or #kill(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #borrow(_) or #returnBorrow(_)) w.byte(0);
+      // effects: [35, order, status, price, shown, member]: the CCP's close-out order, added as any sale is (SPEC §20)
+      case (#closeOut(x)) { w.byte(4); w.nat(e[1]); w.nat(x.instrument); w.byte(2); w.nat(e[3]); w.nat(e[4]); list(w, []) };
+      // private: funds, kills, limits, insider lists, securities loans, clearing members' terms, margins and obligations
+      case (#deposit(_) or #withdraw(_) or #flush or #kill(_) or #revive(_) or #setLimits(_) or #setBlackout(_) or #liftBlackout(_) or #borrow(_) or #returnBorrow(_)
+        or #setClearing(_) or #setMargin(_) or #admitClearing(_) or #designateClearing(_) or #postCollateral(_) or #withdrawCollateral(_) or #cutCycle(_)
+        or #settleCycle(_) or #callFund or #contributeFund(_) or #fundSkin(_) or #declareDefault(_) or #closeDefault(_)) w.byte(0);
     }
   };
 
