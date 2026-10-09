@@ -1,14 +1,45 @@
 {
   "battery": "Offering",
   "grants": [
-    {"role": "2vxsx-fae", "prefixes": ["offering.", "custody."], "exact": []},
-    {"role": "aaaaa-aa", "prefixes": [], "exact": ["command.approve", "command.reject"]}
+    {
+      "role": "2vxsx-fae",
+      "prefixes": [
+        "offering.",
+        "custody."
+      ],
+      "exact": []
+    },
+    {
+      "role": "aaaaa-aa",
+      "prefixes": [],
+      "exact": [
+        "command.approve",
+        "command.reject"
+      ]
+    }
   ],
   "eligibleRole": "director",
-  "holders": ["aaaaa-aa"],
-  "offeringDuals": ["offering.open", "offering.cornerstone.commit", "offering.price", "offering.handoff", "offering.withdraw"],
-  "custodyDuals": ["custody.holder.register", "custody.asset.register", "custody.reconcile"],
+  "holders": [
+    "aaaaa-aa"
+  ],
+  "offeringDuals": [
+    "offering.open",
+    "offering.cornerstone.commit",
+    "offering.price",
+    "offering.handoff",
+    "offering.withdraw"
+  ],
+  "custodyDuals": [
+    "custody.holder.register",
+    "custody.asset.register",
+    "custody.reconcile"
+  ],
   "bookDuals": [],
   "exchangeDuals": [],
-  "ttlSeconds": 3600
+  "ttlSeconds": 3600,
+  "survDuals": [
+    "surv.params",
+    "surv.case.close",
+    "surv.case.report"
+  ]
 }

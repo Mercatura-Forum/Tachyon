@@ -1,5 +1,5 @@
 {
-  "battery": "Book",
+  "battery": "Surv",
   "grants": [
     {
       "role": "2vxsx-fae",
@@ -29,7 +29,10 @@
         "book.kill.revive",
         "book.risk.limits",
         "book.insider.blackout",
-        "book.insider.lift"
+        "book.insider.lift",
+        "surv.params",
+        "surv.case.close",
+        "surv.case.report"
       ]
     },
     {
@@ -46,7 +49,9 @@
         "book.instrument.phase",
         "book.auction.uncross",
         "book.kill.sweep",
-        "book.day.seal"
+        "book.day.seal",
+        "surv.scan",
+        "surv.report.seal"
       ]
     },
     {
@@ -138,6 +143,14 @@
         "book.order.masscancel",
         "book.kill.set",
         "book.borrow.return"
+      ]
+    },
+    {
+      "role": "3qubo-5aaaa-aaaaa-aab3q-cai",
+      "prefixes": [],
+      "exact": [
+        "surv.case.open",
+        "surv.case.note"
       ]
     }
   ],

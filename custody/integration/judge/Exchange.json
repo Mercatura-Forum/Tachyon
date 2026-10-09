@@ -106,5 +106,10 @@
     "exchange.instrument.lot",
     "exchange.clock.offset"
   ],
-  "ttlSeconds": 3600
+  "ttlSeconds": 3600,
+  "survDuals": [
+    "surv.params",
+    "surv.case.close",
+    "surv.case.report"
+  ]
 }
