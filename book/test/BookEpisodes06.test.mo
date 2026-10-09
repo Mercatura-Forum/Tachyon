@@ -15,5 +15,5 @@ w.seed := w.seed ^ Nat64.fromNat(0xE9_0000 + 6);
 let commands = w.episodes(840, 20, 60);
 Debug.print("count: episodes of random commands judged by the book and the reference = " # Nat.toText(w.seenCount("episodes")));
 Debug.print("count: random commands in the episodes = " # Nat.toText(commands));
-w.printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "uncrossed books checked", "checkpoints"]);
+w.printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "uncrossed books checked", "checkpoints", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price"]);
 if (w.failures > 0) { Debug.print("BOOK EPISODES 06 FAILED: " # Nat.toText(w.failures)); assert false } else Debug.print("BOOK EPISODES 06 GREEN");

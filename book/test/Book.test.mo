@@ -52,7 +52,7 @@ import TR "../../custody/test/support/Transcript";
 import W "support/World";
 
 let w = W.World(true);
-let { act; advance; avail; bytes; cancel; cash; check; checkpoint; clearer; clientRef; day; depRef; deposit; depository; depthText; egxBands; executes; lastClear; lim; n; newRun; operator; order; pick; placed; printCoverage; randomStream; refusedAs; replayed; rnd; scheduler; seen; seenCount; settle; sharesA; sharesB; sharesC; sharesD; status; stranger; t1; t2; t3; t4; tick; today; uncrossed; xs } = w;
+let { act; advance; govern; avail; bytes; cancel; cash; check; checkpoint; clearer; clientRef; day; depRef; deposit; depository; depthText; egxBands; executes; lastClear; lim; n; newRun; operator; order; pick; placed; printCoverage; randomStream; refusedAs; replayed; rnd; scheduler; seen; seenCount; settle; sharesA; sharesB; sharesC; sharesD; status; stranger; t1; t2; t3; t4; tick; today; uncrossed; xs } = w;
 
 // ─── PART 1: the catalogue, the encoding ─────────────────────────────────────────────────────
 let cat = B.catalogue();
@@ -63,18 +63,22 @@ check(not Perm.clean(Perm.validate(missingOne, B.commandNames, B.methodNames)), 
 for ((id, reason) in B.singleActs().vals()) { switch (Perm.byId(cat, id)) { case (?p) check(not p.dualByDefault and reason.size() > 40, "single act " # id # " has its reason"); case null check(false, "single act " # id # " exists") } };
 for (p in cat.vals()) { if (not p.dualByDefault and Text.startsWith(p.id, #text "book.")) check(Array.find<(Text, Text)>(B.singleActs(), func(x) { x.0 == p.id }) != null, "single permission " # p.id # " has its reason recorded") };
 check(B.checkSums(), "row widths hold their fields");
-check(K.families.size() == 13, "thirteen command families");
+check(K.families.size() == 21, "twenty-one command families");
 Debug.print("count: catalogue rows validated in both directions = " # Nat.toText(report.checked));
 
 let sampleCommands : [T.Command] = [
-  #openInstrument({ instrument = 1; assetLedger = sharesA; cashLedger = cash; lot = 10; referencePrice = 85_000; bands = egxBands; collarBps = 500 }),
+  #openInstrument({ instrument = 1; assetLedger = sharesA; cashLedger = cash; lot = 10; referencePrice = 85_000; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }),
   #setTrading({ instrument = 1; open = true }), #setTrading({ instrument = 1; open = false }), #setReference({ instrument = 1; price = 85_010 }),
   #deposit({ account = 1; ledger = cash; amount = 5_000_000; reference = bytes(7, 32) }), #withdraw({ account = 1; ledger = sharesA; amount = 10 }),
-  #placeOrder({ account = 1; instrument = 1; side = #buy; kind = #limit; qty = 100; price = 85_000; stopPrice = 0; peak = 20; validity = #gtd; gtdDay = 20_514; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "c-1"; oco = 0; trail = 0 }),
-  #placeOrder({ account = 3; instrument = 1; side = #sell; kind = #trailingStop; qty = 20; price = 0; stopPrice = 84_500; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #principal; shortSale = false; clientRef = "c-3"; oco = 0; trail = 300 }),
-  #placeOrder({ account = 2; instrument = 2; side = #sell; kind = #stopLimit; qty = 7; price = 1_990; stopPrice = 1_985; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelBoth; capacity = #principal; shortSale = true; clientRef = "طلب-٢"; oco = 9; trail = 0 }),
+  #placeOrder({ account = 1; instrument = 1; side = #buy; kind = #limit; qty = 100; price = 85_000; stopPrice = 0; peak = 20; validity = #gtd; gtdDay = 20_514; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "c-1"; oco = 0; trail = 0; member = w.memberOf(1); trader = w.traderIdOf(w.traderOf(1)) }),
+  #placeOrder({ account = 3; instrument = 1; side = #sell; kind = #trailingStop; qty = 20; price = 0; stopPrice = 84_500; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #principal; shortSale = false; clientRef = "c-3"; oco = 0; trail = 300; member = w.memberOf(3); trader = w.traderIdOf(w.traderOf(3)) }),
+  #placeOrder({ account = 2; instrument = 2; side = #sell; kind = #stopLimit; qty = 7; price = 1_990; stopPrice = 1_985; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelBoth; capacity = #principal; shortSale = true; clientRef = "طلب-٢"; oco = 9; trail = 0; member = w.memberOf(2); trader = w.traderIdOf(w.traderOf(2)) }),
   #cancelOrder({ order = 3 }), #amendOrder({ order = 3; qty = 50; price = 84_990 }), #massCancel({ account = 4; limit = 100 }), #flush,
   #endOfDay({ limit = 500 }), #expireGtd({ day = 20_514; limit = 50 }), #clear({ time = 1_772_445_600_000_000_000 }),
+  #setPhase({ instrument = 1; phase = #auction; endFrom = 1_772_445_600_000_000_000; endTo = 1_772_446_200_000_000_000 }), #setPhase({ instrument = 2; phase = #tradeAtClose; endFrom = 0; endTo = 0 }),
+  #uncross({ instrument = 1; next = #continuous }), #halt({ instrument = 1; reason = "pending disclosure" }), #resume({ instrument = 1 }),
+  #kill({ member = 2; trader = 0; reason = "the member's risk desk" }), #kill({ member = 0; trader = 3; reason = "a runaway algorithm" }), #killSweep({ kill = 1; limit = 500 }),
+  #revive({ kill = 1 }), #setLimits({ member = 1; maxOrderQty = 1_000; maxOrderValue = 90_000_000; creditLimit = 2_000_000_000 }),
 ];
 var roundTrips = 0;
 for (c in sampleCommands.vals()) {
@@ -90,7 +94,7 @@ var familiesCovered = 0;
 for (f in K.families.vals()) { if (Array.find<T.Command>(sampleCommands, func(c) { K.familyOf(c) == f }) != null) familiesCovered += 1 };
 check(familiesCovered == K.families.size(), "every family has a sample command");
 check(E.readAt(K.registry, 1 : Nat8, C.Reader([14 : Nat8])) == null, "an unknown family tag is a decode fault");
-check(K.sideOf(3) == null and K.kindOf(8) == null and K.validityOf(0) == null and K.selfTradeOf(4) == null and K.statusOf(5) == null and K.capacityOf(3) == null, "an unknown vocabulary byte decodes to nothing");
+check(K.phaseOf(7) == null and K.sideOf(3) == null and K.kindOf(8) == null and K.validityOf(0) == null and K.selfTradeOf(4) == null and K.statusOf(5) == null and K.capacityOf(3) == null, "an unknown vocabulary byte decodes to nothing");
 Debug.print("count: commands round-tripped through encoding v1 = " # Nat.toText(roundTrips));
 
 let m = newRun(true);
@@ -102,16 +106,16 @@ refusedAs(m, t1, #clear({ time = w.now }), "a:NoGrant", "a trader submits a clea
 refusedAs(m, clearer, #clear({ time = w.now }), "e:ClearNotSubmittable", "even a principal granted the clear cannot submit one");
 refusedAs(m, scheduler, lim(1, 1, #buy, 10, 85_000, "x"), "a:NoGrant", "the scheduler places an order");
 // the instruments
-refusedAs(m, operator, #openInstrument({ instrument = 1; assetLedger = sharesA; cashLedger = cash; lot = 10; referencePrice = 85_000; bands = egxBands; collarBps = 500 }), "e:InstrumentOpenAlready", "an instrument opened twice");
-refusedAs(m, operator, #openInstrument({ instrument = 3; assetLedger = sharesC; cashLedger = cash; lot = 1; referencePrice = 50_000; bands = egxBands; collarBps = 500 }), "e:UnknownInstrument", "a delisted instrument opened");
-refusedAs(m, operator, #openInstrument({ instrument = 9; assetLedger = sharesC; cashLedger = cash; lot = 1; referencePrice = 50_000; bands = egxBands; collarBps = 500 }), "e:UnknownInstrument", "an instrument the exchange never listed");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesC; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 500 }), "e:InstrumentMismatch", "an opening naming another asset ledger");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = sharesA; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 500 }), "e:InstrumentMismatch", "an opening naming another cash ledger");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 10; referencePrice = 12_340; bands = egxBands; collarBps = 500 }), "e:InstrumentMismatch", "an opening naming another lot");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = [{ fromPrice = 0; tick = 1 }]; collarBps = 500 }), "e:InstrumentMismatch", "an opening naming other bands");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 0 }), "e:InvalidTerms", "a collar of nothing");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 10_000 }), "e:InvalidTerms", "a collar of the whole price");
-refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_345; bands = egxBands; collarBps = 500 }), "e:PriceOffTick", "a reference price off the tick");
+refusedAs(m, operator, #openInstrument({ instrument = 1; assetLedger = sharesA; cashLedger = cash; lot = 10; referencePrice = 85_000; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InstrumentOpenAlready", "an instrument opened twice");
+refusedAs(m, operator, #openInstrument({ instrument = 3; assetLedger = sharesC; cashLedger = cash; lot = 1; referencePrice = 50_000; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:UnknownInstrument", "a delisted instrument opened");
+refusedAs(m, operator, #openInstrument({ instrument = 9; assetLedger = sharesC; cashLedger = cash; lot = 1; referencePrice = 50_000; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:UnknownInstrument", "an instrument the exchange never listed");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesC; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InstrumentMismatch", "an opening naming another asset ledger");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = sharesA; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InstrumentMismatch", "an opening naming another cash ledger");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 10; referencePrice = 12_340; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InstrumentMismatch", "an opening naming another lot");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = [{ fromPrice = 0; tick = 1 }]; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InstrumentMismatch", "an opening naming other bands");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 0; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InvalidTerms", "a collar of nothing");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_340; bands = egxBands; collarBps = 10_000; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InvalidTerms", "a collar of the whole price");
+refusedAs(m, operator, #openInstrument({ instrument = 4; assetLedger = sharesD; cashLedger = cash; lot = 5; referencePrice = 12_350; bands = egxBands; collarBps = 500; staticBps = 2_000; dynamicBps = 0; interruptSecs = 600 }), "e:InstrumentMismatch", "an opening with a reference other than the exchange's (the first day's, SPEC §12)");
 refusedAs(m, scheduler, #setTrading({ instrument = 9; open = true }), "e:UnknownInstrument", "trading an instrument the book does not hold");
 refusedAs(m, scheduler, #setTrading({ instrument = 1; open = false }), "e:InvalidTerms", "closing a closed instrument");
 refusedAs(m, scheduler, #setReference({ instrument = 1; price = 85_005 }), "e:PriceOffTick", "a reference off the 0.01 tick");
@@ -199,7 +203,7 @@ let c1 = avail(m, 1, cash); let c9 = avail(m, 9, cash); let a1 = avail(m, 1, sha
 let s1b = placed(m, lim(1, 1, #buy, 100, 85_000, "s1b"));
 let s1s = placed(m, lim(9, 1, #sell, 100, 84_990, "s1s"));
 settle(m);
-scenario(lastClear(m) == [13, 1, 84_990, 100, 1, s1b, s1s, 100, 0, 0], "one price for the batch: " # debug_show(lastClear(m)));
+scenario(lastClear(m) == [13, 1, 84_990, 100, 1, s1b, s1s, 100, 0, 0, 0], "one price for the batch: " # debug_show(lastClear(m)));
 scenario(avail(m, 1, cash) == c1 - 8_499_000 and avail(m, 9, cash) == c9 + 8_499_000 and avail(m, 1, sharesA) == a1 + 100 and avail(m, 9, sharesA) == a9 - 100, "the buyer pays the clear's price, the difference to its limit returned");
 scenario(status(m, s1b) == ?#filled and status(m, s1s) == ?#filled, "both filled");
 // priority by batch: two sells at one price in two batches; the buy takes the earlier
@@ -207,7 +211,7 @@ ignore tick(); let s2a = placed(m, lim(9, 1, #sell, 100, 85_000, "s2a"));
 ignore tick(); let s2b = placed(m, lim(10, 1, #sell, 100, 85_000, "s2b"));
 ignore tick(); let s2c = placed(m, lim(1, 1, #buy, 100, 85_000, "s2c"));
 settle(m);
-scenario(lastClear(m) == [13, 1, 85_000, 100, 1, s2c, s2a, 100, 0, 0] and status(m, s2b) == ?#live, "the earlier batch fills first");
+scenario(lastClear(m) == [13, 1, 85_000, 100, 1, s2c, s2a, 100, 0, 0, 0] and status(m, s2b) == ?#live, "the earlier batch fills first");
 cancel(m, s2b);
 // pro rata in lots: three sells of one lot in one batch, a buy of two lots: two lots go by the largest remainders
 // (all equal), ties by key: the sell with the greatest key gets nothing
@@ -226,7 +230,7 @@ ignore tick();
 let f1 = placed(m, lim(9, 1, #sell, 100, 85_000, "s4a"));
 let f2 = placed(m, order(1, 1, #buy, #fok, 200, 85_000, 0, 0, #day, 0, #cancelResting, "s4b", 0));
 settle(m);
-scenario(lastClear(m) == [13, 1, 0, 0, 0, 1, f2, 0] and status(m, f1) == ?#live and B.balance(m.st, 1, cash).held == 0, "fill-or-kill removed, nothing traded");
+scenario(lastClear(m) == [13, 1, 0, 0, 0, 1, f2, 0, 0] and status(m, f1) == ?#live and B.balance(m.st, 1, cash).held == 0, "fill-or-kill removed, nothing traded");
 cancel(m, f1);
 // a market buy at its collar: 85.000 x 1.05 = 89.250, on the 0.01 tick; it holds 10 x 89.250 and pays 86.000
 ignore tick();
@@ -235,7 +239,7 @@ let mb = placed(m, order(2, 1, #buy, #market, 10, 0, 0, 0, #day, 0, #cancelResti
 scenario((switch (B.order(m.st, mb)) { case (?o) o.price == 89_250 and o.held == 892_500; case null false }), "the market order's collar price and holding");
 let c2 = avail(m, 2, cash);
 settle(m);
-scenario(lastClear(m) == [13, 1, 86_000, 10, 1, mb, ms, 10, 0, 0] and avail(m, 2, cash) == c2 + 32_500, "the market order trades at the clear's price, the rest of its holding returned");
+scenario(lastClear(m) == [13, 1, 86_000, 10, 1, mb, ms, 10, 0, 0, 0] and avail(m, 2, cash) == c2 + 32_500, "the market order trades at the clear's price, the rest of its holding returned");
 // a stop-limit triggered by a clear's price is judged for self-trade then: its cancel-resting instruction cancels the
 // account's own sell it w.now crosses
 ignore tick();
@@ -243,9 +247,9 @@ let s6r = placed(m, lim(2, 1, #sell, 10, 86_150, "s6r"));
 let s6s = placed(m, order(2, 1, #buy, #stopLimit, 10, 86_200, 86_100, 0, #gtc, 0, #cancelResting, "s6s", 0));
 let s6b = placed(m, lim(9, 1, #buy, 10, 86_100, "s6b")); let s6c = placed(m, lim(10, 1, #sell, 10, 86_100, "s6c"));
 settle(m);
-scenario(lastClear(m) == [13, 1, 86_100, 10, 1, s6b, s6c, 10, 0, 0] and status(m, s6s) == ?#waiting, "the trade at 86.100; the stop waits for the next clear");
+scenario(lastClear(m) == [13, 1, 86_100, 10, 1, s6b, s6c, 10, 0, 0, 0] and status(m, s6s) == ?#waiting, "the trade at 86.100; the stop waits for the next clear");
 settle(m);
-scenario(lastClear(m) == [13, 1, 0, 0, 0, 1, s6r, 1, s6s] and status(m, s6r) == ?#cancelled and status(m, s6s) == ?#live, "triggered, the stop cancels the account's own crossing sell");
+scenario(lastClear(m) == [13, 1, 0, 0, 0, 1, s6r, 1, s6s, 0] and status(m, s6r) == ?#cancelled and status(m, s6s) == ?#live, "triggered, the stop cancels the account's own crossing sell");
 cancel(m, s6s);
 // one-cancels-other: the limit sell fills, its linked stop is cancelled in the same clear
 ignore tick();
@@ -254,17 +258,17 @@ let o2 = placed(m, order(3, 1, #sell, #stop, 10, 0, 84_000, 0, #day, 0, #cancelR
 scenario((switch (B.order(m.st, o1)) { case (?o) o.oco == o2; case null false }), "the pair linked both ways");
 let o3 = placed(m, lim(9, 1, #buy, 10, 86_000, "s7b"));
 settle(m);
-scenario(lastClear(m) == [13, 1, 86_000, 10, 1, o3, o1, 10, 1, o2, 0] and status(m, o2) == ?#cancelled, "the fill cancels the linked stop");
+scenario(lastClear(m) == [13, 1, 86_000, 10, 1, o3, o1, 10, 1, o2, 0, 0] and status(m, o2) == ?#cancelled, "the fill cancels the linked stop");
 // an iceberg: its whole peak filled, it takes the clear's batch as its priority, behind an order entered after it
 ignore tick(); let ice = placed(m, order(4, 1, #sell, #limit, 50, 85_500, 0, 10, #gtc, 0, #cancelResting, "s8i", 0));
 ignore tick(); let pl = placed(m, lim(5, 1, #sell, 10, 85_500, "s8p"));
 ignore tick(); let b1 = placed(m, lim(9, 1, #buy, 10, 85_500, "s8b1"));
 let tb1 = w.now;
 settle(m);
-scenario(lastClear(m) == [13, 1, 85_500, 10, 1, b1, ice, 10, 0, 0] and (switch (B.order(m.st, ice)) { case (?o) o.remaining == 40 and o.prio == tb1; case null false }), "the iceberg fills its peak first and its priority moves to that batch");
+scenario(lastClear(m) == [13, 1, 85_500, 10, 1, b1, ice, 10, 0, 0, 0] and (switch (B.order(m.st, ice)) { case (?o) o.remaining == 40 and o.prio == tb1; case null false }), "the iceberg fills its peak first and its priority moves to that batch");
 ignore tick(); let b2 = placed(m, lim(9, 1, #buy, 10, 85_500, "s8b2"));
 settle(m);
-scenario(lastClear(m) == [13, 1, 85_500, 10, 1, b2, pl, 10, 0, 0], "the plain order w.now ahead of the refreshed iceberg");
+scenario(lastClear(m) == [13, 1, 85_500, 10, 1, b2, pl, 10, 0, 0, 0], "the plain order now ahead of the refreshed iceberg");
 cancel(m, ice);
 // a closed instrument: nothing trades, the immediate order ends, the resting ones wait and trade when it opens
 ignore tick(); ignore executes(m, scheduler, #setTrading({ instrument = 2; open = false }), "close 2");
@@ -272,10 +276,10 @@ ignore tick();
 let q1 = placed(m, lim(9, 2, #sell, 1, 1_990, "s9s")); let q2 = placed(m, lim(1, 2, #buy, 1, 1_995, "s9b"));
 let q3 = placed(m, order(2, 2, #buy, #ioc, 1, 1_995, 0, 0, #day, 0, #cancelResting, "s9i", 0));
 settle(m);
-scenario(lastClear(m) == [13, 2, 0, 0, 0, 1, q3, 0] and status(m, q1) == ?#live and status(m, q2) == ?#live, "closed: the immediate order cancelled, the limits wait");
+scenario(lastClear(m) == [13, 2, 0, 0, 0, 1, q3, 0, 0] and status(m, q1) == ?#live and status(m, q2) == ?#live, "closed: the immediate order cancelled, the limits wait");
 ignore tick(); ignore executes(m, scheduler, #setTrading({ instrument = 2; open = true }), "open 2");
 settle(m);
-scenario(lastClear(m) == [13, 2, 1_990, 1, 1, q2, q1, 1, 0, 0], "open again: the waiting orders trade");
+scenario(lastClear(m) == [13, 2, 1_990, 1, 1, q2, q1, 1, 0, 0, 0], "open again: the waiting orders trade");
 // amendments: a smaller quantity at the same price keeps the priority, a new price takes the batch's
 ignore tick(); let am = placed(m, lim(1, 1, #buy, 100, 84_000, "s10")); let pa = switch (B.order(m.st, am)) { case (?o) o.prio; case null 0 };
 ignore tick();
@@ -304,7 +308,7 @@ let eod = executes(m, scheduler, #endOfDay({ limit = 500 }), "end of day");
 scenario(dayOrders == 150 and eod.size() == 152 and eod[1] == 150, "the end of day sweeps all 150 day orders across pages");
 // a trailing stop: a sell trailing 3.00 below the price, from a stop of 84.000; a trade at 86.000 moves it to 85.700, a
 // trade at 85.600 does not move it and reaches it, so it triggers at the next clear: a market sell with no buyer, ended
-let ts = placed(m, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #trailingStop; qty = 10; price = 0; stopPrice = 84_000; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #principal; shortSale = false; clientRef = "s12t"; oco = 0; trail = 300 }));
+let ts = placed(m, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #trailingStop; qty = 10; price = 0; stopPrice = 84_000; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #principal; shortSale = false; clientRef = "s12t"; oco = 0; trail = 300; member = w.memberOf(4); trader = w.traderIdOf(w.traderOf(4)) }));
 ignore tick(); ignore placed(m, lim(9, 1, #buy, 10, 86_000, "s12a")); ignore placed(m, lim(10, 1, #sell, 10, 86_000, "s12b"));
 settle(m);
 scenario((switch (B.order(m.st, ts)) { case (?o) o.stopPrice == 85_700 and o.status == #waiting; case null false }), "the trade at 86.000 moves the trailing stop to 85.700");
@@ -312,14 +316,135 @@ ignore tick(); ignore placed(m, lim(9, 1, #buy, 10, 85_600, "s12c")); ignore pla
 settle(m);
 scenario((switch (B.order(m.st, ts)) { case (?o) o.stopPrice == 85_700 and o.status == #waiting; case null false }), "a lower trade does not move it");
 settle(m);
-scenario(lastClear(m) == [13, 1, 0, 0, 0, 1, ts, 1, ts] and status(m, ts) == ?#cancelled, "reached, it triggers at the next clear and ends unfilled: " # debug_show(lastClear(m)));
-refusedAs(m, t1, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #trailingStop; qty = 10; price = 0; stopPrice = 84_000; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s12x"; oco = 0; trail = 305 }), "e:InvalidPrice", "a trail off the tick");
-refusedAs(m, t1, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #limit; qty = 10; price = 90_000; stopPrice = 0; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s12y"; oco = 0; trail = 300 }), "e:InvalidTerms", "a trail on a limit order");
+scenario(lastClear(m) == [13, 1, 0, 0, 0, 1, ts, 1, ts, 0] and status(m, ts) == ?#cancelled, "reached, it triggers at the next clear and ends unfilled: " # debug_show(lastClear(m)));
+refusedAs(m, t1, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #trailingStop; qty = 10; price = 0; stopPrice = 84_000; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s12x"; oco = 0; trail = 305; member = w.memberOf(4); trader = w.traderIdOf(w.traderOf(4)) }), "e:InvalidPrice", "a trail off the tick");
+refusedAs(m, t1, #placeOrder({ account = 4; instrument = 1; side = #sell; kind = #limit; qty = 10; price = 90_000; stopPrice = 0; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s12y"; oco = 0; trail = 300; member = w.memberOf(4); trader = w.traderIdOf(w.traderOf(4)) }), "e:InvalidTerms", "a trail on a limit order");
 // the cap on trailing stops: an instrument holds 64 per side; the 65th is refused, then the 64 are cancelled
 var trailingPlaced = 0;
-for (k in Nat.range(0, 64)) { if (placed(m, #placeOrder({ account = 5; instrument = 2; side = #sell; kind = #trailingStop; qty = 1; price = 0; stopPrice = 1_900 - k; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s14-" # n(k); oco = 0; trail = 20 })) > 0) trailingPlaced += 1 };
-refusedAs(m, t1, #placeOrder({ account = 5; instrument = 2; side = #sell; kind = #trailingStop; qty = 1; price = 0; stopPrice = 1_800; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s14-x"; oco = 0; trail = 20 }), "e:TrailingStopsFull", "a 65th trailing stop on one side");
+for (k in Nat.range(0, 64)) { if (placed(m, #placeOrder({ account = 5; instrument = 2; side = #sell; kind = #trailingStop; qty = 1; price = 0; stopPrice = 1_900 - k; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s14-" # n(k); oco = 0; trail = 20; member = w.memberOf(5); trader = w.traderIdOf(w.traderOf(5)) })) > 0) trailingPlaced += 1 };
+refusedAs(m, t1, #placeOrder({ account = 5; instrument = 2; side = #sell; kind = #trailingStop; qty = 1; price = 0; stopPrice = 1_800; peak = 0; validity = #day; gtdDay = 0; selfTrade = #cancelResting; capacity = #agency; shortSale = false; clientRef = "s14-x"; oco = 0; trail = 20; member = w.memberOf(5); trader = w.traderIdOf(w.traderOf(5)) }), "e:TrailingStopsFull", "a 65th trailing stop on one side");
 scenario(trailingPlaced == 64 and executes(m, t1, #massCancel({ account = 5; limit = 500 }), "mass cancel")[1] == 64, "64 trailing stops held and cancelled");
+// ─── Phases, auctions, bands, halts, the kill switch, risk limits (SPEC §8 to §12) ───────
+// the opening auction (§9): a buy at 85.700 and a sell at 85.500 execute 100 at either price with no surplus; the rule
+// takes the reference (the last price, 85.600), a price no order named
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #auction; endFrom = 0; endTo = 0 }), "auction");
+refusedAs(m, t1, order(1, 1, #buy, #ioc, 10, 85_000, 0, 0, #day, 0, #cancelResting, "s15x", 0), "e:InvalidTerms", "no immediate-or-cancel order in an auction");
+let ob = placed(m, lim(1, 1, #buy, 100, 85_700, "s15b")); let os = placed(m, lim(9, 1, #sell, 100, 85_500, "s15s"));
+settle(m);
+scenario(lastClear(m) == [13, 1, 0, 0, 0, 0, 0, 0] and status(m, ob) == ?#live, "in the auction nothing trades");
+scenario(B.indicative(m.st, 1) == ?{ price = 85_600; volume = 100; surplus = 0; withinBand = true } and B.indicative(m.st, 2) == null, "the indicative price: 85.600 for 100, no surplus; none for an instrument not in a call phase");
+ignore tick();
+scenario(executes(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "uncross") == [15, 1, 85_600, 100, 1, ob, os, 100, 0, 2], "the uncross at the reference, 85.600, between the two");
+// market pressure: a buy surplus at both prices of the most volume takes the higher
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #auction; endFrom = 0; endTo = 0 }), "auction");
+let mpb = placed(m, lim(1, 1, #buy, 300, 85_700, "s15c")); let ps1 = placed(m, lim(9, 1, #sell, 100, 85_500, "s15d")); let ps2 = placed(m, lim(10, 1, #sell, 100, 85_650, "s15e"));
+ignore tick();
+let u2 = executes(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "uncross");
+scenario(u2.size() > 4 and u2[2] == 85_700 and u2[3] == 200 and status(m, ps1) == ?#filled and status(m, ps2) == ?#filled and (switch (B.order(m.st, mpb)) { case (?o) o.remaining == 100; case null false }), "a buy surplus takes the higher price, 85.700");
+cancel(m, mpb);
+// the closing auction sets the closing price; trade at close then trades at it only
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #closingAuction; endFrom = 0; endTo = 0 }), "closing auction");
+let cb = placed(m, lim(2, 1, #buy, 50, 85_800, "s16a")); let cs = placed(m, lim(10, 1, #sell, 50, 85_800, "s16b"));
+ignore tick();
+scenario(executes(m, scheduler, #uncross({ instrument = 1; next = #tradeAtClose }), "uncross") == [15, 1, 85_800, 50, 1, cb, cs, 50, 0, 5]
+  and (switch (B.instrument(m.st, 1)) { case (?x) x.closePrice == 85_800 and x.phase == #tradeAtClose; case null false }), "the closing price 85.800, then trade at close");
+ignore tick();
+let tb = placed(m, lim(2, 1, #buy, 30, 86_000, "s16c")); let ts1 = placed(m, lim(10, 1, #sell, 30, 85_800, "s16d")); let ts2 = placed(m, lim(11, 1, #sell, 30, 85_700, "s16e"));
+settle(m);
+scenario(lastClear(m) == [13, 1, 85_800, 30, 1, tb, ts2, 30, 0, 0, 0] and status(m, ts1) == ?#live, "trade at close at 85.800 only, the earlier batch's lower sell first by price");
+cancel(m, ts1);
+// an uncross outside the static band: the orders entered inside it; the reference then moved to 80.000, whose band
+// (64.000 to 96.000) excludes the price the rule fixes (100.000, the lower of the two): nothing trades, the auction goes on
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #auction; endFrom = 0; endTo = 0 }), "auction");
+let xb = placed(m, lim(1, 1, #buy, 10, 101_000, "s16f")); let xs9 = placed(m, lim(9, 1, #sell, 10, 100_000, "s16g"));
+ignore tick(); ignore executes(m, scheduler, #setReference({ instrument = 1; price = 80_000 }), "reference");
+ignore tick();
+scenario((switch (B.indicative(m.st, 1)) { case (?v) v.price == 100_000 and not v.withinBand; case null false }), "the indicative price 100.000 lies outside the static band around 80.000");
+scenario(executes(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "uncross") == [15, 1, 0, 0, 0, 0, 3]
+  and status(m, xb) == ?#live and status(m, xs9) == ?#live, "an uncross outside the static band trades nothing, the auction continuing");
+cancel(m, xb); cancel(m, xs9);
+ignore tick(); ignore executes(m, scheduler, #setReference({ instrument = 1; price = 85_000 }), "reference");
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #continuous; endFrom = 0; endTo = 0 }), "continuous");
+// a volatility interruption (§10): two orders at 100.000 in one batch, the reference moved to 80.000 in the same block;
+// the clear's price lies outside the static band, so nothing trades and the instrument goes to an auction for 600 s
+ignore tick();
+let vb = placed(m, lim(1, 1, #buy, 10, 100_000, "s16h")); let vs = placed(m, lim(9, 1, #sell, 10, 100_000, "s16i"));
+ignore executes(m, scheduler, #setReference({ instrument = 1; price = 80_000 }), "reference");
+settle(m);
+scenario(lastClear(m) == [13, 1, 0, 0, 0, 0, 0, 1] and status(m, vb) == ?#live
+  and (switch (B.instrument(m.st, 1)) { case (?x) x.phase == #auction and x.interruptUntil == w.now - 1_000_000_000 + 600_000_000_000; case null false }), "a clear outside the static band interrupts: an auction until 600 s on");
+refusedAs(m, scheduler, #setPhase({ instrument = 1; phase = #continuous; endFrom = 0; endTo = 0 }), "e:InvalidTerms", "a phase set during an interruption");
+refusedAs(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "e:AuctionNotEnded", "an uncross before the interruption ends");
+advance(600);
+ignore tick(); ignore executes(m, scheduler, #setReference({ instrument = 1; price = 85_000 }), "reference");
+scenario(executes(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "uncross") == [15, 1, 100_000, 10, 1, vb, vs, 10, 0, 2], "the interruption's uncross at 100.000, back to continuous");
+// The reference-price rule, surpluses on both sides: 99.800, 99.900 (buy surplus 100), 99.950 and 101.000 (sell surplus
+// 100) tie on volume 100 and surplus 100; the reference, the last price 100.000, is held against the highest price with a
+// buy surplus and the lowest with a sell surplus (99.900 to 99.950), not the whole range: the price is 99.950
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #auction; endFrom = 0; endTo = 0 }), "auction");
+let gtb1 = placed(m, lim(1, 1, #buy, 100, 99_900, "s16j")); let gtb2 = placed(m, lim(2, 1, #buy, 100, 101_000, "s16k"));
+let gts9 = placed(m, lim(9, 1, #sell, 50, 99_000, "s16l")); let gts10 = placed(m, lim(10, 1, #sell, 50, 99_800, "s16m")); let gts11 = placed(m, lim(11, 1, #sell, 100, 99_950, "s16n"));
+ignore tick();
+scenario(B.indicative(m.st, 1) == ?{ price = 99_950; volume = 100; surplus = -100; withinBand = true }, "the indicative price 99.950 for 100, a sell surplus of 100");
+let u3 = executes(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "uncross");
+scenario(u3.size() > 4 and u3[2] == 99_950 and u3[3] == 100 and status(m, gts9) == ?#filled and status(m, gts10) == ?#filled and status(m, gtb2) == ?#filled
+  and status(m, gtb1) == ?#live and status(m, gts11) == ?#live, "surpluses on both sides: the reference held against 99.900 to 99.950, the price 99.950");
+cancel(m, gtb1); cancel(m, gts11);
+// refusals of the phases and the bands
+refusedAs(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "e:NotInAuction", "an uncross in continuous trading");
+refusedAs(m, scheduler, #setPhase({ instrument = 1; phase = #continuous; endFrom = 0; endTo = 0 }), "e:InvalidTerms", "a phase the instrument is in");
+refusedAs(m, scheduler, #setPhase({ instrument = 1; phase = #tradeAtClose; endFrom = 5; endTo = 9 }), "e:InvalidTerms", "a random end for trade at close");
+refusedAs(m, t1, lim(1, 1, #buy, 10, 106_000, "s17x"), "e:PriceOutsideBand", "a buy above the static band (20 per cent of 85.000)");
+let an = placed(m, lim(1, 1, #buy, 10, 85_000, "s17a"));
+refusedAs(m, t1, #amendOrder({ order = an; qty = 10; price = 60_000 }), "e:PriceOutsideBand", "an amendment below the static band");
+cancel(m, an);
+ignore tick(); ignore executes(m, scheduler, #setPhase({ instrument = 1; phase = #auction; endFrom = w.now + 10_000_000_000; endTo = w.now + 20_000_000_000 }), "auction with a random end");
+refusedAs(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "e:AuctionNotEnded", "an uncross before the random end's window");
+advance(11);
+scenario(executes(m, scheduler, #uncross({ instrument = 1; next = #continuous }), "uncross") == [15, 1, 0, 0, 0, 0, 2], "an uncross in its window, nothing to trade");
+// a halt (four eyes): no order accepted, none amended; a cancel is; the resumption is an auction
+let hb = placed(m, lim(9, 2, #buy, 5, 1_990, "s18a"));
+ignore tick();
+scenario(govern(m, #halt({ instrument = 2; reason = "pending disclosure" })) == #ok(#executed({ block = DL.length(m.st.log) - 1; effects = [16, 2] })), "halted under four eyes");
+refusedAs(m, t3, lim(10, 2, #sell, 5, 1_990, "s18b"), "e:InstrumentHalted", "an order on a halted instrument");
+refusedAs(m, t3, #amendOrder({ order = hb; qty = 4; price = 1_990 }), "e:InstrumentHalted", "an amendment on a halted instrument");
+refusedAs(m, scheduler, #setPhase({ instrument = 2; phase = #continuous; endFrom = 0; endTo = 0 }), "e:InstrumentHalted", "a scheduled phase on a halted instrument");
+refusedAs(m, operator, #halt({ instrument = 2; reason = "again" }), "e:InstrumentHalted", "a halt of a halted instrument");
+cancel(m, hb);
+ignore tick();
+scenario(govern(m, #resume({ instrument = 2 })) == #ok(#executed({ block = DL.length(m.st.log) - 1; effects = [17, 2] })) and (switch (B.instrument(m.st, 2)) { case (?x) x.phase == #auction; case null false }), "resumed into an auction");
+refusedAs(m, operator, #resume({ instrument = 2 }), "e:InvalidTerms", "a resumption of an instrument not halted");
+ignore tick(); ignore executes(m, scheduler, #uncross({ instrument = 2; next = #continuous }), "uncross");
+// the kill switch: member 2 blocked, its open orders swept in slices, revived under four eyes once none is open
+let kb1 = placed(m, lim(9, 2, #buy, 3, 1_980, "s19a")); let kb2 = placed(m, lim(10, 2, #buy, 3, 1_981, "s19b")); let kb3 = placed(m, lim(11, 2, #buy, 3, 1_982, "s19c"));
+ignore tick();
+let k1 = executes(m, operator, #kill({ member = 2; trader = 0; reason = "the member's risk desk" }), "kill");
+scenario(k1.size() == 2 and k1[0] == 18, "member 2 killed");
+let killId = k1[1];
+refusedAs(m, t3, lim(12, 2, #buy, 3, 1_983, "s19d"), "e:Killed", "an order of a killed member");
+refusedAs(m, t3, #amendOrder({ order = kb1; qty = 2; price = 1_980 }), "e:Killed", "an amendment of a killed member's order");
+refusedAs(m, operator, #kill({ member = 2; trader = 0; reason = "again" }), "e:InvalidTerms", "a member killed twice");
+refusedAs(m, t1, #kill({ member = 0; trader = 3; reason = "not mine" }), "e:InvalidTerms", "a trader killing outside its member");
+refusedAs(m, operator, #revive({ kill = killId }), "e:OrdersStillOpen", "a revival while the member's orders are open");
+scenario(executes(m, scheduler, #killSweep({ kill = killId; limit = 2 }), "sweep") == [19, killId, 2, kb1, kb2], "the first slice: two orders");
+scenario(executes(m, scheduler, #killSweep({ kill = killId; limit = 2 }), "sweep") == [19, killId, 1, kb3], "the second slice: the last");
+refusedAs(m, scheduler, #killSweep({ kill = 999; limit = 2 }), "e:UnknownKill", "a sweep of no kill");
+ignore tick();
+scenario(govern(m, #revive({ kill = killId })) == #ok(#executed({ block = DL.length(m.st.log) - 1; effects = [20, killId] })), "revived under four eyes");
+ignore placed(m, lim(9, 2, #buy, 3, 1_980, "s19e"));
+// risk limits: quantity, value and credit, the use the value of the member's open orders
+ignore tick();
+scenario(govern(m, #setLimits({ member = 1; maxOrderQty = 100; maxOrderValue = 9_000_000; creditLimit = 12_000_000 })) == #ok(#executed({ block = DL.length(m.st.log) - 1; effects = [21, 1] })), "member 1's limits");
+refusedAs(m, t1, lim(1, 1, #buy, 110, 80_000, "s20a"), "e:RiskLimit", "a quantity above the limit");
+refusedAs(m, t1, lim(1, 1, #buy, 100, 95_000, "s20b"), "e:RiskLimit", "a value above the limit (9,500,000)");
+let r1a = placed(m, lim(1, 1, #buy, 100, 80_000, "s20c"));
+scenario((switch (B.limitsOf(m.st, 1)) { case (?(_, row)) row.limits.used == 8_000_000; case null false }), "the use is the open order's value, 8,000,000");
+refusedAs(m, t1, lim(2, 1, #buy, 60, 80_000, "s20d"), "e:RiskLimit", "the credit (8,000,000 + 4,800,000 above 12,000,000)");
+refusedAs(m, t1, #amendOrder({ order = r1a; qty = 100; price = 95_000 }), "e:RiskLimit", "an amendment judged on its new value");
+cancel(m, r1a);
+scenario((switch (B.limitsOf(m.st, 1)) { case (?(_, row)) row.limits.used == 0; case null false }), "the cancel returns the use");
+ignore tick();
+ignore govern(m, #setLimits({ member = 1; maxOrderQty = 0; maxOrderValue = 0; creditLimit = 0 }));
 checkpoint(m);
 Debug.print("count: scenarios whose every effect matched the hand computation = " # n(scenarios));
 
@@ -351,7 +476,7 @@ while (oid < m.st.nextOrder) { switch (B.order(m.st, oid)) { case (?o) { if (o.o
 Debug.print("count: linked orders cancelled on the main book = " # n(ocoCancelled));
 Debug.print("count: icebergs that traded on the main book = " # n(icebergsFilled));
 printCoverage(["pairs", "clears that traded", "stops triggered", "orders cancelled at a clear", "own orders cancelled at entry", "incoming orders cancelled with the resting",
-  "amendments keeping priority", "amendments taking a new priority", "uncrossed books checked", "checkpoints"]);
+  "amendments keeping priority", "amendments taking a new priority", "uncrossed books checked", "checkpoints", "call-phase reads checked", "continuous trades checked within the bands", "trades at close", "volatility interruptions", "uncrosses", "uncrosses that traded", "uncrosses equal to their indicative price", "uncrosses outside the static band, the auction continuing"]);
 for (f in K.families.vals()) { if (f != "openInstrument" and f != "clear") Debug.print("count: executed " # f # " = " # n(seenCount("executed " # f))) };
 var refusalNames = 0;
 for ((k, _) in Map.entries(seen)) { if (Text.startsWith(k, #text "refused ")) refusalNames += 1 };
