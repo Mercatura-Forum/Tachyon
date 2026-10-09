@@ -42,6 +42,8 @@ import K "../src/OfferingCanonical";
 import Of "../src/OfferingCore";
 import CT "../src/CustodyTypes";
 import Cu "../src/CustodyCore";
+import TC "support/Traced";
+import TR "support/Transcript";
 
 var failures = 0;
 func check(cond : Bool, what : Text) { if (not cond) { failures += 1; Debug.print("FAIL: " # what) } };
@@ -114,16 +116,16 @@ func attempt(c : OT.Command, what : Text) : { #ok : [Nat]; #err : Text } {
   let run = func(o : Of.Result<Of.Outcome>) : { #ok : [Nat]; #err : Text } {
     switch (o) { case (#ok(#executed(x))) { acts += 1; #ok(x.effects) }; case (other) #err(nameOf(debug_show(other))) }
   };
-  switch (Of.submit(st, auth, tick(), officer, c, null, what)) {
-    case (#ok(#proposed(p))) run(Of.approve(st, auth, tick(), director1, p.proposal));
+  switch (TC.osub(st, auth, tick(), officer, c, null, what)) {
+    case (#ok(#proposed(p))) run(TC.oapp(st, auth, tick(), director1, p.proposal));
     case (other) run(other);
   }
 };
 func act(c : OT.Command, what : Text) : [Nat] { switch (attempt(c, what)) { case (#ok(r)) r; case (#err(e)) { check(false, what # ": " # e); [] } } };
 func refused(c : OT.Command, name : Text, what : Text) {
   let before = Of.fingerprint(st);
-  let got = switch (Of.submit(st, auth, tick(), officer, c, null, what)) {
-    case (#ok(#proposed(p))) debug_show(Of.approve(st, auth, tick(), director1, p.proposal));
+  let got = switch (TC.osub(st, auth, tick(), officer, c, null, what)) {
+    case (#ok(#proposed(p))) debug_show(TC.oapp(st, auth, tick(), director1, p.proposal));
     case (other) { check(Of.fingerprint(st) == before, "refused and unchanged: " # what); debug_show(other) };
   };
   if (nameOf(got) == name) { refusals += 1; Debug.print("refusal|" # what # "|" # name) } else check(false, "refused for " # name # " not " # got # ": " # what);
@@ -321,7 +323,7 @@ Debug.print("count: allocation slices = " # t(slices));
 let cs = Cu.newState();
 Cu.setPolicies(cs, Array.map<Text, { permission : Text; required : Nat; eligibleRole : Text; ttlSeconds : Nat }>(["custody.holder.register", "custody.asset.register", "custody.reconcile"], dual));
 func custody(c : CT.Command, what : Text) : [Nat] {
-  let o = switch (Cu.submit(cs, auth, tick(), officer, c, null, what)) { case (#ok(#proposed(p))) Cu.approve(cs, auth, tick(), director1, p.proposal); case (other) other };
+  let o = switch (TC.csub(cs, auth, tick(), officer, c, null, what)) { case (#ok(#proposed(p))) TC.capp(cs, auth, tick(), director1, p.proposal); case (other) other };
   switch (o) { case (#ok(#executed(x))) x.effects; case (other) { check(false, what # ": " # debug_show(other)); [] } }
 };
 let shares = Principal.fromText("6abng-3xbmm-zos2l-batfg-zytpv-vj2jv-3t7hk-3hh6q-6hugj-2q3bc-cqe");
@@ -368,6 +370,9 @@ for ((off, x) in [(O1, base), (O3, t3)].vals()) {
 Debug.print("count: allotments delivered to the custody register as issuance receipts = " # t(receipts));
 Debug.print("count: refusals named with the state unchanged = " # t(refusals));
 Debug.print("count: acts recorded = " # t(acts));
+
+TR.fingerprint("offering", Of.fingerprint(st));
+TR.fingerprint("custody", Cu.fingerprint(cs));
 
 // ─── PART 10: the replay ────────────────────────────────────────────────────────────────
 let fresh = Of.newStateOver(st.log);

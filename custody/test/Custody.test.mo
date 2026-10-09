@@ -38,6 +38,8 @@ import CT "../src/CustodyTypes";
 import M "../src/CustodyMath";
 import K "../src/CustodyCanonical";
 import Cu "../src/CustodyCore";
+import TC "support/Traced";
+import TR "support/Transcript";
 
 var failures = 0;
 func check(cond : Bool, what : Text) { if (not cond) { failures += 1; Debug.print("FAIL: " # what) } };
@@ -102,15 +104,15 @@ func refused(r : Cu.Result<Cu.Outcome>, what : Text) {
   let f0 = Cu.fingerprint(s);
   switch (r) { case (#err(_)) { refusals += 1; check(Cu.fingerprint(s) == f0, "refusal left the state: " # what) }; case (#ok(_)) check(false, "should refuse: " # what) }
 };
-func sub(c : CT.Command) : Cu.Result<Cu.Outcome> { Cu.submit(s, auth, tick(), registrar, c, null, "x") };
+func sub(c : CT.Command) : Cu.Result<Cu.Outcome> { TC.csub(s, auth, tick(), registrar, c, null, "x") };
 var governed = 0;
 func govern(c : CT.Command, what : Text) : [Nat] {
   switch (sub(c)) {
     case (#ok(#proposed(p))) {
-      switch (Cu.approve(s, auth, tick(), registrar, p.proposal)) { case (#err(#auth(#NoGrant(_)))) {}; case (_) check(false, "the maker holds no approval grant: " # what) };
-      switch (Cu.approve(s, auth, tick(), stranger, p.proposal)) { case (#err(#auth(#NoGrant(_)))) {}; case (_) check(false, "stranger approval refused: " # what) };
-      switch (Cu.approve(s, auth, tick(), director1, p.proposal)) {
-        case (#ok(#executed(x))) { governed += 1; switch (Cu.approve(s, auth, tick(), director2, p.proposal)) { case (#err(#auth(#ProposalNotAwaiting(_)))) {}; case (_) check(false, "second approval refused: " # what) }; x.effects };
+      switch (TC.capp(s, auth, tick(), registrar, p.proposal)) { case (#err(#auth(#NoGrant(_)))) {}; case (_) check(false, "the maker holds no approval grant: " # what) };
+      switch (TC.capp(s, auth, tick(), stranger, p.proposal)) { case (#err(#auth(#NoGrant(_)))) {}; case (_) check(false, "stranger approval refused: " # what) };
+      switch (TC.capp(s, auth, tick(), director1, p.proposal)) {
+        case (#ok(#executed(x))) { governed += 1; switch (TC.capp(s, auth, tick(), director2, p.proposal)) { case (#err(#auth(#ProposalNotAwaiting(_)))) {}; case (_) check(false, "second approval refused: " # what) }; x.effects };
         case (other) { check(false, "approval executes " # what # ": " # debug_show(other)); [] };
       };
     };
@@ -120,7 +122,7 @@ func govern(c : CT.Command, what : Text) : [Nat] {
 func single(c : CT.Command, what : Text) : [Nat] { switch (sub(c)) { case (#ok(#executed(x))) x.effects; case (other) { check(false, "single act executes " # what # ": " # debug_show(other)); [] } } };
 func rcpt(id : Nat) : CT.Receipt { { kind = #trade; id; block = 100 + id; hash = bytes(id, 32) } };
 
-refused(Cu.submit(s, auth, tick(), stranger, #registerHolder({ holder = 1; commit = bytes(0xA1, 32); account = shares }), null, "x"), "stranger registers a holder");
+refused(TC.csub(s, auth, tick(), stranger, #registerHolder({ holder = 1; commit = bytes(0xA1, 32); account = shares }), null, "x"), "stranger registers a holder");
 refused(sub(#registerHolder({ holder = 0; commit = bytes(0xA1, 32); account = shares })), "holder zero");
 refused(sub(#registerHolder({ holder = 1; commit = bytes(0xA1, 31); account = shares })), "a 31-byte commitment");
 for (h in [1, 2, 3, 4].vals()) { check(govern(#registerHolder({ holder = h; commit = bytes(0xA0 + h, 32); account = if (h == 1) shares else Principal.fromText("aaaaa-aa") }), "holder") == [h], "holder " # Nat.toText(h)) };
@@ -253,6 +255,8 @@ Debug.print("count: governance commands executed through four eyes = " # Nat.toT
 let c = Cu.counts(s);
 check(c.holders == 4 and c.assets == 1 and c.positions == 4 and c.receipts == 5 and c.actions == 5 and c.entitlements == 20 and c.reconciliations == 2, "counts: " # debug_show(c));
 Debug.print("count: corporate actions announced = " # Nat.toText(c.actions));
+
+TR.fingerprint("custody", Cu.fingerprint(s));
 
 // ─── PART 4: the replay ────────────────────────────────────────────────────────────────────
 let fresh = Cu.newStateOver(s.log);
