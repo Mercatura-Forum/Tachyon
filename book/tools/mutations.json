@@ -538,5 +538,221 @@
   "old": "case (?(id, w)) (id, if (w.count == 0 or t - w.start > Nat64.fromNat(secs) * SEC)",
   "new": "case (?(id, w)) (id, if (w.count == 0)",
   "test": "surveillance/Surv"
+ },
+ {
+  "id": "C01",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the margin requirement never refuses",
+  "property": "a clearing buy beyond its initial and variation margin is refused (MarginShort)",
+  "old": "    if (required > available) ?#MarginShort({ required; available }) else null\n",
+  "new": "    null\n",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C02",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the liquidity check removed",
+  "property": "a clearing buy is refused beyond the CCP's free cash",
+  "old": "        if (value > valueBefore and free < value - valueBefore) return ?#LiquidityShort({ needed = value - valueBefore; free });\n",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C03",
+  "file": "book/src/BookCore.mo",
+  "mutant": "variation margin ignored",
+  "property": "variation margin counts against a member's resources",
+  "old": "    let required = r.imOrders + add - drop + variationOf(s, r);",
+  "new": "    let required = r.imOrders + add - drop;",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C04",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the CCP's payment left out",
+  "property": "the CCP pays a pre-funded seller of a clearing buyer at the fill",
+  "old": "        debit(s, ccp, i0.cashLedger, v); credit(s, ccp, i0.assetLedger, q);",
+  "new": "        credit(s, ccp, i0.assetLedger, q);",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C05",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the gross paid",
+  "property": "a payer pays its net, not its gross",
+  "old": "            let a = pay - to;\n            if (balance(s, r.settlementAccount, t.cashLedger).available >= a) {",
+  "new": "            let a = pay;\n            if (balance(s, r.settlementAccount, t.cashLedger).available >= a) {",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C06",
+  "file": "book/src/BookCore.mo",
+  "mutant": "receivers first",
+  "property": "payers settle before receivers",
+  "old": "    for (payers in [true, false].vals()) {",
+  "new": "    for (payers in [false, true].vals()) {",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C07",
+  "file": "book/src/BookCore.mo",
+  "mutant": "no penalty",
+  "property": "a fail rolls with its penalty",
+  "old": "debt = a + penalty; fails = m.fails + 1;",
+  "new": "debt = a; fails = m.fails + 1;",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C08",
+  "file": "book/src/BookCore.mo",
+  "mutant": "shares delivered to a member that failed",
+  "property": "a failing member's shares stay with the CCP",
+  "old": "    if (r.debt != 0 or r.status != 1) return;",
+  "new": "    if (r.status != 1) return;",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C09",
+  "file": "book/src/BookCore.mo",
+  "mutant": "every purchase delivered at the first payment",
+  "property": "delivery against payment: later cycles' purchases are not delivered",
+  "old": "      while (j <= s.cycleNo) { later += boughtOf(s, member, c.instrument, j); j += 1 };",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C10",
+  "file": "book/src/BookCore.mo",
+  "mutant": "a close-out after one fail",
+  "property": "a close-out waits for the deadline",
+  "old": "if (r.status != 2 and (r.debt == 0 or r.fails < t.deadlineCycles))",
+  "new": "if (r.status != 2 and (r.debt == 0 or r.fails < 1))",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C11",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the proceeds kept",
+  "property": "a close-out's proceeds pay the member's debt",
+  "old": "updateMember(s, co.member, func(x : ClearingMember) : ClearingMember { { x with debt = x.debt - paid } });",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C12",
+  "file": "book/src/BookCore.mo",
+  "mutant": "skin before the defaulter's fund",
+  "property": "the waterfall draws the defaulter's fund before the venue's skin",
+  "old": "    let fromFund = Nat.min(rest, r.fund); rest -= fromFund;\n    let fromSkin = Nat.min(rest, s.skin); rest -= fromSkin; s.skin -= fromSkin;",
+  "new": "    let fromSkin = Nat.min(rest, s.skin); rest -= fromSkin; s.skin -= fromSkin;\n    let fromFund = Nat.min(rest, r.fund); rest -= fromFund;",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C13",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the units left by member order",
+  "property": "the others' share by the largest remainder",
+  "old": "      Nat.compare(take * others[b].fund % total, take * others[a].fund % total)",
+  "new": "      Nat.compare(0, 0)",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C14",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the floor's share only",
+  "property": "the fund's requirement is sized from the member's largest cycle purchase",
+  "old": "let required = Nat.max(floorShare, ceilDiv(t.fundBps * r.peak, 10_000));",
+  "new": "let required = floorShare;",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C15",
+  "file": "book/src/BookCore.mo",
+  "mutant": "calendar days",
+  "property": "a T+n settlement day skips holidays and rest days",
+  "old": "    while (k < days) { d += 1; while (not Cal.isBusinessDay(X.calendarFor(xs, d), d)) d += 1; k += 1 };",
+  "new": "    while (k < days) { d += 1; k += 1 };",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C16",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the leg's bytes hashed as a node",
+  "property": "a leg's leaf is hashed under the kernel's leaf rule",
+  "old": "  public func legHash(l : Leg) : Blob { MP.hashLeaf(legRows.encode(l)) };",
+  "new": "  public func legHash(l : Leg) : Blob { MP.hashNode(legRows.encode(l), \"\") };",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C17",
+  "file": "custody/src/CustodyCore.mo",
+  "mutant": "the proof not checked",
+  "property": "custody admits a leg only with a proof that verifies",
+  "old": "        if (not MP.verify(legBytes(x.leg), x.index, x.proof, root)) return ?#ProofRefused({ index = x.index });\n",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C18",
+  "file": "custody/src/CustodyCore.mo",
+  "mutant": "the proof's own peaks taken for the root",
+  "property": "custody checks the proof against the book's root, not the proof's own",
+  "old": "        let ?root = (if (x.index < x.legs) anchor(x.legs) else null) else return ?#RootUnknown({ legs = x.legs });",
+  "new": "        let ?root = MP.bagPeaks(x.proof.peaks) else return ?#RootUnknown({ legs = x.legs });",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C19",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the side read again after the payers' pass",
+  "property": "each member's side of a cycle is fixed before any leg moves",
+  "old": "        if (r.status != 3 and (pay > to) == payers) {",
+  "new": "        if (r.status != 3 and ((by + r.debt) > to) == payers) {",
+  "test": "BookClearingStreams"
+ },
+ {
+  "id": "C20",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the pledge left out of the range",
+  "property": "a sale's pledge to the CCP is a leg of the range",
+  "old": "    appendLeg(s, 3, i.assetLedger, r.settlementAccount, t.ccpAccount, qty - free);\n",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C21",
+  "file": "book/src/BookCore.mo",
+  "mutant": "designation with orders open",
+  "property": "an account with open orders is designated only once they close",
+  "old": "        if (hasLiveOrder(s, x.account)) return ?#InvalidTerms({ reason = \"an account with no open orders\" });\n",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C22",
+  "file": "book/src/BookCore.mo",
+  "mutant": "orders on the CCP's account",
+  "property": "the CCP's account trades only its close-outs",
+  "old": "        if (isCcp(s, x.account)) return ?#InvalidTerms({ reason = \"the central counterparty's account trades only its close-outs\" });\n",
+  "new": "",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C23",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the pledge always from the settlement account",
+  "property": "a clearing sale's pledge comes from custody first",
+  "old": "    let free = c.qty - c.held;\n    if (free >= qty) return;",
+  "new": "    let free = 0;\n    if (free >= qty) return;",
+  "test": "BookClearing"
+ },
+ {
+  "id": "C24",
+  "file": "book/src/BookCore.mo",
+  "mutant": "the revival allowed",
+  "property": "a defaulted member's kill is not revived before its waterfall",
+  "old": "        if (k.trader == 0) { switch (clearingMember(s, k.member)) { case (?(_, r)) { if (r.status == 2) return ?#InvalidTerms({ reason = \"a member in default is closed through the waterfall first\" }) }; case null {} } };\n",
+  "new": "",
+  "test": "BookClearing"
  }
 ]
