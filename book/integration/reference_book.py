@@ -31,7 +31,7 @@ CALL = ("auction", "closingAuction")
 DUAL = {"openInstrument", "halt", "resume", "revive", "setLimits", "setBlackout", "liftBlackout",
         "setClearing", "setMargin", "admitClearing", "designateClearing", "fundSkin", "declareDefault", "closeDefault",
         "setFeeSchedule", "registerMaker", "defineIndex", "reviewIndex", "corporateAction",
-        "setTerms", "defineNav", "issueReceipt", "cancelReceipt"}
+        "setTerms", "defineNav", "issueReceipt", "cancelReceipt", "setAttestors"}
 E18, E9 = 10 ** 18, 10 ** 9
 IMMEDIATE = {"market", "ioc", "fok", "stop", "trailingStop"}
 STOPS = {"stop", "stopLimit", "trailingStop"}
@@ -250,6 +250,12 @@ class Ref:
         self.retirements = []   # (account, instrument, qty, beneficiary)
         self.entitlements = []  # (account, instrument, rights, shares, paid)
         self.value_dates = {}   # bond -> its value date
+        # derivatives (SPEC §33 to §35)
+        self.attestors = []     # the three attestors' roles
+        self.attestations = []  # (instrument, day, attestor, price), in row order
+        self.positions = {}     # (account, instrument) -> [member, long, qty, mark, im], in the order the rows were made
+        self.derivs = {}        # instrument -> its settlement state
+        self.member_im = {}     # member -> its positions' margin
 
     # ── funds ──
     def b(self, a, l):
@@ -296,7 +302,7 @@ class Ref:
         return ceil_div(BOND_FACE * qty * t["coupon"] * 31 * (12 // t["perYear"]), 10_000 * 360)
 
     def value_of(self, inst, price, qty):
-        return price * qty + self.bound(inst, qty)
+        return price * qty * self.multiplier(inst) + self.bound(inst, qty)
 
     def open_value(self, o):
         return self.value_of(o["instrument"], o["price"], o["remaining"])
@@ -445,20 +451,20 @@ class Ref:
     def committed(self):
         """The open clearing buys' value."""
         return sum(self.open_value(o) for o in (self.orders[x] for x in self.open_ids("all"))
-                   if o["side"] == "buy" and o["account"] in self.desig)
+                   if o["side"] == "buy" and o["account"] in self.desig and not self.derivative(o["instrument"]))
 
     def ccp_free(self):
         return max(0, self.ccp_cash() - self.committed())
 
     def im_orders(self, m):
         return sum(self.orders[x]["held"] for x in self.open_ids("member", m)
-                   if self.orders[x]["side"] == "buy" and self.desig.get(self.orders[x]["account"]) == m)
+                   if (self.orders[x]["side"] == "buy" or self.derivative(self.orders[x]["instrument"])) and self.desig.get(self.orders[x]["account"]) == m)
 
     def custody_held(self, m, inst):
         held = 0
         for x in self.open_ids("inst", inst):
             o = self.orders[x]
-            if o["side"] == "sell" and (self.desig.get(o["account"]) == m or (self.is_ccp(o["account"]) and self.closeouts.get(x) == m)):
+            if o["side"] == "sell" and not self.derivative(inst) and (self.desig.get(o["account"]) == m or (self.is_ccp(o["account"]) and self.closeouts.get(x) == m)):
                 held += o["held"]
         return held
 
@@ -476,7 +482,7 @@ class Ref:
         r = self.cm[m]
         if fund and r["fund"] < r["req"]:
             return "FundShort"
-        if self.im_orders(m) + add - drop + self.variation(m) > r["coll"] + r["credit"] - release:
+        if self.im_orders(m) + add - drop + self.variation(m) + self.member_im.get(m, 0) > r["coll"] + r["credit"] - release:
             return "MarginShort"
         return None
 
@@ -495,6 +501,9 @@ class Ref:
             return "NotClearing"
         if self.inst[inst]["cash"] != self.clearing["cash"]:
             return "InvalidTerms"
+        if self.derivative(inst):
+            im = self.deriv_im(inst, side == "buy", qty, price)
+            return self.margin_refusal(m, im, held_before, 0) if im > held_before else None
         if side == "buy":
             if inst not in self.margin:
                 return "InvalidTerms"
@@ -690,6 +699,9 @@ class Ref:
                 return "UnknownInstrument"
             if i["phase"] == "halted":
                 return "InstrumentHalted"
+            d = self.derivs.get(c["instrument"])
+            if d and c["open"] and d["runDay"]:
+                return "InvalidTerms"
             if i["until"]:
                 return "InvalidTerms"
             if c["open"] == (i["phase"] == "continuous"):
@@ -751,6 +763,8 @@ class Ref:
             e = self.class_refusal(c["instrument"], self.today(now))
             if e:
                 return e
+            if self.derivative(c["instrument"]) and (c["account"] not in self.desig or c["short"]):
+                return "InvalidTerms"
             if self.killed(c["member"], c["trader"]):
                 return "Killed"
             if self.blacked_out(c["account"], c["instrument"], now):
@@ -814,7 +828,7 @@ class Ref:
             # §17
             if c["short"] and c["side"] == "buy":
                 return "InvalidTerms"
-            if c["side"] == "sell":
+            if c["side"] == "sell" and not self.derivative(c["instrument"]):
                 if c["short"]:
                     if kind not in ("limit", "ioc", "fok", "stopLimit") or c["price"] < self.short_floor(i):
                         return "ShortSalePrice"
@@ -1084,6 +1098,8 @@ class Ref:
         if k == "cutCycle":
             if t is None or c["cycle"] != self.cycle_no:
                 return "InvalidTerms"
+            if any(d["runDay"] for d in self.derivs.values()):
+                return "InvalidTerms"
             if t["days"] == 0:
                 if c["settleDay"] != 0 or self.settled + 1 != self.cycle_no:
                     return "InvalidTerms"
@@ -1253,7 +1269,59 @@ class Ref:
                 return "InvalidTerms"
         if t and t["cls"] == "right" and today > t["deadline"]:
             return "InvalidTerms"
+        if t and t["cls"] in ("future", "option") and (today > t["expiry"] or self.derivs[inst]["expired"]):
+            return "InvalidTerms"
         return None
+
+    # ── derivatives (SPEC §33 to §35), written from the text ──
+    def derivative(self, inst):
+        return self.cls(inst) in ("future", "option")
+
+    def multiplier(self, inst):
+        return self.terms[inst]["multiplier"] if self.derivative(inst) else 1
+
+    def level(self, index):
+        x = self.indices.get(index)
+        return x["level"] if x else 0
+
+    def attested(self, inst, day):
+        """§33: the median of the three attestors' prices for the day, when all three attested."""
+        got = {n: pr for (i, d, n, pr) in self.attestations if i == inst and d == day}
+        return sorted(got.values())[1] if len(got) == 3 else None
+
+    @staticmethod
+    def intrinsic(t, u):
+        return max(u - t["strike"], 0) if t["call"] else max(t["strike"] - u, 0)
+
+    def deriv_im(self, inst, long, qty, price):
+        """§34, §35: a future's notional × its rate rounded up; an option buyer's premium; a writer's premium and the greater
+        of a × the index less what it is out of the money and b × the index, × contracts × multiplier, rounded up."""
+        t = self.terms[inst]
+        if t["cls"] == "future":
+            return ceil_div(qty * price * t["multiplier"] * t["imBps"], 10_000)
+        if long:
+            return qty * price * t["multiplier"]
+        u = self.level(t["index"])
+        otm = max(t["strike"] - u, 0) if t["call"] else max(u - t["strike"], 0)
+        risk = max(max(t["aBps"] * u - otm * 10_000, 0), t["bBps"] * (u if t["call"] else t["strike"]))
+        return ceil_div(qty * t["multiplier"] * (price * 10_000 + risk), 10_000)
+
+    def move_position(self, account, member, inst, buy, qty):
+        """§34: a fill netted into the account's position, marked at the contract's mark; the margins follow."""
+        mark = self.derivs[inst]["mark"]
+        p = self.positions.setdefault((account, inst), [member, buy, 0, mark, 0])
+        long, q = p[1], p[2]
+        if q == 0:
+            long, q = buy, qty
+        elif long == buy:
+            q += qty
+        elif q >= qty:
+            q -= qty
+        else:
+            long, q = buy, qty - q
+        im = self.deriv_im(inst, long, q, mark) if q else 0
+        self.member_im[member] = self.member_im.get(member, 0) + im - p[4]
+        p[1], p[2], p[3], p[4] = long, q, mark, im
 
     def mover(self, role, c):
         """A trader acting on its own member's account, as an order's sender (§31, §32)."""
@@ -1290,6 +1358,15 @@ class Ref:
                         return "InvalidTerms"
             elif t["cls"] == "certificate":
                 if len(t["registry"]) != 64:
+                    return "InvalidTerms"
+            elif t["cls"] in ("future", "option"):
+                if t["index"] not in self.indices or t["multiplier"] == 0 or t["expiry"] < today:
+                    return "InvalidTerms"
+                if not self.clearing or i["cash"] != self.clearing["cash"]:
+                    return "InvalidTerms"
+                if t["cls"] == "future" and not 1 <= t["imBps"] <= 10_000:
+                    return "InvalidTerms"
+                if t["cls"] == "option" and (t["strike"] == 0 or t["bBps"] == 0 or t["bBps"] > t["aBps"] or t["aBps"] > 10_000):
                     return "InvalidTerms"
             else:
                 u = self.inst.get(t["underlying"])
@@ -1368,6 +1445,34 @@ class Ref:
                 return "InsufficientFunds"
             pay = t["price"] * (c["qty"] // t["den"]) * t["num"]
             return "InsufficientFunds" if self.b(c["account"], i["cash"])[0] < pay else None
+        if k == "setAttestors":
+            a = c["attestors"]
+            return "InvalidTerms" if len(a) != 3 or len(set(a)) != 3 else None
+        if k == "attestPrice":
+            if not 1 <= c["attestor"] <= len(self.attestors) or self.attestors[c["attestor"] - 1] != role:
+                return "InvalidTerms"
+            if not self.derivative(c["instrument"]) or c["day"] != today:
+                return "InvalidTerms"
+            if any(i == c["instrument"] and d == c["day"] and n == c["attestor"] for (i, d, n, _) in self.attestations) or c["price"] == 0:
+                return "InvalidTerms"
+            return None
+        if k == "settleDerivatives":
+            inst = c["instrument"]
+            if inst not in self.inst or not self.inst[inst]["opened"]:
+                return "UnknownInstrument"
+            d = self.derivs.get(inst)
+            if d is None or c["day"] != today or d["expired"] or c["day"] <= d["settled"]:
+                return "InvalidTerms"
+            if d["runDay"] and d["runDay"] != c["day"]:
+                return "InvalidTerms"
+            t = self.terms[inst]
+            if c["day"] > t["expiry"] or self.inst[inst]["phase"] != "closed" or not 1 <= c["limit"] <= 500:
+                return "InvalidTerms"
+            if c["day"] == t["expiry"]:
+                return "InvalidTerms" if self.level(t["index"]) == 0 else None
+            if not d["runDay"] and self.attested(inst, c["day"]) is None:
+                return "InvalidTerms"
+            return None
         if k == "valueDate":
             t = self.terms.get(c["instrument"])
             if not t or t["cls"] != "bond":
@@ -1410,6 +1515,8 @@ class Ref:
             e = self.class_refusal(inst, self.today(now))
             if e:
                 return e
+            if self.derivative(inst):
+                return "InvalidTerms"
             if self.blacked_out(c["account"], inst, now):
                 return "InsiderBlackout"
             if q["qty"] == 0 or q["qty"] % i["lot"]:
@@ -1587,6 +1694,8 @@ class Ref:
                 m = self.desig.get(c["account"])
                 if m is None:
                     self.hold(c["account"], self.ledger(c["instrument"], c["side"]), need); held = need
+                elif self.derivative(c["instrument"]):
+                    held = self.deriv_im(c["instrument"], c["side"] == "buy", c["qty"], price)
                 elif c["side"] == "buy":
                     held = ceil_div(self.margin.get(c["instrument"], 0) * self.value_of(c["instrument"], price, c["qty"]), 10_000)
                 else:
@@ -1625,6 +1734,8 @@ class Ref:
                 else:
                     self.release(o["account"], led, o["held"] - need)
                 held = need
+            elif self.derivative(o["instrument"]):
+                held = self.deriv_im(o["instrument"], o["side"] == "buy", c["qty"], c["price"])
             elif o["side"] == "buy":
                 held = ceil_div(self.margin.get(o["instrument"], 0) * self.value_of(o["instrument"], c["price"], c["qty"]), 10_000)
             else:
@@ -1859,7 +1970,9 @@ class Ref:
         k = c["k"]
         if k == "setTerms":
             self.terms[c["instrument"]] = c["terms"]
-            return [52, c["instrument"], {"bond": 1, "receipt": 2, "certificate": 3, "right": 4}[c["terms"]["cls"]]]
+            if c["terms"]["cls"] in ("future", "option"):
+                self.derivs[c["instrument"]] = dict(mark=self.inst[c["instrument"]]["ref"], settled=0, runDay=0, runPrice=0, cursor=0, runTo=0, runBy=0, expired=False)
+            return [52, c["instrument"], {"bond": 1, "receipt": 2, "certificate": 3, "right": 4, "future": 5, "option": 6}[c["terms"]["cls"]]]
         if k == "defineNav":
             for (b, sh) in c["constituents"]:
                 self.baskets.append((c["instrument"], b, sh))
@@ -1895,6 +2008,14 @@ class Ref:
         if k == "valueDate":
             self.value_dates[c["instrument"]] = c["day"]
             return [58, c["instrument"], c["day"]]
+        if k == "setAttestors":
+            self.attestors = list(c["attestors"])
+            return [59]
+        if k == "attestPrice":
+            self.attestations.append((c["instrument"], c["day"], c["attestor"], c["price"]))
+            return [60, c["instrument"], c["day"], c["attestor"], self.attested(c["instrument"], c["day"]) or 0]
+        if k == "settleDerivatives":
+            return self.settle_derivatives(c["instrument"], c["day"], c["limit"])
         raise ValueError(k)
 
     def deliver(self, m, k, out):
@@ -2153,8 +2274,12 @@ class Ref:
             bo, ao = self.orders[b], self.orders[a]
             self.settle_pair(inst, i, b, bo, a, ao, p, q)
             bm = self.desig.get(bo["account"])
-            bo["held"] = bo["held"] * (bo["remaining"] - q) // bo["remaining"] if bm is not None else self.buy_hold(inst, bo["price"], bo["remaining"] - q)
-            ao["held"] -= q
+            if self.derivative(inst):
+                for o in (bo, ao):
+                    o["held"] = o["held"] * (o["remaining"] - q) // o["remaining"]
+            else:
+                bo["held"] = bo["held"] * (bo["remaining"] - q) // bo["remaining"] if bm is not None else self.buy_hold(inst, bo["price"], bo["remaining"] - q)
+                ao["held"] -= q
             for o in (bo, ao):
                 o["remaining"] -= q; o["filled"] += q
                 o["status"] = "filled" if o["remaining"] == 0 else "live"
@@ -2174,6 +2299,8 @@ class Ref:
 
     def settle_pair(self, inst, i, b, bo, a, ao, p, q):
         """§18: each side as its party's kind says; the CCP between a pre-funded and a clearing party."""
+        if self.derivative(inst):
+            return self.settle_derivative_pair(inst, b, bo, a, ao, p, q)
         v = p * q
         t = self.terms.get(inst)
         ai = accrued(t, q, self.value_dates[inst]) if t and t["cls"] == "bond" else 0
@@ -2231,6 +2358,69 @@ class Ref:
             self.cm[m]["debt"] -= paid
             if net > paid:
                 self.owe(m, self.cycle_no, net - paid, 0)
+
+    def settle_derivative_pair(self, inst, b, bo, a, ao, p, q):
+        """§34, §35: a future's trade marked at once to the contract's mark, an option's premium owed; fees; positions."""
+        bm, am = self.desig[bo["account"]], self.desig[ao["account"]]
+        t = self.terms[inst]
+        v = p * q * t["multiplier"]
+        if t["cls"] == "future":
+            mark = self.derivs[inst]["mark"]
+            d = abs(mark - p) * q * t["multiplier"]
+            if mark >= p:
+                self.owe(bm, self.cycle_no, d, 0); self.owe(am, self.cycle_no, 0, d)
+            else:
+                self.owe(bm, self.cycle_no, 0, d); self.owe(am, self.cycle_no, d, 0)
+        else:
+            self.owe(bm, self.cycle_no, 0, v); self.owe(am, self.cycle_no, v, 0)
+        fee_b = fee_s = self.fee_on(inst, v)
+        self.owe(bm, self.cycle_no, 0, fee_b); self.owe_payable(inst, fee_b)
+        self.owe(am, self.cycle_no, 0, fee_s); self.owe_payable(inst, fee_s)
+        for (mem, f) in ((bo["member"], fee_b), (ao["member"], fee_s)):
+            if f:
+                self.fee_totals[(mem, inst)] = self.fee_totals.get((mem, inst), 0) + f
+        self.move_position(bo["account"], bm, inst, True, q)
+        self.move_position(ao["account"], am, inst, False, q)
+        self.stmt.setdefault(bo["member"], []).append((len(self.log), b, 1, q, p, fee_b))
+        self.stmt.setdefault(ao["member"], []).append((len(self.log), a, 2, q, p, fee_s))
+
+    def settle_derivatives(self, inst, day, limit):
+        """§34, §35: a slice of the daily settlement, `limit` open positions in account order after the run's cursor."""
+        d, t = self.derivs[inst], self.terms[inst]
+        final = day == t["expiry"]
+        price = d["runPrice"] if d["runDay"] else (self.level(t["index"]) if final else self.attested(inst, day))
+        start = d["cursor"] + 1 if d["runDay"] else 0
+        remaining = sorted((acc, key) for key, p in self.positions.items() if key[1] == inst and p[2] > 0 and key[0] >= start for acc in [key[0]])
+        out, n, last, sum_to, sum_by = [], 0, d["cursor"], 0, 0
+        for acc, key in remaining[:limit]:
+            p = self.positions[key]
+            to = by = 0
+            if t["cls"] == "future":
+                amt = abs(price - p[3]) * p[2] * t["multiplier"]
+                if price != p[3]:
+                    if (price > p[3]) == p[1]:
+                        to = amt
+                    else:
+                        by = amt
+            elif final:
+                pay = self.intrinsic(t, price) * p[2] * t["multiplier"]
+                if p[1]:
+                    to = pay
+                else:
+                    by = pay
+            if to or by:
+                self.owe(p[0], self.cycle_no, to, by)
+            sum_to += to; sum_by += by
+            qty, im = (0, 0) if final else (p[2], self.deriv_im(inst, p[1], p[2], price))
+            self.member_im[p[0]] = self.member_im.get(p[0], 0) + im - p[4]
+            p[2], p[3], p[4] = qty, price, im
+            out += [acc, p[0], to, by]; n += 1; last = acc
+        done = len(remaining) <= limit
+        if done:
+            self.derivs[inst] = dict(mark=price, settled=day, runDay=0, runPrice=0, cursor=0, runTo=0, runBy=0, expired=final)
+        else:
+            d.update(runDay=day, runPrice=price, cursor=last, runTo=d["runTo"] + sum_to, runBy=d["runBy"] + sum_by)
+        return [61, inst, day, price, 1 if done else 0, n] + out
 
     # ── the day's statistics (§15) ──
     def add_trade(self, inst, p, q):
@@ -2445,6 +2635,14 @@ class Ref:
         return None
 
     def conserved(self):
+        # §34: every derivative's long contracts equal its short ones
+        for inst in self.derivs:
+            if self.derivs[inst]["runDay"]:
+                continue   # an expiry's run closes the positions slice by slice
+            longs = sum(p[2] for (a, i), p in self.positions.items() if i == inst and p[1])
+            shorts = sum(p[2] for (a, i), p in self.positions.items() if i == inst and not p[1])
+            if longs != shorts:
+                return f"derivative {inst}: {longs} long contracts against {shorts} short"
         for led, total in self.deposited.items():
             have = sum(v[0] + v[1] for (a, l), v in self.bal.items() if l == led)
             if have != total:
@@ -2452,8 +2650,10 @@ class Ref:
         t = self.clearing
         if t:
             # the CCP's cash is what it holds for the members and the venue, plus what it is owed less what it owes
+            # a derivative's run in progress has owed members part of what it will charge others (§34)
             want = (sum(r["coll"] + r["fund"] + r["to"] for r in self.cm.values()) + self.skin + sum(self.payable.values())
-                    - sum(r["by"] + r["debt"] for r in self.cm.values()))
+                    - sum(r["by"] + r["debt"] for r in self.cm.values())
+                    - sum(d["runTo"] - d["runBy"] for d in self.derivs.values()))
             have = sum(self.b(t["ccp"], t["cash"]))
             if have != want:
                 return f"the CCP's cash {have}, its resources and obligations {want}"
@@ -2467,7 +2667,7 @@ class Ref:
 
 def new_scls():
     """A checkpoint's lines of the instrument classes (§28 to §32), as the book printed them."""
-    return {"TM": {}, "NV": {}, "VD": {}, "NP": [], "RC": [], "RT": [], "EN": [], "SU": {}}
+    return {"TM": {}, "NV": {}, "VD": {}, "NP": [], "RC": [], "RT": [], "EN": [], "SU": {}, "DV": {}, "AT": [], "PO": [], "PM": {}}
 
 
 def terms_text(t):
@@ -2478,6 +2678,11 @@ def terms_text(t):
         return "cls=receipt;warehouses=" + ",".join(str(w) for w in t["warehouses"])
     if t["cls"] == "certificate":
         return "cls=certificate;registry=" + t["registry"]
+    if t["cls"] == "future":
+        return f"cls=future;index={t['index']};multiplier={t['multiplier']};expiry={t['expiry']};imBps={t['imBps']}"
+    if t["cls"] == "option":
+        return (f"cls=option;index={t['index']};strike={t['strike']};call={1 if t['call'] else 0};multiplier={t['multiplier']};expiry={t['expiry']};"
+                f"aBps={t['aBps']};bBps={t['bBps']}")
     return (f"cls=right;underlying={t['underlying']};price={t['price']};num={t['num']};den={t['den']};deadline={t['deadline']};"
             f"issuer={t['issuer']};issuerMember={t['issuerMember']}")
 
@@ -2487,7 +2692,7 @@ def parse_cmd(s):
     for kv in s.split(";"):
         k, _, v = kv.partition("=")
         # a client reference and a deposit's reference are text whatever their characters
-        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances", "constituents", "registry", "beneficiary", "warehouses", "bands") else (int(v) if v.isdigit() else v)
+        c[k] = v if k in ("ref", "reference", "sides", "levies", "balances", "constituents", "registry", "beneficiary", "warehouses", "bands", "attestors") else (int(v) if v.isdigit() else v)
     if "open" in c:
         c["open"] = c["open"] in (1, True)
     # the nested fields of SPEC §22 to §25: levies (account:ppm), balances (account:ledger:amount), quotes
@@ -2501,12 +2706,17 @@ def parse_cmd(s):
     if c.get("k") == "setTerms":
         # the class's terms (§28): a bond's, a receipt's warehouses, a certificate's registry, a right's
         t = {"cls": c.pop("cls")}
-        for f in ("coupon", "perYear", "basis", "maturity", "settleDays", "underlying", "price", "num", "den", "deadline", "issuer", "issuerMember", "registry"):
+        for f in ("coupon", "perYear", "basis", "maturity", "settleDays", "underlying", "price", "num", "den", "deadline", "issuer", "issuerMember", "registry",
+                  "index", "multiplier", "expiry", "imBps", "strike", "call", "aBps", "bBps"):
             if f in c:
                 t[f] = c.pop(f)
         if "warehouses" in c:
             t["warehouses"] = [int(x) for x in str(c.pop("warehouses")).split(",") if x]
+        if "call" in t:
+            t["call"] = t["call"] in (1, "1", True)
         c["terms"] = t
+    if c.get("k") == "setAttestors":
+        c["attestors"] = [x for x in str(c["attestors"]).split(",") if x]
     if c.get("k") == "defineNav":
         c["units"] = int(c["units"]); c["cash"] = int(c["cash"])
     if "sides" in c:
@@ -2524,7 +2734,7 @@ def main():
             if kept:
                 lines[-1] += l[2:]      # a long line printed in pieces
         elif l[:2] in ("H|", "S|", "C|", "A|", "B|", "O|", "Q|", "I|", "U|", "K|", "E|", "G|", "J|", "W|", "M|", "CL", "CP", "N|", "P|", "R|", "X|", "Z|", "T|", "IX", "IP",
-                       "TM", "NV", "VD", "NP", "RC", "RT", "EN", "SU"):
+                       "TM", "NV", "VD", "NP", "RC", "RT", "EN", "SU", "DV", "AT", "PO", "PM"):
             lines.append(l); kept = True
         else:
             kept = False
@@ -2533,7 +2743,7 @@ def main():
     proposals = {}
     errors = []
     books = []   # every stream's reference book, for the legs' kinds at the end
-    streams = cmds = blocks = checkpoints = legs_checked = index_rows_checked = path_checked = class_checked = supply_checked = 0
+    streams = cmds = blocks = checkpoints = legs_checked = index_rows_checked = path_checked = class_checked = supply_checked = deriv_checked = 0
     ref = None
     sblocks, sorders, squeue = [], {}, {}
     sinst, slimits, skills = {}, {}, {}
@@ -2663,6 +2873,14 @@ def main():
             scls["EN"].append([int(x) for x in f[1:]])
         elif f[0] == "SU":
             scls["SU"][f[1]] = int(f[2])
+        elif f[0] == "DV":
+            scls["DV"][int(f[1])] = [int(x) for x in f[2:]]
+        elif f[0] == "AT":
+            scls["AT"].append(tuple(int(x) for x in f[1:]))
+        elif f[0] == "PO":
+            scls["PO"].append([int(x) for x in f[1:]])
+        elif f[0] == "PM":
+            scls["PM"][int(f[1])] = int(f[2])
         elif f[0] == "N":
             sstmt[int(f[1])] = (int(f[2]), f[3])
         elif f[0] == "P":
@@ -2812,6 +3030,19 @@ def main():
             have = {led: u for led, u in scls["SU"].items() if u}
             if mine != have:
                 errors.append(f"stream {streams}: units in the book: book {have}, reference {mine}")
+            # derivatives (§33 to §35): settlement states, attestations, positions, members' positions' margin
+            mine = {i: [d["mark"], d["settled"], d["runDay"], d["runPrice"], d["cursor"], d["runTo"], d["runBy"], 1 if d["expired"] else 0] for i, d in ref.derivs.items()}
+            if mine != scls["DV"]:
+                errors.append(f"stream {streams}: derivatives: book {scls['DV']}, reference {mine}")
+            if list(ref.attestations) != scls["AT"]:
+                errors.append(f"stream {streams}: attestations: book {scls['AT'][-3:]}, reference {ref.attestations[-3:]}")
+            mine = [[a, i, p[0], 1 if p[1] else 0, p[2], p[3], p[4]] for (a, i), p in ref.positions.items()]
+            if mine != scls["PO"]:
+                errors.append(f"stream {streams}: positions: book {scls['PO'][-3:]}, reference {mine[-3:]}")
+            mine = {m: ref.member_im.get(m, 0) for m in ref.cm}
+            if scls["PM"] and mine != scls["PM"]:
+                errors.append(f"stream {streams}: positions' margin: book {scls['PM']}, reference {mine}")
+            deriv_checked += len(scls["DV"]) + len(scls["AT"]) + len(scls["PO"])
             class_checked += len(scls["TM"]) + len(scls["NV"]) + len(scls["RC"]) + len(scls["RT"]) + len(scls["EN"]) + len(scls["NP"])
             supply_checked += len(have)
             if dict(ref.payable) != spay:
@@ -2848,6 +3079,8 @@ def main():
     if class_checked:
         print(f"reference: {class_checked} class rows (terms, iNAVs and path, receipts, retirements, entitlements) compared at checkpoints")
     print(f"reference: {supply_checked} ledgers' units in the book compared at checkpoints")
+    if deriv_checked:
+        print(f"reference: {deriv_checked} derivative rows (settlement states, attestations, positions) compared at checkpoints")
     if index_rows_checked:
         print(f"reference: {index_rows_checked} index rows and {path_checked} path levels compared at checkpoints")
     print(f"reference: {streams} streams, {cmds} commands, {blocks} blocks and {checkpoints} checkpoints of every order and balance compared")

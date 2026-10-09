@@ -249,8 +249,12 @@ def read_command(data):
             t = {"cls": "receipt", "warehouses": [r.nat() for _ in range(r.len16())]}
         elif cls == 3:
             t = {"cls": "certificate", "registry": r.blob().hex()}
-        else:
+        elif cls == 4:
             t = {"cls": "right", "underlying": r.nat(), "price": r.nat(), "num": r.nat(), "den": r.nat(), "deadline": r.nat(), "issuer": r.nat(), "issuerMember": r.nat()}
+        elif cls == 5:
+            t = {"cls": "future", "index": r.nat(), "multiplier": r.nat(), "expiry": r.nat(), "imBps": r.nat()}
+        else:
+            t = {"cls": "option", "index": r.nat(), "strike": r.nat(), "call": r.byte() == 1, "multiplier": r.nat(), "expiry": r.nat(), "aBps": r.nat(), "bBps": r.nat()}
         c["terms"] = t
     elif tag == 53:
         c = {"k": "defineNav", "instrument": r.nat(), "units": r.nat(), "cash": r.nat()}
@@ -265,6 +269,12 @@ def read_command(data):
         c = {"k": "exercise", "account": r.nat(), "member": r.nat(), "trader": r.nat(), "instrument": r.nat(), "qty": r.nat()}
     elif tag == 58:
         c = {"k": "valueDate", "instrument": r.nat(), "day": r.nat()}
+    elif tag == 59:
+        c = {"k": "setAttestors", "attestors": [principal_text(r.principal()) for _ in range(r.len16())]}
+    elif tag == 60:
+        c = {"k": "attestPrice", "attestor": r.nat(), "instrument": r.nat(), "day": r.nat(), "price": r.nat()}
+    elif tag == 61:
+        c = {"k": "settleDerivatives", "instrument": r.nat(), "day": r.nat(), "limit": r.nat()}
     elif tag in (45, 46):
         c = {"k": "quote" if tag == 45 else "massQuote", "account": r.nat(), "member": r.nat(), "trader": r.nat()}
         n = 1 if tag == 45 else r.len16()
@@ -402,6 +412,9 @@ def concerned(block, order_member, kill_member, terms):
             mentioned(e[8 + 2 * j])
     elif k in ("reconcileMember", "registerMaker", "issueReceipt", "cancelReceipt", "retire"):
         own(c["member"])
+    elif k == "settleDerivatives":
+        for j in range(e[5]):
+            mentioned(e[7 + 4 * j])
     elif k == "exercise":
         # the holder's act, and the issuer's member, whose account is paid the subscription (§32)
         own(c["member"]); mentioned(terms[c["instrument"]]["issuerMember"])
@@ -631,9 +644,11 @@ def markets_sections(w, book):
 
 def terms_row(t):
     """An instrument's terms as the book stores them (§28): the class, seven figures, the warehouses, the registry."""
-    cls = {"bond": 1, "receipt": 2, "certificate": 3, "right": 4}[t["cls"]]
+    cls = {"bond": 1, "receipt": 2, "certificate": 3, "right": 4, "future": 5, "option": 6}[t["cls"]]
     f = {"bond": [t.get("coupon", 0), t.get("perYear", 0), t.get("basis", 0), t.get("maturity", 0), t.get("settleDays", 0), 0, 0],
-         "right": [t.get(k, 0) for k in ("underlying", "price", "num", "den", "deadline", "issuer", "issuerMember")]}.get(t["cls"], [0] * 7)
+         "right": [t.get(k, 0) for k in ("underlying", "price", "num", "den", "deadline", "issuer", "issuerMember")],
+         "future": [t.get("index", 0), t.get("multiplier", 0), t.get("expiry", 0), t.get("imBps", 0), 0, 0, 0],
+         "option": [t.get("index", 0), t.get("strike", 0), 1 if t.get("call") else 0, t.get("multiplier", 0), t.get("expiry", 0), t.get("aBps", 0), t.get("bBps", 0)]}.get(t["cls"], [0] * 7)
     ws = t.get("warehouses", [])
     b = bytes([cls]) + b"".join(be(v, 8) for v in f) + bytes([len(ws)]) + b"".join(be(ws[k] if k < len(ws) else 0, 8) for k in range(8))
     b += bytes.fromhex(t["registry"]) if t["cls"] == "certificate" else b"\x00" * 32
@@ -652,6 +667,9 @@ def classes_sections(w, book):
             w.nat(i); w.byte(2); w.blob(b"".join(be(v, 8) for v in book.navs[i]))
         if i in book.value_dates:
             w.nat(i); w.byte(3); w.nat(book.value_dates[i])
+        if i in book.derivs:
+            d = book.derivs[i]
+            w.nat(i); w.byte(4); w.blob(b"".join(be(d[k], 8) for k in ("mark", "settled", "runDay", "runPrice", "cursor", "runTo", "runBy")) + bytes([1 if d["expired"] else 0]))
     w.text("baskets"); w.nat(len(book.baskets) + 1)
     for n, (fd, i, sh) in enumerate(book.baskets, start=1):
         w.nat(n); w.blob(be(fd, 8) + be(i, 8) + be(sh, 8))
@@ -670,6 +688,20 @@ def classes_sections(w, book):
     w.text("supply"); w.nat(len(book.deposited) + 1)
     for n, (led, units) in enumerate(book.deposited.items(), start=1):
         w.nat(n); w.blob(principal_field(led) + be(units, 8))
+    # derivatives (§33 to §35)
+    w.text("attestors"); w.nat(4)
+    for n, a in enumerate(book.attestors, start=1):
+        w.nat(n); w.blob(principal_field(a))
+    w.text("attestations"); w.nat(len(book.attestations) + 1)
+    for n, (i, d, k, pr) in enumerate(book.attestations, start=1):
+        w.nat(n); w.blob(be(i, 8) + be(d, 8) + bytes([k]) + be(pr, 8))
+    w.text("positions"); w.nat(len(book.positions) + 1)
+    for n, ((acc, i), (m, long, q, mark, im)) in enumerate(book.positions.items(), start=1):
+        w.nat(n); w.blob(be(acc, 8) + be(i, 8) + be(m, 8) + bytes([1 if long else 0]) + be(q, 8) + be(mark, 8) + be(im, 8))
+    w.text("positionmargin")
+    for m in sorted(book.cm):
+        if m in book.member_im:
+            w.nat(m); w.nat(book.member_im[m])
 
 
 def main():
