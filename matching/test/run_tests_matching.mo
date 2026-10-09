@@ -307,6 +307,140 @@ label aonloop while (tt < 1500) {
 };
 Debug.print("aonTrials=" # Nat.toText(aonTrials) # " survivingAON-checks=" # Nat.toText(aonChecked));
 
+// ═══ PART 4 - the fixes: the lot rule (AU-08), exact bid release (AU-02), self-trade prevention (AU-03) ═══
+
+// 4a. lotRefusal, worked by hand
+check("lot: unset refused", L.lotRefusal(10, 100, 0, 1, 1) != null);
+check("lot: not above the asset fee refused", L.lotRefusal(10, 100, 1, 1, 1) != null);
+check("lot: a part lot refused", L.lotRefusal(15, 100, 10, 1, 1) != null);
+check("lot: one lot's price not above the cash fee refused", L.lotRefusal(10, 1, 10, 1, 10) != null);
+check("lot: a whole number of lots accepted", L.lotRefusal(30, 100, 10, 1, 1) == null);
+
+// 4b. Property: with every order passing lotRefusal, every fill of the clear is settleable (its quantity above the
+// asset fee, its cash above the cash fee). Control: the same books without the rule must produce an unsettleable
+// fill somewhere, so the property is shown to separate books with and without it.
+func settleableOver(withRule : Bool) : (Nat, Nat) { // (fills checked, unsettleable fills)
+  var fillsChecked = 0; var bad = 0;
+  var t = 0;
+  while (t < 1500) {
+    let lot = rndRange(2, 10); let assetFee = rndRange(1, lot - 1); let cashFee = rndRange(1, 50);
+    let bl = List.empty<BO>(); let al = List.empty<BO>();
+    var nid = 1;
+    var k = 0; let nb = rndRange(1, 10); let na = rndRange(1, 10);
+    while (k < nb + na) {
+      let price = rndRange(1, 40);
+      let qty = if (withRule) lot * rndRange(1, 6) else rndRange(1, 6 * lot);
+      let ok = (not withRule) or L.lotRefusal(qty, price, lot, assetFee, cashFee) == null;
+      if (ok) { if (k < nb) List.add(bl, { id = nid; limitPrice = price; qty } : BO) else List.add(al, { id = nid; limitPrice = price; qty } : BO) };
+      nid += 1; k += 1;
+    };
+    let bids = List.toArray(bl); let asks = List.toArray(al);
+    switch (L.clearingPrice(bids, asks)) {
+      case null {};
+      case (?pp) {
+        let sched = L.fillSchedule(L.eligibleBids(bids, pp), L.eligibleAsks(asks, pp), pp, L.targetVolume(bids, asks, pp));
+        for (f in sched.vals()) { fillsChecked += 1; if (f.qty <= assetFee or f.qty * f.price <= cashFee) bad += 1 };
+      };
+    };
+    t += 1;
+  };
+  (fillsChecked, bad)
+};
+let (lotFills, lotBad) = settleableOver(true);
+check("lot rule: fills were checked", lotFills > 1000);
+checkEqNat("lot rule: no unsettleable fill", lotBad, 0);
+let (_, ctlBad) = settleableOver(false);
+check("CONTROL lot rule: without it an unsettleable fill appears", ctlBad > 0);
+Debug.print("lot: fills=" # Nat.toText(lotFills) # " unsettleable=" # Nat.toText(lotBad) # " (control without the rule: " # Nat.toText(ctlBad) # ")");
+
+// 4c. Property: a bid's releases over any life (partial fills, then a last fill, a cancel or a kill) sum to the
+// reservation exactly. Control: the release before the fix (limit x fill; a cancel releases limit x remaining) leaves
+// the fee reserved for ever.
+var lives = 0; var exact = 0; var naiveResidue = 0;
+var u = 0;
+while (u < 4000) {
+  let qty = rndRange(1, 60); let limit = rndRange(1, 500); let fee = rndRange(0, 30);
+  let reservation = limit * qty + fee;
+  var held = reservation; var released = 0; var naiveReleased = 0;
+  var remaining = qty;
+  label life while (remaining > 0) {
+    let action = rndRange(0, 9);
+    if (action == 0) { // cancel or kill: nothing filled, the order ends
+      let (r, left) = L.bidRelease(held, limit, 0, 0); released += r; held := left;
+      naiveReleased += limit * remaining; remaining := 0; break life;
+    };
+    let f = rndRange(1, remaining);
+    remaining -= f;
+    let (r, left) = L.bidRelease(held, limit, f, remaining); released += r; held := left;
+    naiveReleased += limit * f;
+  };
+  lives += 1;
+  if (released == reservation and held == 0) exact += 1;
+  if (reservation > naiveReleased) naiveResidue += 1;
+  u += 1;
+};
+checkEqNat("bid release: every life released exactly", exact, lives);
+check("CONTROL bid release: the release before the fix leaves a residue", naiveResidue > 0);
+Debug.print("bid release: lives=" # Nat.toText(lives) # " exact=" # Nat.toText(exact) # " (before the fix, lives with a residue: " # Nat.toText(naiveResidue) # ")");
+
+// 4d. crossesOwn by hand, then the property: orders taken in arrival order through the cancel-incoming rule (each
+// owner's best opposite limit over its accepted orders) never give a clear with a fill between one owner's orders.
+// Control: without the rule some trial has such a fill.
+check("smp: buy at the own ask crosses", L.crossesOwn(#buy, 100, ?100));
+check("smp: buy below the own ask passes", not L.crossesOwn(#buy, 99, ?100));
+check("smp: sell at the own bid crosses", L.crossesOwn(#sell, 100, ?100));
+check("smp: sell above the own bid passes", not L.crossesOwn(#sell, 101, ?100));
+check("smp: no opposite passes", not L.crossesOwn(#buy, 100, null));
+// The generator's low bit has period two, so a side drawn as rndRange(0, 1) after one other draw is the same every
+// time (every order a sell): the side is drawn from the high bits.
+func coin() : Bool { (rnd() >> 40) % 2 == 0 };
+func selfFills(withRule : Bool) : (Nat, Nat) { // (trials that crossed, self-matched fills)
+  var crossedT = 0; var selfF = 0;
+  var t = 0;
+  while (t < 1500) {
+    let owner = Map.empty<Nat, Nat>();
+    let bl = List.empty<BO>(); let al = List.empty<BO>();
+    // per owner (0..2): lowest accepted ask, highest accepted bid
+    let minAsk = Map.empty<Nat, Nat>(); let maxBid = Map.empty<Nat, Nat>();
+    var nid = 1;
+    var k = 0;
+    while (k < 14) {
+      let who = rndRange(0, 2); let isBid = coin(); let price = rndRange(90, 110); let qty = rndRange(1, 9);
+      let opp : ?Nat = if (isBid) Map.get(minAsk, Nat.compare, who) else Map.get(maxBid, Nat.compare, who);
+      let refused = withRule and L.crossesOwn(if (isBid) #buy else #sell, price, opp);
+      if (not refused) {
+        Map.add(owner, Nat.compare, nid, who);
+        if (isBid) {
+          List.add(bl, { id = nid; limitPrice = price; qty } : BO);
+          switch (Map.get(maxBid, Nat.compare, who)) { case (?m) { if (price > m) Map.add(maxBid, Nat.compare, who, price) }; case null Map.add(maxBid, Nat.compare, who, price) };
+        } else {
+          List.add(al, { id = nid; limitPrice = price; qty } : BO);
+          switch (Map.get(minAsk, Nat.compare, who)) { case (?m) { if (price < m) Map.add(minAsk, Nat.compare, who, price) }; case null Map.add(minAsk, Nat.compare, who, price) };
+        };
+      };
+      nid += 1; k += 1;
+    };
+    let bids = List.toArray(bl); let asks = List.toArray(al);
+    switch (L.clearingPrice(bids, asks)) {
+      case null {};
+      case (?pp) {
+        crossedT += 1;
+        for (f in L.fillSchedule(L.eligibleBids(bids, pp), L.eligibleAsks(asks, pp), pp, L.targetVolume(bids, asks, pp)).vals()) {
+          if (Map.get(owner, Nat.compare, f.buyId) == Map.get(owner, Nat.compare, f.sellId)) selfF += 1;
+        };
+      };
+    };
+    t += 1;
+  };
+  (crossedT, selfF)
+};
+let (smpCrossed, smpSelf) = selfFills(true);
+check("smp: windows crossed", smpCrossed > 200);
+checkEqNat("smp: no self-matched fill", smpSelf, 0);
+let (_, smpCtl) = selfFills(false);
+check("CONTROL smp: without the rule a self-matched fill appears", smpCtl > 0);
+Debug.print("smp: crossed windows=" # Nat.toText(smpCrossed) # " self fills=" # Nat.toText(smpSelf) # " (control without the rule: " # Nat.toText(smpCtl) # ")");
+
 Debug.print("trials=" # Nat.toText(TRIALS) # " crossed=" # Nat.toText(crossed));
 Debug.print("checks=" # Nat.toText(checks) # " failures=" # Nat.toText(failures));
 if (failures > 0) { Runtime.trap("MATCHING BATTERY FAILED: " # Nat.toText(failures) # " failures") };
