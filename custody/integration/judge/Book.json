@@ -43,7 +43,8 @@
         "book.sweep.expire",
         "book.instrument.phase",
         "book.auction.uncross",
-        "book.kill.sweep"
+        "book.kill.sweep",
+        "book.day.seal"
       ]
     },
     {
