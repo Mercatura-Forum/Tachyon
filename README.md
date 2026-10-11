@@ -49,7 +49,7 @@ The exchange:
 | Exchange | continuous order book, central counterparty, surveillance desk, venue contract, FIX 4.4 and FIX 5.0 SP2 gateway |
 | Proofs | Merkle mountain range receipts with a certified root |
 | Verification | 168,493 interpreter checks; 25 of 25 rows on a geographically distributed subnet running the production node binary |
-| Status | settlement core verified on the production node binary under the production environment; matching engine and listing registry verified in the interpreter and on a Thebes subnet; the exchange verified in the interpreter and judged on a four-validator test chain running the production node binary |
+| Status | settlement core verified on the production node binary under the production environment; matching engine and listing registry verified in the interpreter and on a Thebes subnet; the exchange verified in the interpreter and judged on a test chain running the production node binary |
 
 Tachyon implements BIS DvP Model 1 (gross, simultaneous, both-or-neither) over
 any ICRC-1/ICRC-2 ledger for cash and fungible assets and any ICRC-7 ledger for
@@ -277,10 +277,10 @@ A client that read the removed whole-collection methods moves to the pages.
 
 - **Matching and listing on the production binary.** The settlement core has
   been run on a subnet of validators in diverse locations running it. The
-  matching engine with its fixes has been run on a four-validator test chain
+  matching engine with its fixes has been run on a test chain
   running the production node binary (`docs/VERIFICATION.md` §6), not on such a
   subnet. The listing registry has not been run on the production binary.
-- **The exchange on a chain.** Its batteries are judged on a four-validator test
+- **The exchange on a chain.** Its batteries are judged on a test
   chain running the production node binary (`docs/VERIFICATION.md` §7), not on a
   subnet of validators in diverse locations.
 - **Rejected orders and the log.** A refused order writes no block, so the
